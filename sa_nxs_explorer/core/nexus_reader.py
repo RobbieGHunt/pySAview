@@ -446,17 +446,42 @@ class NexusReader:
                 axes = vn["axis"][()].tolist() if "axis" in vn else [0] * len(names)
                 scanneds = vn["scanned"][()].tolist() if "scanned" in vn else [0] * len(names)
 
+                # Explicit sibling arrays only: do not guess uncertainty channels
+                # from their names. NeXus errors are standard deviations;
+                # variance already contains squared uncertainties.
+                variances = None
+                for error_key in ("variance", "errors"):
+                    if error_key in sv:
+                        error_data = np.asarray(sv[error_key][()], dtype=float)
+                        if error_data.shape != raw_data.shape:
+                            raise ValueError(f"{sv.name}/{error_key} does not match scan data shape")
+                        if error_key == "errors":
+                            error_data = np.where(error_data >= 0, error_data**2, np.nan)
+                        variances = error_data
+                        break
+
                 for i, name in enumerate(names):
                     var_data = raw_data[i]
+                    unit = units[i] if i < len(units) else ""
+                    unit_source = "file" if unit else "unspecified"
+                    # SuperADAM writes its measured exposure as Count/Time
+                    # with an empty unit field. Keep this interpretation explicit.
+                    if (not unit and name == "Count" and "SUPERADAM" in entry
+                            and i < len(labels) and labels[i] == "Time"
+                            and i < len(props) and props[i] == "Time"):
+                        unit = "s"
+                        unit_source = "SuperADAM Count/Time convention (file unit absent)"
                     variables[name] = ScanVariable(
                         index=i,
                         name=name,
                         label=labels[i] if i < len(labels) else name,
-                        unit=units[i] if i < len(units) else "",
+                        unit=unit,
                         property=props[i] if i < len(props) else "",
                         axis=int(axes[i]) if i < len(axes) else 0,
                         is_scanned=bool(scanneds[i]) if i < len(scanneds) else False,
                         data=var_data,
+                        variance=variances[i] if variances is not None else None,
+                        unit_source=unit_source,
                     )
 
         # 3. Motors from entry0/SUPERADAM

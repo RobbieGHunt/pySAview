@@ -8,6 +8,7 @@ from typing import Any
 
 import numpy as np
 import pyqtgraph as pg
+from matplotlib import colormaps
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
     QButtonGroup,
@@ -16,6 +17,7 @@ from PyQt6.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
     QGroupBox,
+    QFormLayout,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -23,6 +25,8 @@ from PyQt6.QtWidgets import (
     QListWidgetItem,
     QMessageBox,
     QPushButton,
+    QScrollArea,
+    QSizePolicy,
     QSplitter,
     QTabWidget,
     QTableWidget,
@@ -36,9 +40,11 @@ from sa_nxs_explorer.core.scan_calculations import (
     CurveStats,
     PlottedCurve,
     calculate_curve_stats,
-    compute_normalized_y,
     compute_q,
     split_by_flipper,
+)
+from sa_nxs_explorer.core.normalization import (
+    is_count_channel, normalize_signal, log_error_bounds,
 )
 from sa_nxs_explorer.ui import icons
 from sa_nxs_explorer.ui.theme import apply_plot_theme
@@ -79,6 +85,13 @@ class ScanPlotView(QWidget):
         ctrl_layout.setContentsMargins(0, 0, 0, 0)
         ctrl_layout.setSpacing(10)
 
+        self.control_tabs = QTabWidget()
+        ctrl_layout.addWidget(self.control_tabs)
+        processing_panel = QWidget()
+        processing_layout = QVBoxLayout(processing_panel)
+        processing_layout.setContentsMargins(4, 4, 4, 4)
+        self.control_tabs.addTab(processing_panel, "Data & Processing")
+
         # 1. Axis Selection Group
         grp_axis = QGroupBox("Scan Variables (Axes)")
         axis_layout = QVBoxLayout(grp_axis)
@@ -107,7 +120,7 @@ class ScanPlotView(QWidget):
         self.combo_y.currentIndexChanged.connect(self._on_axis_or_setting_changed)
         axis_layout.addWidget(self.combo_y)
 
-        ctrl_layout.addWidget(grp_axis)
+        processing_layout.addWidget(grp_axis)
 
         # 2. Normalization & Spin Splitting
         grp_processing = QGroupBox("Processing & Polarization")
@@ -117,27 +130,93 @@ class ScanPlotView(QWidget):
         proc_layout.addWidget(QLabel("Normalization:"))
         self.combo_norm = QComboBox()
         self.combo_norm.addItem("Raw Counts (counts)", "raw")
-        self.combo_norm.addItem("Normalized to Monitor1 (relative)", "monitor")
+        self.combo_norm.addItem("Counts / Monitor1 (unscaled ratio)", "monitor")
         self.combo_norm.addItem("Normalized to Time (cps)", "time")
-        self.combo_norm.addItem("Normalized to Monitor & Time (cps)", "monitor_time")
+        self.combo_norm.addItem("Monitor ratio × fixed reference rate", "monitor_time")
         self.combo_norm.currentIndexChanged.connect(self._on_axis_or_setting_changed)
         proc_layout.addWidget(self.combo_norm)
 
+        self.lbl_reference_rate = QLabel("Reference monitor rate (monitor counts/s):")
+        self.lbl_reference_rate.setWordWrap(True)
+        self.spin_reference_rate = QDoubleSpinBox()
+        self.spin_reference_rate.setRange(0.000001, 1e12)
+        self.spin_reference_rate.setDecimals(6)
+        self.spin_reference_rate.setValue(1.0)
+        self.spin_reference_rate.valueChanged.connect(self._on_axis_or_setting_changed)
+        self.spin_reference_rate.setToolTip("Fixed exact display scale shared by every overlaid scan; not estimated from each scan.")
+        proc_layout.addWidget(self.lbl_reference_rate)
+        proc_layout.addWidget(self.spin_reference_rate)
+        self.lbl_reference_rate.hide()
+        self.spin_reference_rate.hide()
+
+        proc_layout.addWidget(QLabel("Counting uncertainty:"))
+        self.combo_uncertainty = QComboBox()
+        self.combo_uncertainty.addItem("Exact 68.27% count intervals", "exact")
+        self.combo_uncertainty.addItem("Propagated standard uncertainty", "standard")
+        self.combo_uncertainty.setToolTip("Exact intervals assume independent unweighted Poisson counts. Supplied variances use first-order propagation.")
+        self.combo_uncertainty.currentIndexChanged.connect(self._on_axis_or_setting_changed)
+        proc_layout.addWidget(self.combo_uncertainty)
+
         proc_layout.addWidget(QLabel("Polarization (Spin State):"))
         self.combo_spin = QComboBox()
-        self.combo_spin.addItem("Split by Flipper1 (Up vs Down)", "split")
+        self.combo_spin.addItem("Split by Flipper1 (d / u)", "split")
         self.combo_spin.addItem("Combined (All points)", "all")
-        self.combo_spin.addItem("Spin Up only (Flipper 0)", "flipper0")
-        self.combo_spin.addItem("Spin Down only (Flipper 1)", "flipper1")
+        self.combo_spin.addItem("d — Down only (Flipper OFF / 0)", "flipper0")
+        self.combo_spin.addItem("u — Up only (Flipper ON / 1)", "flipper1")
         self.combo_spin.currentIndexChanged.connect(self._on_axis_or_setting_changed)
         proc_layout.addWidget(self.combo_spin)
 
-        ctrl_layout.addWidget(grp_processing)
+        processing_layout.addWidget(grp_processing)
+        processing_layout.addStretch()
 
         # 3. Plot Display Options
         grp_display = QGroupBox("Chart Display Options")
         disp_layout = QVBoxLayout(grp_display)
         disp_layout.setSpacing(6)
+
+        self.spin_style_controls = {}
+        for spin, title, default_map in (("d", "d / Down — Flipper OFF (0)", "Blues"),
+                                          ("u", "u / Up — Flipper ON (1)", "Reds")):
+            group = QGroupBox(title)
+            form = QFormLayout(group)
+            palette = QComboBox()
+            palette.addItems(sorted(colormaps, key=str.casefold))
+            palette.setCurrentText(default_map)
+            palette.setToolTip("Matplotlib colormap for this spin family; loaded files use different shades.")
+            preview = QLabel()
+            preview.setFixedHeight(12)
+            form.addRow("Colormap:", palette)
+            form.addRow("Shades:", preview)
+            line_style = QComboBox()
+            line_style.addItem("Solid", "solid")
+            line_style.addItem("Dashed", "dashed")
+            form.addRow("Line style:", line_style)
+            line_width = QDoubleSpinBox()
+            line_width.setRange(0.5, 12)
+            line_width.setDecimals(1)
+            line_width.setSingleStep(0.5)
+            line_width.setValue(2)
+            line_width.setSuffix(" px")
+            form.addRow("Line width:", line_width)
+            marker_size = QDoubleSpinBox()
+            marker_size.setRange(0, 24)
+            marker_size.setDecimals(1)
+            marker_size.setValue(5)
+            marker_size.setSuffix(" px")
+            marker_size.setToolTip("Zero hides markers for this spin channel.")
+            form.addRow("Marker size:", marker_size)
+            self.spin_style_controls[spin] = {"colormap": palette, "preview": preview,
+                                               "line_style": line_style,
+                                               "line_width": line_width,
+                                               "marker_size": marker_size}
+            disp_layout.addWidget(group)
+        self.combo_down_colormap = self.spin_style_controls["d"]["colormap"]
+        self.combo_up_colormap = self.spin_style_controls["u"]["colormap"]
+        for controls in self.spin_style_controls.values():
+            controls["colormap"].currentTextChanged.connect(self._on_axis_or_setting_changed)
+            controls["line_style"].currentIndexChanged.connect(self._on_axis_or_setting_changed)
+            controls["line_width"].valueChanged.connect(self._on_axis_or_setting_changed)
+            controls["marker_size"].valueChanged.connect(self._on_axis_or_setting_changed)
 
         scales_row = QHBoxLayout()
         self.chk_log_y = QCheckBox("Log Y")
@@ -158,12 +237,13 @@ class ScanPlotView(QWidget):
         self.combo_style.currentIndexChanged.connect(self._on_axis_or_setting_changed)
         disp_layout.addWidget(self.combo_style)
 
-        self.chk_errors = QCheckBox("Show Error Bars (±1σ)")
+        self.chk_errors = QCheckBox("Show Intervals / Uncertainties")
         self.chk_errors.setChecked(True)
         self.chk_errors.toggled.connect(self._on_axis_or_setting_changed)
         disp_layout.addWidget(self.chk_errors)
 
-        ctrl_layout.addWidget(grp_display)
+        disp_layout.addStretch()
+        self.control_tabs.addTab(grp_display, "Chart Display Options")
 
         # 4. Action Buttons
         self.btn_reset = QPushButton("Reset View / Auto-Scale")
@@ -177,7 +257,11 @@ class ScanPlotView(QWidget):
         ctrl_layout.addWidget(self.btn_export_csv)
 
         ctrl_layout.addStretch()
-        splitter.addWidget(ctrl_box)
+        controls_scroll = QScrollArea()
+        controls_scroll.setWidgetResizable(True)
+        controls_scroll.setWidget(ctrl_box)
+        controls_scroll.setMinimumWidth(240)
+        splitter.addWidget(controls_scroll)
 
         # ---------------- Right Panel: Plot & Data Tabs ----------------
         right_box = QWidget()
@@ -188,6 +272,10 @@ class ScanPlotView(QWidget):
         # Coordinate readout header
         header_row = QHBoxLayout()
         self.lbl_title = QLabel("Load a scan file to plot data.")
+        self.lbl_title.setWordWrap(True)
+        self.lbl_title.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.lbl_title.setMinimumWidth(0)
+        self.lbl_title.setTextFormat(Qt.TextFormat.PlainText)
         self.lbl_title.setStyleSheet("font-weight: 700; font-size: 14px; color: #0284c7;")
         header_row.addWidget(self.lbl_title, 1)
 
@@ -197,6 +285,14 @@ class ScanPlotView(QWidget):
         self.lbl_coords.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         header_row.addWidget(self.lbl_coords)
         right_layout.addLayout(header_row)
+        self.lbl_processing = QLabel("Open a scan to inspect processing.")
+        self.lbl_processing.setWordWrap(True)
+        self.lbl_processing.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.lbl_processing.setMinimumWidth(0)
+        self.lbl_processing.setTextFormat(Qt.TextFormat.PlainText)
+        self.lbl_processing.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.lbl_processing.setStyleSheet("font-size: 12px; padding: 4px;")
+        right_layout.addWidget(self.lbl_processing)
 
         # Interactive Plot Toolbar (Pan, Box Zoom, Zoom In, Zoom Out, Auto-scale, Log Toggles)
         toolbar_row = QHBoxLayout()
@@ -537,6 +633,7 @@ class ScanPlotView(QWidget):
     def set_theme(self, is_dark: bool) -> None:
         """Update chart styling for theme."""
         self.is_dark_mode = is_dark
+        self._update_palette_previews()
         self.btn_reset.setIcon(icons.get_icon("maximize", is_dark=is_dark))
         self.btn_export_csv.setIcon(icons.get_icon("download", is_dark=is_dark))
         self.btn_pan.setIcon(icons.get_icon("hand", is_dark=is_dark))
@@ -604,6 +701,9 @@ class ScanPlotView(QWidget):
         is_q = x_key == "Q"
         self.lbl_wavelength.setVisible(is_q)
         self.spin_wavelength.setVisible(is_q)
+        is_reference = self.combo_norm.currentData() == "monitor_time"
+        self.lbl_reference_rate.setVisible(is_reference)
+        self.spin_reference_rate.setVisible(is_reference)
 
         # Synchronize plot toolbar buttons
         self.btn_toggle_q.blockSignals(True)
@@ -619,7 +719,17 @@ class ScanPlotView(QWidget):
         self.btn_tool_log_x.setChecked(self.chk_log_x.isChecked())
         self.btn_tool_log_x.blockSignals(False)
 
+        self._update_palette_previews()
         self._update_plot()
+
+    def _update_palette_previews(self) -> None:
+        from matplotlib.colors import to_hex
+        for controls in self.spin_style_controls.values():
+            cmap = colormaps[controls["colormap"].currentText()]
+            low, high = (0.45, 0.70) if self.is_dark_mode else (0.60, 0.85)
+            stops = ", ".join(f"stop:{i/4:g} {to_hex(cmap(low + (high-low)*i/4))}" for i in range(5))
+            controls["preview"].setStyleSheet(
+                f"background: qlineargradient(x1:0,y1:0,x2:1,y2:0,{stops}); border-radius: 3px;")
 
     def _update_plot(self) -> None:
         # Collect checked scans
@@ -646,6 +756,7 @@ class ScanPlotView(QWidget):
 
         if not checked_scans:
             self.lbl_title.setText("No Datasets Selected")
+            self.lbl_processing.setText("No datasets selected for plotting.")
             self.plot_widget.clear()
             if self.plot_widget.plotItem.legend is not None:
                 self.plot_widget.plotItem.legend.clear()
@@ -662,13 +773,15 @@ class ScanPlotView(QWidget):
             title_text = f"Scan #{meta.run_number}: {scan_desc}" if meta.run_number else (scan_desc or "Scan Data")
         else:
             runs = []
+            descriptions = []
             for _, s in checked_scans:
                 rn = f"#{s.metadata.run_number}" if s.metadata.run_number else Path(s.file_path).name
-                if s.metadata.subtitle:
-                    rn += f" ({s.metadata.subtitle})"
-                runs.append(rn)
-            title_text = f"Multi-Scan Overlay: {', '.join(runs)} ({len(checked_scans)} datasets)"
-        self.lbl_title.setText(title_text)
+                runs.append(rn if len(rn) <= 24 else rn[:21] + "…")
+                descriptions.append(f"{rn}: {s.metadata.subtitle or s.metadata.title}")
+            suffix = f" (+{len(runs)-5} more)" if len(runs) > 5 else ""
+            title_text = f"Overlay: {len(runs)} scans — {', '.join(runs[:5])}{suffix}"
+        self.lbl_title.setToolTip(title_text if len(checked_scans) == 1 else "\n".join(descriptions))
+        self.lbl_title.setText(title_text if len(title_text) <= 160 else title_text[:157] + "…")
 
         x_key = self.combo_x.currentData()
         y_key = self.combo_y.currentData()
@@ -680,81 +793,147 @@ class ScanPlotView(QWidget):
         is_multi = len(self.loaded_scans) > 1 or len(checked_scans) > 1
 
         all_curves: list[PlottedCurve] = []
+        warnings = []
+        methods = set()
+        assumptions = set()
+        excluded = 0
         x_label = x_key
         x_units = ""
         y_label = y_key
+        y_units = ""
+        expected_units = None
+
+        def canonical_unit(unit):
+            key = unit.strip()
+            return {"degree": "deg", "degrees": "deg", "°": "deg",
+                    "count": "counts", "cts": "counts", "sec": "s",
+                    "seconds": "s", "second": "s"}.get(key.lower(), key)
 
         for idx, (k, scan) in enumerate(checked_scans):
-            ds_name = ""
-            if is_multi:
-                ds_name = f"#{scan.metadata.run_number}" if scan.metadata.run_number else Path(scan.file_path).name
-
-            # X Data
-            if x_key == "index":
-                n_pts = len(next(iter(scan.variables.values())).data) if scan.variables else 0
-                x_data = np.arange(n_pts, dtype=float)
-                x_label = "Point Index"
-                x_units = ""
-            elif x_key == "Q":
-                if "th" not in scan.variables:
-                    continue
-                th_data = scan.variables["th"].data
-                x_data = compute_q(th_data, self.spin_wavelength.value())
-                x_label = "Q (Momentum Transfer)"
-                x_units = "Å⁻¹"
-            else:
-                if x_key not in scan.variables:
-                    continue
-                x_var = scan.variables[x_key]
-                x_data = np.asarray(x_var.data, dtype=float)
-                x_label = x_var.name
-                x_units = x_var.unit
-
-            # Y Data
-            if y_key in scan.variables:
+            name = Path(scan.file_path).name
+            try:
+                if y_key not in scan.variables:
+                    raise ValueError(f"missing selected Y channel {y_key}")
                 y_var = scan.variables[y_key]
                 raw_y = np.asarray(y_var.data, dtype=float)
-                y_label = y_var.name
-            elif "Detector1" in scan.variables:
-                y_var = scan.variables["Detector1"]
-                raw_y = np.asarray(y_var.data, dtype=float)
-                y_label = "Detector1"
-            else:
-                continue
+                if x_key == "index":
+                    x_data = np.arange(len(raw_y), dtype=float)
+                    current_x_units = ""
+                    current_x_label = "Point Index"
+                elif x_key == "Q":
+                    if "th" not in scan.variables:
+                        raise ValueError("missing incident-angle channel th")
+                    if canonical_unit(scan.variables["th"].unit) != "deg":
+                        raise ValueError("Q conversion requires th in degrees")
+                    x_data = compute_q(scan.variables["th"].data, self.spin_wavelength.value())
+                    current_x_units = "Å⁻¹"
+                    current_x_label = "Q (Momentum Transfer)"
+                else:
+                    if x_key not in scan.variables:
+                        raise ValueError(f"missing selected X channel {x_key}")
+                    x_var = scan.variables[x_key]
+                    x_data = np.asarray(x_var.data, dtype=float)
+                    current_x_units = x_var.unit
+                    current_x_label = x_var.name
+                current_units = (canonical_unit(current_x_units), canonical_unit(y_var.unit))
+                if expected_units is not None and current_units != expected_units:
+                    raise ValueError("selected channel units differ from the other plotted scans")
+                if x_data.ndim != 1 or raw_y.ndim != 1 or len(x_data) != len(raw_y):
+                    raise ValueError("X and Y must be matching 1D scan channels")
 
-            # Normalization
-            mon_data = scan.variables.get("Monitor1").data if "Monitor1" in scan.variables else None
-            time_data = scan.variables.get("Count").data if "Count" in scan.variables else None
-
-            y_data, y_err = compute_normalized_y(
-                raw_y,
-                norm_mode=norm_mode,
-                monitor_data=mon_data,
-                time_data=time_data,
-            )
-
-            # Spin splitting
-            flipper_data = scan.variables.get("Flipper1").data if "Flipper1" in scan.variables else np.zeros_like(x_data)
-            curves = split_by_flipper(
-                x_data,
-                y_data,
-                y_err,
-                flipper_data,
-                spin_mode=spin_mode,
-                palette_index=idx,
-                dataset_name=ds_name,
-            )
-            all_curves.extend(curves)
+                mon_var = scan.variables.get("Monitor1")
+                time_var = scan.variables.get("Count", scan.variables.get("Time"))
+                if norm_mode in ("monitor", "monitor_time") and mon_var is not None and not is_count_channel(mon_var.name, mon_var.unit):
+                    raise ValueError("Monitor1 is not a count channel")
+                if norm_mode == "time" and time_var is not None and canonical_unit(time_var.unit) != "s":
+                    raise ValueError("dwell-time channel must have units of seconds")
+                if norm_mode == "time" and time_var is not None and time_var.unit_source not in ("file", "unspecified"):
+                    assumptions.add(f"{time_var.name} in seconds: {time_var.unit_source}")
+                result = normalize_signal(
+                    raw_y, norm_mode,
+                    monitor=mon_var.data if mon_var is not None else None,
+                    time=time_var.data if time_var is not None else None,
+                    count_data=is_count_channel(y_var.name, y_var.unit),
+                    variance=y_var.variance,
+                    monitor_variance=mon_var.variance if mon_var is not None else None,
+                    uncertainty=self.combo_uncertainty.currentData(),
+                    reference_monitor_rate=self.spin_reference_rate.value(),
+                    numerator_is_monitor=y_key == "Monitor1",
+                    input_units=y_var.unit,
+                )
+                valid = result.valid & np.isfinite(x_data)
+                f_var = scan.variables.get("Flipper1")
+                effective_spin = spin_mode
+                if f_var is None:
+                    if spin_mode in ("flipper0", "flipper1"):
+                        raise ValueError("selected spin state requires Flipper1")
+                    effective_spin = "all"
+                    f_data = np.zeros(len(raw_y))
+                else:
+                    f_data = np.asarray(f_var.data, dtype=float)
+                    if f_data.shape != raw_y.shape:
+                        raise ValueError("Flipper1 length differs from the scan")
+                    if spin_mode != "all":
+                        valid &= np.isin(f_data, [0, 1])
+                dropped = len(raw_y) - int(np.count_nonzero(valid))
+                excluded += dropped
+                if dropped:
+                    why = sorted(set(result.reasons[~result.valid]))
+                    if np.any(~np.isfinite(x_data)):
+                        why.append("nonfinite X")
+                    if effective_spin != "all" and np.any(~np.isin(f_data, [0, 1])):
+                        why.append("invalid Flipper1 state")
+                    warnings.append(f"{name}: {dropped} excluded ({', '.join(why)})")
+                if not np.any(valid):
+                    continue
+                expected_units = current_units
+                x_label, x_units, y_units = current_x_label, current_x_units, result.units
+                methods.add(result.method)
+                original_indices = np.flatnonzero(valid)
+                curves = split_by_flipper(
+                    x_data[valid], result.values[valid],
+                    result.sigma[valid] if result.sigma is not None else None,
+                    f_data[valid], spin_mode=effective_spin,
+                    palette_index=list(self.loaded_scans).index(k),
+                    dataset_count=len(self.loaded_scans),
+                    down_colormap=self.combo_down_colormap.currentText(),
+                    up_colormap=self.combo_up_colormap.currentText(),
+                    dark=self.is_dark_mode,
+                    dataset_name=f"#{scan.metadata.run_number}" if is_multi and scan.metadata.run_number else (name if is_multi else ""),
+                )
+                for curve in curves:
+                    source_indices = original_indices[curve.indices]
+                    curve.y_lower = result.lower[source_indices] if result.lower is not None else None
+                    curve.y_upper = result.upper[source_indices] if result.upper is not None else None
+                    curve.indices = source_indices
+                    curve.uncertainty_method = result.method
+                    curve.source_path = scan.file_path
+                    curve.normalization = norm_mode
+                    curve.reference_monitor_rate = self.spin_reference_rate.value() if norm_mode == "monitor_time" else None
+                    curve.x_units, curve.y_units = x_units, y_units
+                    curve.wavelength = self.spin_wavelength.value() if x_key == "Q" else None
+                all_curves.extend(curves)
+            except ValueError as error:
+                warnings.append(f"{name}: skipped — {error}")
 
         self._current_curves = all_curves
-
-        # Format Y axis label
-        if norm_mode == "monitor":
-            y_label += " / Monitor1"
-        elif norm_mode == "time":
-            y_label += " / Time (cps)"
-        elif norm_mode in ("monitor_time", "monitor_cps"):
-            y_label += " / Monitor1 (cps)"
+        formulas = {"raw": "Y", "monitor": "N / Monitor1", "time": "N / dwell time",
+                    "monitor_time": f"(N / Monitor1) × {self.spin_reference_rate.value():g} monitor counts/s (fixed reference)"}
+        status = f"Processing: {formulas.get(norm_mode, norm_mode)}; {'; '.join(sorted(methods)) or 'no compatible data'}; {excluded} invalid points excluded."
+        if x_key == "Q":
+            status += f" Wavelength: {self.spin_wavelength.value():g} Å."
+        hidden = sum(np.count_nonzero((c.x <= 0) if self.chk_log_x.isChecked() else np.zeros(len(c.x), dtype=bool))
+                     + np.count_nonzero((c.y <= 0) if self.chk_log_y.isChecked() else np.zeros(len(c.y), dtype=bool)) for c in all_curves)
+        if hidden:
+            status += f" Log axes hide nonpositive coordinates ({hidden} coordinate values); retained in table/export."
+        if self.chk_log_y.isChecked() and any(c.y_lower is not None and np.any(c.y_lower <= 0) for c in all_curves):
+            status += " Nonpositive lower bounds cannot be drawn on a log axis; use linear view/table."
+        self._processing_warnings = warnings
+        if assumptions:
+            status += " Unit assumptions: " + "; ".join(sorted(assumptions)) + "."
+        if warnings:
+            status += " " + " | ".join(warnings)
+        self.lbl_processing.setText(status)
 
         # Clear existing items
         self.plot_widget.clear()
@@ -765,7 +944,7 @@ class ScanPlotView(QWidget):
         # Labels
         text_color = "#f1f5f9" if self.is_dark_mode else "#1e293b"
         self.plot_widget.setLabel("bottom", x_label, units=x_units, color=text_color)
-        self.plot_widget.setLabel("left", y_label, color=text_color)
+        self.plot_widget.setLabel("left", y_label, units=y_units, color=text_color)
 
         bot_ax = self.plot_widget.getPlotItem().getAxis("bottom")
         if bot_ax is not None:
@@ -788,7 +967,7 @@ class ScanPlotView(QWidget):
             py = curve.y
             perr = curve.y_err
 
-            valid = np.ones(len(px), dtype=bool)
+            valid = np.isfinite(px) & np.isfinite(py)
             if log_x:
                 valid &= (px > 0)
             if log_y:
@@ -801,50 +980,42 @@ class ScanPlotView(QWidget):
             cy = py[valid]
             cerr = perr[valid] if perr is not None else None
 
-            pen = pg.mkPen(curve.color, width=2) if style in ("both", "line") else None
-            symbol = "o" if style in ("both", "points") else None
-            brush = curve.color if style in ("both", "points") else None
+            controls = self.spin_style_controls.get(curve.spin)
+            line_width = controls["line_width"].value() if controls else 2
+            marker_size = controls["marker_size"].value() if controls else 5
+            dashed = controls is not None and controls["line_style"].currentData() == "dashed"
+            pen = pg.mkPen(curve.color, width=line_width,
+                           style=Qt.PenStyle.DashLine if dashed else Qt.PenStyle.SolidLine) if style in ("both", "line") else None
+            symbol = curve.symbol if style in ("both", "points") and marker_size > 0 else None
+            brush = curve.color if symbol is not None else None
 
             self.plot_widget.plot(
                 cx,
                 cy,
                 pen=pen,
                 symbol=symbol,
-                symbolSize=4,
+                symbolSize=marker_size,
+                symbolPen=pg.mkPen(curve.color, width=1),
                 symbolBrush=brush,
                 name=curve.label,
             )
 
-            # Error bars (±1σ) rendered accurately in both linear and log scale
-            if show_errors and cerr is not None and len(cx) > 0:
-                if log_x:
-                    x_pts = np.log10(cx)
-                else:
-                    x_pts = cx
-
+            # Exact confidence limits remain asymmetric. Standard uncertainty
+            # is separately identified in the processing banner and export.
+            if show_errors and curve.y_lower is not None and len(cx) > 0:
+                lower = curve.y_lower[valid]
+                upper = curve.y_upper[valid]
+                x_pts = np.log10(cx) if log_x else cx
                 if log_y:
-                    # Map to ViewBox log10 space with asymmetric Poisson bounds
                     y_pts = np.log10(cy)
-                    cy_safe = np.maximum(cy, 1e-12)
-                    rel_err = cerr / cy_safe
-                    top_err = np.log10(1.0 + rel_err)
-                    # Safe relative lower bound (capped at 1.5 decades down for zero-count drops)
-                    lower_ratio = np.maximum(1.0 - rel_err, 0.01)
-                    bot_err = np.minimum(-np.log10(lower_ratio), 1.5)
+                    top_err, bot_err = log_error_bounds(cy, lower, upper)
                 else:
                     y_pts = cy
-                    top_err = cerr
-                    bot_err = cerr
-
-                err_item = pg.ErrorBarItem(
-                    x=x_pts,
-                    y=y_pts,
-                    top=top_err,
-                    bottom=bot_err,
-                    beam=0,  # No caps on the error bars, just vertical lines
-                    pen=pg.mkPen(curve.color, width=2),  # Keep error bar line width same as regular line width
-                )
-                self.plot_widget.addItem(err_item)
+                    top_err, bot_err = upper - cy, cy - lower
+                self.plot_widget.addItem(pg.ErrorBarItem(
+                    x=x_pts, y=y_pts, top=top_err, bottom=bot_err,
+                    beam=0, pen=pg.mkPen(curve.color, width=line_width),
+                ))
 
         apply_plot_theme(self.plot_widget, self.is_dark_mode)
 
@@ -867,9 +1038,9 @@ class ScanPlotView(QWidget):
     def _update_data_table(self, curves: list[PlottedCurve], x_label: str, y_label: str) -> None:
         total_rows = sum(len(c.x) for c in curves)
         self.curve_data_table.setRowCount(total_rows)
-        self.curve_data_table.setColumnCount(6)
+        self.curve_data_table.setColumnCount(9)
         self.curve_data_table.setHorizontalHeaderLabels([
-            "Dataset", "State / Curve", "Step Index", x_label, y_label, "Error (±1σ)"
+            "Dataset", "State / Curve", "Step Index", x_label, y_label, "Std uncertainty", "Lower bound", "Upper bound", "Uncertainty method"
         ])
         self.curve_data_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
 
@@ -885,6 +1056,9 @@ class ScanPlotView(QWidget):
                 self.curve_data_table.setItem(cur_row, 3, QTableWidgetItem(f"{c.x[i]:.6g}"))
                 self.curve_data_table.setItem(cur_row, 4, QTableWidgetItem(f"{c.y[i]:.6g}"))
                 self.curve_data_table.setItem(cur_row, 5, QTableWidgetItem(err_val))
+                for col, value in ((6, c.y_lower), (7, c.y_upper)):
+                    self.curve_data_table.setItem(cur_row, col, QTableWidgetItem(f"{value[i]:.6g}" if value is not None else "--"))
+                self.curve_data_table.setItem(cur_row, 8, QTableWidgetItem(c.uncertainty_method))
                 cur_row += 1
 
     def _export_csv(self) -> None:
@@ -901,13 +1075,19 @@ class ScanPlotView(QWidget):
         try:
             with open(file_path, "w", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
-                writer.writerow(["Dataset", "Curve", "OriginalStepIndex", "X", "Y", "Y_Error"])
+                writer.writerow(["Dataset", "Curve", "OriginalStepIndex", "X", "Y", "StandardUncertainty", "LowerBound", "UpperBound", "UncertaintyMethod", "Normalization", "ReferenceMonitorRate", "XUnits", "YUnits", "WavelengthAngstrom", "SourceFile", "ProcessingWarnings", "ProcessingStatus"])
                 for c in self._current_curves:
                     ds_name = c.dataset_name or "Default"
                     for i in range(len(c.x)):
                         idx = c.indices[i] if i < len(c.indices) else i
-                        err = c.y_err[i] if c.y_err is not None and i < len(c.y_err) else 0.0
-                        writer.writerow([ds_name, c.label, idx, c.x[i], c.y[i], err])
+                        err = c.y_err[i] if c.y_err is not None and i < len(c.y_err) else ""
+                        writer.writerow([ds_name, c.label, idx, c.x[i], c.y[i], err,
+                                         c.y_lower[i] if c.y_lower is not None else "",
+                                         c.y_upper[i] if c.y_upper is not None else "",
+                                         c.uncertainty_method, c.normalization,
+                                         c.reference_monitor_rate, c.x_units, c.y_units,
+                                         c.wavelength, c.source_path,
+                                         " | ".join(getattr(self, "_processing_warnings", [])), self.lbl_processing.text()])
 
             QMessageBox.information(self, "Export Succeeded", f"Exported {sum(len(c.x) for c in self._current_curves)} data points to {Path(file_path).name}.")
         except Exception as e:

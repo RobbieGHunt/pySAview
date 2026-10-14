@@ -16,6 +16,7 @@ from PyQt6.QtWidgets import (
     QLabel,
     QMainWindow,
     QMessageBox,
+    QSizePolicy,
     QSplitter,
     QStatusBar,
     QTabWidget,
@@ -206,6 +207,9 @@ class MainWindow(QMainWindow):
 
         self.combo_active_file = QComboBox()
         self.combo_active_file.setMinimumWidth(260)
+        self.combo_active_file.setMinimumContentsLength(24)
+        self.combo_active_file.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.combo_active_file.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.combo_active_file.currentIndexChanged.connect(self._on_active_file_combo_changed)
         toolbar.addWidget(self.combo_active_file)
 
@@ -431,6 +435,7 @@ class MainWindow(QMainWindow):
             sub_str = f" - {scan.metadata.subtitle}" if scan.metadata.subtitle else ""
             lbl = f"{name} ({run_str}{sub_str})" if run_str else f"{name}{sub_str}"
             self.combo_active_file.addItem(lbl, k)
+            self.combo_active_file.setItemData(self.combo_active_file.count()-1, lbl, Qt.ItemDataRole.ToolTipRole)
 
         if self.active_file_path:
             idx = self.combo_active_file.findData(str(self.active_file_path))

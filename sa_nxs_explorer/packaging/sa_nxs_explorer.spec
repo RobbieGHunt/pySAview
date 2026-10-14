@@ -6,14 +6,11 @@ import os
 block_cipher = None
 
 excludes = [
-    "matplotlib",
     "tkinter",
-    "scipy",
     "pandas",
     "IPython",
     "jupyter",
     "notebook",
-    "PIL",
     "cv2",
     "torch",
     "pytest",

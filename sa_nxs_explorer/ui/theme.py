@@ -835,6 +835,15 @@ def apply_plot_theme(plot_widget: pg.PlotWidget, is_dark: bool) -> None:
             if hasattr(ax, "labelText") and ax.labelText:
                 units = getattr(ax, "labelUnits", None) or ""
                 ax.setLabel(ax.labelText, units=units, color=text_color)
+            # Disabling prefixes does not clear a previously computed scale
+            # in every pyqtgraph version, especially after a theme/log change.
+            if hasattr(ax, "setSIPrefixEnableRanges"):
+                ax.setSIPrefixEnableRanges(())
+            ax.autoSIPrefixScale = 1.0
+            ax.labelUnitPrefix = ""
+            ax._updateLabel()
+            ax.picture = None
+            ax.update()
     plot_item.showGrid(x=True, y=True, alpha=grid_alpha)
 
     if plot_item.legend is not None:
