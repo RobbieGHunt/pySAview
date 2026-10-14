@@ -67,10 +67,9 @@ Or open a specific file directly:
 .venv\Scripts\python.exe -m sa_nxs_explorer sa_nxs_explorer/example_data/005572.nxs
 ```
 
-### Option 3: Direct Launcher Script
-```powershell
-.venv\Scripts\python.exe sa_nxs_explorer/sa_nxs_launcher.py
-```
+The supported Windows launcher is `run.bat`. The obsolete VBScript launcher,
+direct Python launcher, shortcut generator, and old `.lnk` shortcut are no
+longer supported. Use the batch file above or the Python module entry point.
 
 ---
 

@@ -1,8 +1,10 @@
 @echo off
+setlocal
 cd /d "%~dp0\.."
-if exist ".venv\Scripts\python.exe" (
-    ".venv\Scripts\python.exe" -m sa_nxs_explorer %*
-) else (
-    python -m sa_nxs_explorer %*
+if not exist ".venv\Scripts\python.exe" (
+    echo Missing project virtual environment. Follow the installation instructions in README.md.
+    pause
+    exit /b 1
 )
+".venv\Scripts\python.exe" -m sa_nxs_explorer %*
 pause

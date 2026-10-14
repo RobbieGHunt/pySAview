@@ -44,3 +44,13 @@ The current scope is the viewer's P0 work: validated normalization and
 uncertainty, explicit channel/unit compatibility, and visible processing status.
 Persistent ROI/session state, background processing, and further layout changes
 remain later milestones. The magnetometry application is maintained separately.
+
+## Supported launchers
+
+On Windows, use `sa_nxs_explorer/run.bat`, which runs the repository's own
+`.venv` and reports a missing environment rather than choosing another Python
+installation. The module entry point `python -m sa_nxs_explorer` and installed
+`sa-nxs-explorer` command remain supported.
+
+Legacy `run.vbs`, `sa_nxs_launcher.py`, `create_shortcut.ps1`, and
+`SuperADAM_Explorer.lnk` are retired and should not be used.
