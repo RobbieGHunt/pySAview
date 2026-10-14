@@ -2,6 +2,9 @@
 
 A specialized PyQt6 and pyqtgraph graphical explorer for ILL SuperADAM polarized neutron reflectometry NeXus (`.nxs`) scan files.
 
+Processing conventions and P0 changes are described in
+[normalization and uncertainty](../docs/normalization.md).
+
 ---
 
 ## Features
@@ -22,9 +25,11 @@ A specialized PyQt6 and pyqtgraph graphical explorer for ILL SuperADAM polarized
 - **Polarization / Spin state separation**: Splits curves automatically by `Flipper1` into **Spin Up** (Flipper OFF / 0) and **Spin Down** (Flipper ON / 1) states.
 - **Count Normalization**:
   - Raw counts
-  - Normalized to beam monitor (`Detector1 / Monitor1`)
+  - Unscaled beam-monitor ratio (`Detector1 / Monitor1`)
   - Normalized to dwell time (`Detector1 / Time`, cps)
-- **Poisson Error Bars**: Automatic $\pm 1\sigma$ error bars with propagated uncertainties.
+  - Monitor ratio multiplied by a visible fixed reference monitor rate, shared across scans
+- **Counting Uncertainty**: Exact 68.27% Poisson confidence intervals by default; independently identified first-order standard uncertainties as an alternative or for supplied variances.
+- **Processing Status**: Formula, uncertainty method, wavelength, invalid-point exclusions, and unit assumptions are shown beside the plot. Missing/incompatible channels never silently change the selected processing.
 - **Interactive cursor tracker**: Live mouse coordinate readout ($X$, $Y$).
 - **Data Summary & Export**: Curve statistics (peak position, centroid, integrated counts) and 1-click CSV data export.
 
@@ -73,4 +78,4 @@ Run the test suite with pytest:
 ```powershell
 .venv\Scripts\pytest.exe sa_nxs_explorer/tests
 ```
-All 19 dedicated tests verify the reader, Q calculations, normalizations, flipper spin splitting, ROI integration, and PyQt6 GUI components.
+Tests verify the reader, Q calculations, normalizations, statistical coverage and zero-count limits, flipper spin splitting, ROI integration, exports, and PyQt6 GUI components.

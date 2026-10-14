@@ -462,16 +462,26 @@ class NexusReader:
 
                 for i, name in enumerate(names):
                     var_data = raw_data[i]
+                    unit = units[i] if i < len(units) else ""
+                    unit_source = "file" if unit else "unspecified"
+                    # SuperADAM writes its measured exposure as Count/Time
+                    # with an empty unit field. Keep this interpretation explicit.
+                    if (not unit and name == "Count" and "SUPERADAM" in entry
+                            and i < len(labels) and labels[i] == "Time"
+                            and i < len(props) and props[i] == "Time"):
+                        unit = "s"
+                        unit_source = "SuperADAM Count/Time convention (file unit absent)"
                     variables[name] = ScanVariable(
                         index=i,
                         name=name,
                         label=labels[i] if i < len(labels) else name,
-                        unit=units[i] if i < len(units) else "",
+                        unit=unit,
                         property=props[i] if i < len(props) else "",
                         axis=int(axes[i]) if i < len(axes) else 0,
                         is_scanned=bool(scanneds[i]) if i < len(scanneds) else False,
                         data=var_data,
                         variance=variances[i] if variances is not None else None,
+                        unit_source=unit_source,
                     )
 
         # 3. Motors from entry0/SUPERADAM

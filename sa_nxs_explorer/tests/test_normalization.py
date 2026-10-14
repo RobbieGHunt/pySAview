@@ -158,3 +158,5 @@ def test_count_channel_classification():
     assert not is_count_channel("th", "deg")
     assert not is_count_channel("LakeshoreMain", "K")
     assert not is_count_channel("Detector1_variance", "counts")
+    assert not is_count_channel("Monitor1", "counts/s")
+    assert not is_count_channel("Detector1", "counts/s")

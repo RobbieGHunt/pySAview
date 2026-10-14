@@ -95,6 +95,10 @@ need additional models; no exact Poisson claim is made for them.
   excluded, with reasons in the processing banner and CSV warning column.
 - Non-count channels can be plotted raw. They receive no invented Poisson
   uncertainty; supplied variances remain available.
+- SuperADAM files can omit the unit for `Count`, with both label and property
+  set to `Time`. For that specific instrument/schema combination the reader
+  interprets exposure as seconds, and the processing status records the unit
+  assumption. Other unknown exposure units are rejected.
 - Logarithmic axes cannot show zero/negative values or endpoints. Such values
   remain in the table/export when scientifically valid. Nonpositive lower
   bounds are omitted from the log rendering, never replaced or clipped. Use

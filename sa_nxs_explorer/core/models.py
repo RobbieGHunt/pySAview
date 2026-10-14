@@ -47,6 +47,7 @@ class ScanVariable:
     is_scanned: bool
     data: np.ndarray
     variance: np.ndarray | None = None
+    unit_source: str = "file"
 
 
 @dataclass

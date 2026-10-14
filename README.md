@@ -27,3 +27,20 @@ $env:QT_QPA_PLATFORM = "offscreen"
 ```
 
 The supplied scans are used by the reader and UI integration tests.
+
+## Scientific processing
+
+See [normalization and uncertainty](docs/normalization.md) for the formulas,
+statistical assumptions, exact low-count intervals, and invalid-point policy.
+
+Monitor mode is the unscaled count ratio `N/M`. The reference-rate mode uses
+a visible fixed scale shared across files; it does not silently rescale each
+scan to its own mean monitor. Standard uncertainties and exact confidence
+limits are exported separately, with their methods identified.
+
+## Incremental development
+
+The current scope is the viewer's P0 work: validated normalization and
+uncertainty, explicit channel/unit compatibility, and visible processing status.
+Persistent ROI/session state, background processing, and further layout changes
+remain later milestones. The magnetometry application is maintained separately.

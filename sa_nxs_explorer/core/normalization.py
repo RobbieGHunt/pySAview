@@ -38,8 +38,9 @@ def is_count_channel(name: str, unit: str) -> bool:
     key = name.lower()
     if any(word in key for word in ("error", "sigma", "variance", "rate")):
         return False
-    return (name in {"ROI_Counts", "Detector1", "Monitor1", "Monitor2"}
-            or unit.strip().lower() in {"count", "counts", "cts"})
+    units = unit.strip().lower()
+    return (units in {"count", "counts", "cts"}
+            or (not units and name in {"ROI_Counts", "Detector1", "Monitor1", "Monitor2"}))
 
 
 def poisson_interval(counts, confidence=CONFIDENCE):
