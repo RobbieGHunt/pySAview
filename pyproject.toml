@@ -1,0 +1,29 @@
+[project]
+name = "pysaview"
+version = "0.1.0"
+description = "SuperADAM NeXus file inspection and quick plotting"
+requires-python = ">=3.12,<3.13"
+dependencies = ["PyQt6>=6.7", "pyqtgraph>=0.13.7", "numpy>=2.0", "h5py>=3.11"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-qt>=4.4", "pyinstaller>=6.10"]
+
+[project.gui-scripts]
+sa-nxs-explorer = "sa_nxs_explorer.app:main"
+
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["sa_nxs_explorer*"]
+exclude = ["sa_nxs_explorer.tests*"]
+
+[tool.setuptools.package-data]
+sa_nxs_explorer = ["resources/*.svg", "example_data/*.nxs"]
+
+[tool.pytest.ini_options]
+testpaths = ["sa_nxs_explorer/tests"]
+pythonpath = ["."]
+qt_api = "pyqt6"
+addopts = "-p no:cacheprovider"
