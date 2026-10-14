@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 import numpy as np
+from sa_nxs_explorer.core.normalization import normalize_signal
 
 
 @dataclass
@@ -18,6 +19,15 @@ class PlottedCurve:
     color: str
     indices: np.ndarray
     dataset_name: str = ""
+    y_lower: np.ndarray | None = None
+    y_upper: np.ndarray | None = None
+    uncertainty_method: str = ""
+    source_path: str = ""
+    normalization: str = "raw"
+    reference_monitor_rate: float | None = None
+    x_units: str = ""
+    y_units: str = ""
+    wavelength: float | None = None
 
 
 @dataclass
@@ -40,7 +50,7 @@ def compute_q(theta_deg: np.ndarray, wavelength_angstrom: float = 5.21) -> np.nd
 
     Q = (4 * pi / wavelength) * sin(theta_rad)
     """
-    if wavelength_angstrom <= 0:
+    if not np.isfinite(wavelength_angstrom) or wavelength_angstrom <= 0:
         raise ValueError("Wavelength must be strictly positive.")
     theta_rad = np.radians(np.asarray(theta_deg, dtype=float))
     return (4.0 * np.pi / wavelength_angstrom) * np.sin(theta_rad)
@@ -51,82 +61,22 @@ def compute_normalized_y(
     norm_mode: Literal["raw", "monitor", "time", "monitor_time", "monitor_cps"] = "raw",
     monitor_data: np.ndarray | None = None,
     time_data: np.ndarray | None = None,
-    scale_monitor: bool = True,
+    scale_monitor: bool = False,
+    reference_monitor_rate: float = 1.0,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Calculate normalized Y values and associated Poisson uncertainties.
+    """Compatibility API returning values and propagated standard uncertainty.
 
-    norm_mode:
-      - 'raw': Raw counts (Poisson error = sqrt(y))
-      - 'monitor': Count ratio scaled by mean monitor (or raw ratio if scale_monitor=False)
-      - 'time': Count rate in counts per second (y / t)
-      - 'monitor_time' / 'monitor_cps': Monitor-normalized count rate in cps:
-            (y / M) * R_mon_mean, where R_mon_mean = sum(M) / sum(t).
-            Corrects for reactor flux fluctuations AND variable dwell times.
-
-    Returns (y_norm, y_err).
+    Monitor normalization now means N/M, without an implicit scan-specific
+    scale. Use normalize_signal for exact confidence limits and invalid reasons.
+    Standard uncertainty is an estimate, not an exact low-count interval.
     """
-    y = np.asarray(y_data, dtype=float)
-    # Poisson count errors: sqrt(max(y, 1)) to avoid zero div / zero error
-    y_pos = np.maximum(y, 0.0)
-    raw_err = np.sqrt(np.maximum(y_pos, 1.0))
-
-    if norm_mode == "raw":
-        return y, raw_err
-
-    if norm_mode == "monitor":
-        if monitor_data is None or len(monitor_data) != len(y):
-            return y, raw_err
-        m = np.asarray(monitor_data, dtype=float)
-        m_safe = np.where(m > 0, m, 1.0)
-        norm_factor = np.mean(m_safe) if scale_monitor else 1.0
-        y_norm = (y / m_safe) * norm_factor
-
-        # Propagated relative error: sqrt((dy/y)^2 + (dm/m)^2)
-        rel_y = raw_err / np.maximum(y_pos, 1.0)
-        m_pos = np.maximum(m, 0.0)
-        m_err = np.sqrt(np.maximum(m_pos, 1.0))
-        rel_m = m_err / np.maximum(m_pos, 1.0)
-        tot_rel = np.sqrt(rel_y**2 + rel_m**2)
-        y_err = y_norm * tot_rel
-        return y_norm, y_err
-
-    if norm_mode == "time":
-        if time_data is None or len(time_data) != len(y):
-            return y, raw_err
-        t = np.asarray(time_data, dtype=float)
-        t_safe = np.where(t > 0, t, 1.0)
-        y_norm = y / t_safe
-        y_err = raw_err / t_safe
-        return y_norm, y_err
-
-    if norm_mode in ("monitor_time", "monitor_cps"):
-        if monitor_data is None or len(monitor_data) != len(y):
-            return compute_normalized_y(y, norm_mode="time" if time_data is not None else "raw", time_data=time_data)
-        if time_data is None or len(time_data) != len(y):
-            return compute_normalized_y(y, norm_mode="monitor", monitor_data=monitor_data, scale_monitor=scale_monitor)
-
-        m = np.asarray(monitor_data, dtype=float)
-        t = np.asarray(time_data, dtype=float)
-        m_safe = np.where(m > 0, m, 1.0)
-        t_safe = np.where(t > 0, t, 1.0)
-
-        # Nominal monitor rate (cps) across the scan: sum(M) / sum(t)
-        tot_time = np.sum(t_safe)
-        r_mon = float(np.sum(m_safe) / tot_time) if tot_time > 0 else 1.0
-
-        # Normalization: (I / M) * R_mon
-        y_norm = (y / m_safe) * r_mon
-
-        # Propagated relative error: sqrt((dy/y)^2 + (dm/m)^2)
-        rel_y = raw_err / np.maximum(y_pos, 1.0)
-        m_pos = np.maximum(m, 0.0)
-        m_err = np.sqrt(np.maximum(m_pos, 1.0))
-        rel_m = m_err / np.maximum(m_pos, 1.0)
-        tot_rel = np.sqrt(rel_y**2 + rel_m**2)
-        y_err = y_norm * tot_rel
-        return y_norm, y_err
-
-    return y, raw_err
+    if scale_monitor:
+        raise ValueError("Implicit mean-monitor scaling is unsupported; use a fixed reference rate.")
+    result = normalize_signal(
+        y_data, norm_mode, monitor=monitor_data, time=time_data,
+        uncertainty="standard", reference_monitor_rate=reference_monitor_rate,
+    )
+    return result.values, result.sigma
 
 
 CURVE_PALETTES = [
@@ -148,7 +98,7 @@ CURVE_PALETTES = [
 def split_by_flipper(
     x_data: np.ndarray,
     y_data: np.ndarray,
-    y_err: np.ndarray,
+    y_err: np.ndarray | None,
     flipper_data: np.ndarray,
     spin_mode: str = "split",
     palette_index: int = 0,
@@ -201,7 +151,7 @@ def split_by_flipper(
                 label=f"{prefix}Spin Up (Flipper OFF / 0)",
                 x=x_data[sorted_idx0],
                 y=y_data[sorted_idx0],
-                y_err=y_err[sorted_idx0],
+                y_err=y_err[sorted_idx0] if y_err is not None else None,
                 color=color_up,
                 indices=sorted_idx0,
                 dataset_name=dataset_name,
@@ -217,7 +167,7 @@ def split_by_flipper(
                 label=f"{prefix}Spin Down (Flipper ON / 1)",
                 x=x_data[sorted_idx1],
                 y=y_data[sorted_idx1],
-                y_err=y_err[sorted_idx1],
+                y_err=y_err[sorted_idx1] if y_err is not None else None,
                 color=color_down,
                 indices=sorted_idx1,
                 dataset_name=dataset_name,
@@ -225,6 +175,8 @@ def split_by_flipper(
         )
 
     if not curves:
+        if spin_mode in ("flipper0", "flipper1"):
+            return []
         # Fallback if no flipper states found
         return [
             PlottedCurve(

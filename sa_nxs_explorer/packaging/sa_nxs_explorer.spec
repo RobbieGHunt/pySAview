@@ -8,7 +8,6 @@ block_cipher = None
 excludes = [
     "matplotlib",
     "tkinter",
-    "scipy",
     "pandas",
     "IPython",
     "jupyter",

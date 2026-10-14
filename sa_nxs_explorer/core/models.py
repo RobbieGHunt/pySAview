@@ -46,6 +46,7 @@ class ScanVariable:
     axis: int
     is_scanned: bool
     data: np.ndarray
+    variance: np.ndarray | None = None
 
 
 @dataclass

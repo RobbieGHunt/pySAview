@@ -38,9 +38,9 @@ def test_compute_normalized_y_raw():
 def test_compute_normalized_y_monitor():
     y = np.array([100.0, 200.0])
     mon = np.array([1000.0, 1000.0])
-    y_norm, y_err = compute_normalized_y(y, norm_mode="monitor", monitor_data=mon, scale_monitor=True)
-    # Mean monitor is 1000, so y_norm == y
-    np.testing.assert_allclose(y_norm, y)
+    y_norm, y_err = compute_normalized_y(y, norm_mode="monitor", monitor_data=mon)
+    # Monitor normalization is the unscaled ratio, shared across scans.
+    np.testing.assert_allclose(y_norm, y / mon)
     assert len(y_err) == 2
     assert np.all(y_err > 0)
 
@@ -59,16 +59,16 @@ def test_compute_normalized_y_monitor_time():
     y = np.array([100.0, 200.0])
     mon = np.array([1000.0, 2000.0])
     t = np.array([10.0, 20.0])
-    y_norm, y_err = compute_normalized_y(y, norm_mode="monitor_time", monitor_data=mon, time_data=t)
-    # Average monitor rate = (1000 + 2000) / (10 + 20) = 100 cps
+    y_norm, y_err = compute_normalized_y(y, norm_mode="monitor_time", monitor_data=mon, time_data=t, reference_monitor_rate=100)
+    # The fixed reference monitor rate is 100 monitor counts/s.
     # (100 / 1000) * 100 = 10.0; (200 / 2000) * 100 = 10.0
     np.testing.assert_allclose(y_norm, [10.0, 10.0])
     assert y_err[0] == pytest.approx(10.0 * np.sqrt((10.0 / 100.0)**2 + (np.sqrt(1000.0) / 1000.0)**2), rel=1e-3)
     assert y_err[1] > 0
 
-    # Fallback when one source is missing
-    fallback_y, _ = compute_normalized_y(y, norm_mode="monitor_time", monitor_data=None, time_data=t)
-    np.testing.assert_allclose(fallback_y, [10.0, 10.0])
+    # Missing sources are never silently replaced with another normalization.
+    with pytest.raises(ValueError, match="Monitor counts is required"):
+        compute_normalized_y(y, norm_mode="monitor_time", monitor_data=None, time_data=t)
 
 
 def test_split_by_flipper():
