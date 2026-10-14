@@ -35,6 +35,8 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from sa_nxs_explorer.core.curve_colors import palette_range
+from sa_nxs_explorer.core.waterfall import waterfall_order, display_values
 from sa_nxs_explorer.core.models import ScanData
 from sa_nxs_explorer.core.scan_calculations import (
     CurveStats,
@@ -241,6 +243,26 @@ class ScanPlotView(QWidget):
         self.chk_errors.setChecked(True)
         self.chk_errors.toggled.connect(self._on_axis_or_setting_changed)
         disp_layout.addWidget(self.chk_errors)
+
+        self.chk_waterfall = QCheckBox("Waterfall: offset scans")
+        self.chk_waterfall.setToolTip("Numbered scans ascend from the base; other files follow in load order. Both spins share an offset. Tables and exports are unchanged.")
+        disp_layout.addWidget(self.chk_waterfall)
+        self.combo_waterfall_mode = QComboBox()
+        self.combo_waterfall_mode.addItem("Logarithmic (decades)", "log")
+        self.combo_waterfall_mode.addItem("Linear (Y units)", "linear")
+        self.spin_waterfall_spacing = QDoubleSpinBox()
+        self.spin_waterfall_spacing.setDecimals(3)
+        self.spin_waterfall_spacing.setRange(0.001, 1000000)
+        self.spin_waterfall_spacing.setValue(1.0)
+        waterfall_form = QFormLayout()
+        waterfall_form.addRow("Offset mode", self.combo_waterfall_mode)
+        waterfall_form.addRow("Spacing per scan", self.spin_waterfall_spacing)
+        disp_layout.addLayout(waterfall_form)
+        self.combo_waterfall_mode.setEnabled(False)
+        self.spin_waterfall_spacing.setEnabled(False)
+        self.chk_waterfall.toggled.connect(self._on_waterfall_changed)
+        self.combo_waterfall_mode.currentIndexChanged.connect(self._on_waterfall_changed)
+        self.spin_waterfall_spacing.valueChanged.connect(self._on_axis_or_setting_changed)
 
         disp_layout.addStretch()
         self.control_tabs.addTab(grp_display, "Chart Display Options")
@@ -693,7 +715,7 @@ class ScanPlotView(QWidget):
                 y_val = 10**y_val
             if self.chk_log_x.isChecked():
                 x_val = 10**x_val
-            self.lbl_coords.setText(f"Cursor: (X: {x_val:.4g}, Y: {y_val:.4g})")
+            self.lbl_coords.setText(f"Cursor: (X: {x_val:.4g}, {'Display Y' if self.chk_waterfall.isChecked() else 'Y'}: {y_val:.4g})")
 
     def _on_axis_or_setting_changed(self) -> None:
         # Toggle wavelength input visibility
@@ -722,11 +744,19 @@ class ScanPlotView(QWidget):
         self._update_palette_previews()
         self._update_plot()
 
+    def _on_waterfall_changed(self, *_args) -> None:
+        enabled = self.chk_waterfall.isChecked()
+        self.combo_waterfall_mode.setEnabled(enabled)
+        self.spin_waterfall_spacing.setEnabled(enabled)
+        if enabled:
+            self.chk_log_y.setChecked(self.combo_waterfall_mode.currentData() == "log")
+        self._on_axis_or_setting_changed()
+
     def _update_palette_previews(self) -> None:
         from matplotlib.colors import to_hex
         for controls in self.spin_style_controls.values():
             cmap = colormaps[controls["colormap"].currentText()]
-            low, high = (0.45, 0.70) if self.is_dark_mode else (0.60, 0.85)
+            low, high = palette_range(self.is_dark_mode)
             stops = ", ".join(f"stop:{i/4:g} {to_hex(cmap(low + (high-low)*i/4))}" for i in range(5))
             controls["preview"].setStyleSheet(
                 f"background: qlineargradient(x1:0,y1:0,x2:1,y2:0,{stops}); border-radius: 3px;")
@@ -894,7 +924,7 @@ class ScanPlotView(QWidget):
                     x_data[valid], result.values[valid],
                     result.sigma[valid] if result.sigma is not None else None,
                     f_data[valid], spin_mode=effective_spin,
-                    palette_index=list(self.loaded_scans).index(k),
+                    palette_index=waterfall_order([s.file_path for s in self.loaded_scans.values()]).index(scan.file_path),
                     dataset_count=len(self.loaded_scans),
                     down_colormap=self.combo_down_colormap.currentText(),
                     up_colormap=self.combo_up_colormap.currentText(),
@@ -933,6 +963,16 @@ class ScanPlotView(QWidget):
             status += " Unit assumptions: " + "; ".join(sorted(assumptions)) + "."
         if warnings:
             status += " " + " | ".join(warnings)
+        waterfall = self.chk_waterfall.isChecked()
+        offset_mode = self.combo_waterfall_mode.currentData()
+        spacing = self.spin_waterfall_spacing.value()
+        visible_paths = {c.source_path for c in all_curves}
+        ordered_paths = waterfall_order([scan.file_path for scan in self.loaded_scans.values()
+                                         if scan.file_path in visible_paths])
+        ranks = {path: rank for rank, path in enumerate(ordered_paths)}
+        if waterfall:
+            units = "decades" if offset_mode == "log" else "Y units"
+            status += f" Waterfall display: {spacing:g} {units} per scan, ascending scan number then unnumbered load order; spins share offsets. Table/export values are unshifted."
         self.lbl_processing.setText(status)
 
         # Clear existing items
@@ -944,7 +984,7 @@ class ScanPlotView(QWidget):
         # Labels
         text_color = "#f1f5f9" if self.is_dark_mode else "#1e293b"
         self.plot_widget.setLabel("bottom", x_label, units=x_units, color=text_color)
-        self.plot_widget.setLabel("left", y_label, units=y_units, color=text_color)
+        self.plot_widget.setLabel("left", y_label + (" (waterfall display)" if waterfall else ""), units=y_units, color=text_color)
 
         bot_ax = self.plot_widget.getPlotItem().getAxis("bottom")
         if bot_ax is not None:
@@ -964,9 +1004,14 @@ class ScanPlotView(QWidget):
         # Render curves
         for curve in all_curves:
             px = curve.x
-            py = curve.y
+            rank = ranks.get(curve.source_path, 0) if waterfall else 0
+            py = display_values(curve.y, rank, spacing, offset_mode) if waterfall else curve.y
+            lower_display = display_values(curve.y_lower, rank, spacing, offset_mode) if waterfall else curve.y_lower
+            upper_display = display_values(curve.y_upper, rank, spacing, offset_mode) if waterfall else curve.y_upper
             perr = curve.y_err
 
+            if waterfall and np.any(np.isfinite(curve.y) & ~np.isfinite(py)):
+                self.lbl_processing.setText(self.lbl_processing.text() + " Offset exceeds display range; reduce spacing. Overflowing points are hidden; original data are retained.")
             valid = np.isfinite(px) & np.isfinite(py)
             if log_x:
                 valid &= (px > 0)
@@ -997,14 +1042,14 @@ class ScanPlotView(QWidget):
                 symbolSize=marker_size,
                 symbolPen=pg.mkPen(curve.color, width=1),
                 symbolBrush=brush,
-                name=curve.label,
+                name=curve.label + (f" [offset {rank * spacing:g} {'dec' if offset_mode == 'log' else 'Y'}]" if waterfall else ""),
             )
 
             # Exact confidence limits remain asymmetric. Standard uncertainty
             # is separately identified in the processing banner and export.
             if show_errors and curve.y_lower is not None and len(cx) > 0:
-                lower = curve.y_lower[valid]
-                upper = curve.y_upper[valid]
+                lower = lower_display[valid]
+                upper = upper_display[valid]
                 x_pts = np.log10(cx) if log_x else cx
                 if log_y:
                     y_pts = np.log10(cy)

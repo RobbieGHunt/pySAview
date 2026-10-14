@@ -6,6 +6,11 @@ from matplotlib.colors import to_hex
 DATASET_SYMBOLS = ("o", "s", "t", "d", "+", "x", "star", "p", "h", "t1", "t2", "t3")
 
 
+def palette_range(dark=False):
+    """Use broad shades while avoiding the least legible endpoints."""
+    return (0.20, 0.85) if dark else (0.30, 0.95)
+
+
 def spin_palette(index=0, count=1, *, down="Blues", up="Reds", dark=False):
     """Sample one shade per loaded scan, avoiding nearly-white/dark endpoints.
 
@@ -14,7 +19,7 @@ def spin_palette(index=0, count=1, *, down="Blues", up="Reds", dark=False):
     """
     count = max(1, count)
     fraction = index / max(1, count - 1) if count > 1 else 0.5
-    low, high = (0.45, 0.70) if dark else (0.60, 0.85)
+    low, high = palette_range(dark)
     position = low + (high - low) * fraction
     return {"down": to_hex(colormaps[down](position)),
             "up": to_hex(colormaps[up](position)),

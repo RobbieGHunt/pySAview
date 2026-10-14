@@ -54,3 +54,7 @@ installation. The module entry point `python -m sa_nxs_explorer` and installed
 
 Legacy `run.vbs`, `sa_nxs_launcher.py`, `create_shortcut.ps1`, and
 `SuperADAM_Explorer.lnk` are retired and should not be used.
+
+### Waterfall display
+
+In **Chart Display Options**, enable **Waterfall: offset scans**. Logarithmic mode defaults to one decade per scan (multiply by `10 ** (rank * spacing)`); linear mode adds `rank * spacing` in plotted Y units. The mode selects the corresponding Y axis scale; the axis controls remain available. Both spin channels of a file share its offset. Numbered `number.nxs` files ascend from the base by scan number; other files follow in load order. Only visible scans occupy ranks. Offsets apply equally to interval endpoints and never change normalization, statistical results, tables, or exported numerical data. Legend labels identify offsets.
