@@ -17,6 +17,7 @@ from PyQt6.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
     QGroupBox,
+    QFormLayout,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -83,6 +84,13 @@ class ScanPlotView(QWidget):
         ctrl_layout.setContentsMargins(0, 0, 0, 0)
         ctrl_layout.setSpacing(10)
 
+        self.control_tabs = QTabWidget()
+        ctrl_layout.addWidget(self.control_tabs)
+        processing_panel = QWidget()
+        processing_layout = QVBoxLayout(processing_panel)
+        processing_layout.setContentsMargins(4, 4, 4, 4)
+        self.control_tabs.addTab(processing_panel, "Data & Processing")
+
         # 1. Axis Selection Group
         grp_axis = QGroupBox("Scan Variables (Axes)")
         axis_layout = QVBoxLayout(grp_axis)
@@ -111,7 +119,7 @@ class ScanPlotView(QWidget):
         self.combo_y.currentIndexChanged.connect(self._on_axis_or_setting_changed)
         axis_layout.addWidget(self.combo_y)
 
-        ctrl_layout.addWidget(grp_axis)
+        processing_layout.addWidget(grp_axis)
 
         # 2. Normalization & Spin Splitting
         grp_processing = QGroupBox("Processing & Polarization")
@@ -157,26 +165,57 @@ class ScanPlotView(QWidget):
         self.combo_spin.currentIndexChanged.connect(self._on_axis_or_setting_changed)
         proc_layout.addWidget(self.combo_spin)
 
-        ctrl_layout.addWidget(grp_processing)
+        processing_layout.addWidget(grp_processing)
+        processing_layout.addStretch()
 
         # 3. Plot Display Options
         grp_display = QGroupBox("Chart Display Options")
         disp_layout = QVBoxLayout(grp_display)
         disp_layout.setSpacing(6)
 
-        disp_layout.addWidget(QLabel("d / Down palette (Flipper OFF):"))
-        self.combo_down_colormap = QComboBox()
-        self.combo_down_colormap.addItems(sorted(colormaps, key=str.casefold))
-        self.combo_down_colormap.setCurrentText("Blues")
-        disp_layout.addWidget(self.combo_down_colormap)
-        disp_layout.addWidget(QLabel("u / Up palette (Flipper ON):"))
-        self.combo_up_colormap = QComboBox()
-        self.combo_up_colormap.addItems(sorted(colormaps, key=str.casefold))
-        self.combo_up_colormap.setCurrentText("Reds")
-        disp_layout.addWidget(self.combo_up_colormap)
-        for combo in (self.combo_down_colormap, self.combo_up_colormap):
-            combo.setToolTip("Choose a Matplotlib colormap; each loaded scan gets a different shade. Reversed palettes end in _r.")
-            combo.currentTextChanged.connect(self._on_axis_or_setting_changed)
+        self.spin_style_controls = {}
+        for spin, title, default_map in (("d", "d / Down — Flipper OFF (0)", "Blues"),
+                                          ("u", "u / Up — Flipper ON (1)", "Reds")):
+            group = QGroupBox(title)
+            form = QFormLayout(group)
+            palette = QComboBox()
+            palette.addItems(sorted(colormaps, key=str.casefold))
+            palette.setCurrentText(default_map)
+            palette.setToolTip("Matplotlib colormap for this spin family; loaded files use different shades.")
+            preview = QLabel()
+            preview.setFixedHeight(12)
+            form.addRow("Colormap:", palette)
+            form.addRow("Shades:", preview)
+            line_style = QComboBox()
+            line_style.addItem("Solid", "solid")
+            line_style.addItem("Dashed", "dashed")
+            form.addRow("Line style:", line_style)
+            line_width = QDoubleSpinBox()
+            line_width.setRange(0.5, 12)
+            line_width.setDecimals(1)
+            line_width.setSingleStep(0.5)
+            line_width.setValue(2)
+            line_width.setSuffix(" px")
+            form.addRow("Line width:", line_width)
+            marker_size = QDoubleSpinBox()
+            marker_size.setRange(0, 24)
+            marker_size.setDecimals(1)
+            marker_size.setValue(5)
+            marker_size.setSuffix(" px")
+            marker_size.setToolTip("Zero hides markers for this spin channel.")
+            form.addRow("Marker size:", marker_size)
+            self.spin_style_controls[spin] = {"colormap": palette, "preview": preview,
+                                               "line_style": line_style,
+                                               "line_width": line_width,
+                                               "marker_size": marker_size}
+            disp_layout.addWidget(group)
+        self.combo_down_colormap = self.spin_style_controls["d"]["colormap"]
+        self.combo_up_colormap = self.spin_style_controls["u"]["colormap"]
+        for controls in self.spin_style_controls.values():
+            controls["colormap"].currentTextChanged.connect(self._on_axis_or_setting_changed)
+            controls["line_style"].currentIndexChanged.connect(self._on_axis_or_setting_changed)
+            controls["line_width"].valueChanged.connect(self._on_axis_or_setting_changed)
+            controls["marker_size"].valueChanged.connect(self._on_axis_or_setting_changed)
 
         scales_row = QHBoxLayout()
         self.chk_log_y = QCheckBox("Log Y")
@@ -202,7 +241,8 @@ class ScanPlotView(QWidget):
         self.chk_errors.toggled.connect(self._on_axis_or_setting_changed)
         disp_layout.addWidget(self.chk_errors)
 
-        ctrl_layout.addWidget(grp_display)
+        disp_layout.addStretch()
+        self.control_tabs.addTab(grp_display, "Chart Display Options")
 
         # 4. Action Buttons
         self.btn_reset = QPushButton("Reset View / Auto-Scale")
@@ -587,6 +627,7 @@ class ScanPlotView(QWidget):
     def set_theme(self, is_dark: bool) -> None:
         """Update chart styling for theme."""
         self.is_dark_mode = is_dark
+        self._update_palette_previews()
         self.btn_reset.setIcon(icons.get_icon("maximize", is_dark=is_dark))
         self.btn_export_csv.setIcon(icons.get_icon("download", is_dark=is_dark))
         self.btn_pan.setIcon(icons.get_icon("hand", is_dark=is_dark))
@@ -672,7 +713,17 @@ class ScanPlotView(QWidget):
         self.btn_tool_log_x.setChecked(self.chk_log_x.isChecked())
         self.btn_tool_log_x.blockSignals(False)
 
+        self._update_palette_previews()
         self._update_plot()
+
+    def _update_palette_previews(self) -> None:
+        from matplotlib.colors import to_hex
+        for controls in self.spin_style_controls.values():
+            cmap = colormaps[controls["colormap"].currentText()]
+            low, high = (0.45, 0.70) if self.is_dark_mode else (0.60, 0.85)
+            stops = ", ".join(f"stop:{i/4:g} {to_hex(cmap(low + (high-low)*i/4))}" for i in range(5))
+            controls["preview"].setStyleSheet(
+                f"background: qlineargradient(x1:0,y1:0,x2:1,y2:0,{stops}); border-radius: 3px;")
 
     def _update_plot(self) -> None:
         # Collect checked scans
@@ -921,16 +972,22 @@ class ScanPlotView(QWidget):
             cy = py[valid]
             cerr = perr[valid] if perr is not None else None
 
-            pen = pg.mkPen(curve.color, width=2) if style in ("both", "line") else None
-            symbol = curve.symbol if style in ("both", "points") else None
-            brush = curve.color if style in ("both", "points") else None
+            controls = self.spin_style_controls.get(curve.spin)
+            line_width = controls["line_width"].value() if controls else 2
+            marker_size = controls["marker_size"].value() if controls else 5
+            dashed = controls is not None and controls["line_style"].currentData() == "dashed"
+            pen = pg.mkPen(curve.color, width=line_width,
+                           style=Qt.PenStyle.DashLine if dashed else Qt.PenStyle.SolidLine) if style in ("both", "line") else None
+            symbol = curve.symbol if style in ("both", "points") and marker_size > 0 else None
+            brush = curve.color if symbol is not None else None
 
             self.plot_widget.plot(
                 cx,
                 cy,
                 pen=pen,
                 symbol=symbol,
-                symbolSize=4,
+                symbolSize=marker_size,
+                symbolPen=pg.mkPen(curve.color, width=1),
                 symbolBrush=brush,
                 name=curve.label,
             )
@@ -949,7 +1006,7 @@ class ScanPlotView(QWidget):
                     top_err, bot_err = upper - cy, cy - lower
                 self.plot_widget.addItem(pg.ErrorBarItem(
                     x=x_pts, y=y_pts, top=top_err, bottom=bot_err,
-                    beam=0, pen=pg.mkPen(curve.color, width=2),
+                    beam=0, pen=pg.mkPen(curve.color, width=line_width),
                 ))
 
         apply_plot_theme(self.plot_widget, self.is_dark_mode)

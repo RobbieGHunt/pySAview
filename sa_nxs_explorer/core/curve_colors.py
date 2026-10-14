@@ -14,7 +14,7 @@ def spin_palette(index=0, count=1, *, down="Blues", up="Reds", dark=False):
     """
     count = max(1, count)
     fraction = index / max(1, count - 1) if count > 1 else 0.5
-    low, high = (0.30, 0.65) if dark else (0.45, 0.85)
+    low, high = (0.45, 0.70) if dark else (0.60, 0.85)
     position = low + (high - low) * fraction
     return {"down": to_hex(colormaps[down](position)),
             "up": to_hex(colormaps[up](position)),

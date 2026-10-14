@@ -30,6 +30,7 @@ class PlottedCurve:
     y_units: str = ""
     wavelength: float | None = None
     symbol: str = "o"
+    spin: str | None = None
 
 
 @dataclass
@@ -141,6 +142,7 @@ def split_by_flipper(
         curves.append(
             PlottedCurve(
                 label=f"{prefix}d (OFF)",
+                spin="d",
                 x=x_data[sorted_idx0],
                 y=y_data[sorted_idx0],
                 y_err=y_err[sorted_idx0] if y_err is not None else None,
@@ -158,6 +160,7 @@ def split_by_flipper(
         curves.append(
             PlottedCurve(
                 label=f"{prefix}u (ON)",
+                spin="u",
                 x=x_data[sorted_idx1],
                 y=y_data[sorted_idx1],
                 y_err=y_err[sorted_idx1] if y_err is not None else None,

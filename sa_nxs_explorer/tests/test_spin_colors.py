@@ -5,12 +5,40 @@ from sa_nxs_explorer.core.curve_colors import spin_palette
 from sa_nxs_explorer.tests.test_processing_ui import scan
 from sa_nxs_explorer.core.models import ScanVariable
 from sa_nxs_explorer.ui.scan_plot_view import ScanPlotView
+from PyQt6.QtCore import Qt
+
+
+def test_independent_spin_line_and_marker_styles(qtbot):
+    view = ScanPlotView()
+    qtbot.addWidget(view)
+    data = scan()
+    data.variables["Flipper1"] = ScanVariable(3, "Flipper1", "F1", "", "", 0, False, np.array([0, 1, 0]))
+    view.add_scan(data)
+    view.chk_log_y.setChecked(False)
+    tab = view.control_tabs.widget(1)
+    assert view.control_tabs.tabText(1) == "Chart Display Options"
+    controls = view.spin_style_controls["u"]
+    controls["line_style"].setCurrentIndex(controls["line_style"].findData("dashed"))
+    controls["line_width"].setValue(4)
+    controls["marker_size"].setValue(11)
+    plots = {item.name(): item for item in view.plot_widget.listDataItems()}
+    up = plots["u (ON)"]
+    down = plots["d (OFF)"]
+    assert up.opts["pen"].style() == Qt.PenStyle.DashLine
+    assert up.opts["pen"].widthF() == 4
+    assert up.opts["symbolSize"] == 11
+    assert down.opts["pen"].style() == Qt.PenStyle.SolidLine
+    assert down.opts["pen"].widthF() == 2
+    assert down.opts["symbolSize"] == 5
+    controls["marker_size"].setValue(0)
+    up = next(item for item in view.plot_widget.listDataItems() if item.name() == "u (ON)")
+    assert up.opts["symbol"] is None
 
 
 def test_default_spin_colors_follow_superadam_convention():
     palette = spin_palette()
-    assert palette["up"] == to_hex(colormaps["Reds"](0.65))
-    assert palette["down"] == to_hex(colormaps["Blues"](0.65))
+    assert palette["up"] == to_hex(colormaps["Reds"](0.725))
+    assert palette["down"] == to_hex(colormaps["Blues"](0.725))
     for dark in [False, True]:
         shades = [spin_palette(i, 12, dark=dark) for i in range(12)]
         assert len({p["up"] for p in shades}) == 12
