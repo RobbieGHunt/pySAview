@@ -730,10 +730,10 @@ class ScanPlotView(QWidget):
         expected_units = None
 
         def canonical_unit(unit):
-            key = unit.strip().lower()
+            key = unit.strip()
             return {"degree": "deg", "degrees": "deg", "°": "deg",
                     "count": "counts", "cts": "counts", "sec": "s",
-                    "seconds": "s", "second": "s"}.get(key, key)
+                    "seconds": "s", "second": "s"}.get(key.lower(), key)
 
         for idx, (k, scan) in enumerate(checked_scans):
             name = Path(scan.file_path).name

@@ -74,6 +74,13 @@ def test_overlay_unit_mismatch_is_reported(view):
     assert "units differ" in view.lbl_processing.text()
 
 
+def test_unit_symbols_preserve_case_and_prefix_scale(view):
+    view.add_scan(scan(detector_unit="mA"))
+    view.add_scan(scan("megamp.nxs", detector_unit="MA"))
+    assert len(view._current_curves) == 1
+    assert "units differ" in view.lbl_processing.text()
+
+
 def test_invalid_monitor_points_keep_original_step_indices(view):
     view.add_scan(scan(monitor=(1000, 0, 2000)))
     set_mode(view, "monitor")
