@@ -9,6 +9,7 @@ from PyQt6.QtWidgets import (
     QHeaderView,
     QLabel,
     QLineEdit,
+    QSizePolicy,
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
@@ -48,6 +49,7 @@ class MetadataView(QWidget):
         self.lbl_exp_details = QLabel("No file loaded.")
         self.lbl_exp_details.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.lbl_exp_details.setWordWrap(True)
+        self.lbl_exp_details.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         exp_layout.addWidget(self.lbl_exp_details)
         top_layout.addWidget(grp_exp, 1)
 
@@ -58,6 +60,7 @@ class MetadataView(QWidget):
         self.lbl_sample_details = QLabel("No sample metadata available.")
         self.lbl_sample_details.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.lbl_sample_details.setWordWrap(True)
+        self.lbl_sample_details.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         sample_layout.addWidget(self.lbl_sample_details)
         top_layout.addWidget(grp_sample, 1)
 

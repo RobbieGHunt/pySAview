@@ -14,6 +14,7 @@ from PyQt6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QPushButton,
+    QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
@@ -135,12 +136,15 @@ class SessionFilesView(QWidget):
         info_layout.setSpacing(3)
 
         self.lbl_info_title = QLabel("Active Sample:")
+        self.lbl_info_title.setWordWrap(True)
+        self.lbl_info_title.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         self.lbl_info_title.setStyleSheet("font-weight: 700; font-size: 11px; color: #0369a1;")
         info_layout.addWidget(self.lbl_info_title)
 
         self.lbl_info_desc = QLabel("No file active")
         self.lbl_info_desc.setStyleSheet("color: #334155; font-size: 11px;")
         self.lbl_info_desc.setWordWrap(True)
+        self.lbl_info_desc.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         info_layout.addWidget(self.lbl_info_desc)
 
         exp_layout.addWidget(self.info_frame)

@@ -26,6 +26,7 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QSplitter,
     QTabWidget,
     QTableWidget,
@@ -272,6 +273,9 @@ class ScanPlotView(QWidget):
         header_row = QHBoxLayout()
         self.lbl_title = QLabel("Load a scan file to plot data.")
         self.lbl_title.setWordWrap(True)
+        self.lbl_title.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.lbl_title.setMinimumWidth(0)
+        self.lbl_title.setTextFormat(Qt.TextFormat.PlainText)
         self.lbl_title.setStyleSheet("font-weight: 700; font-size: 14px; color: #0284c7;")
         header_row.addWidget(self.lbl_title, 1)
 
@@ -283,6 +287,8 @@ class ScanPlotView(QWidget):
         right_layout.addLayout(header_row)
         self.lbl_processing = QLabel("Open a scan to inspect processing.")
         self.lbl_processing.setWordWrap(True)
+        self.lbl_processing.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.lbl_processing.setMinimumWidth(0)
         self.lbl_processing.setTextFormat(Qt.TextFormat.PlainText)
         self.lbl_processing.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.lbl_processing.setStyleSheet("font-size: 12px; padding: 4px;")
@@ -767,13 +773,15 @@ class ScanPlotView(QWidget):
             title_text = f"Scan #{meta.run_number}: {scan_desc}" if meta.run_number else (scan_desc or "Scan Data")
         else:
             runs = []
+            descriptions = []
             for _, s in checked_scans:
                 rn = f"#{s.metadata.run_number}" if s.metadata.run_number else Path(s.file_path).name
-                if s.metadata.subtitle:
-                    rn += f" ({s.metadata.subtitle})"
-                runs.append(rn)
-            title_text = f"Multi-Scan Overlay: {', '.join(runs)} ({len(checked_scans)} datasets)"
-        self.lbl_title.setText(title_text)
+                runs.append(rn if len(rn) <= 24 else rn[:21] + "…")
+                descriptions.append(f"{rn}: {s.metadata.subtitle or s.metadata.title}")
+            suffix = f" (+{len(runs)-5} more)" if len(runs) > 5 else ""
+            title_text = f"Overlay: {len(runs)} scans — {', '.join(runs[:5])}{suffix}"
+        self.lbl_title.setToolTip(title_text if len(checked_scans) == 1 else "\n".join(descriptions))
+        self.lbl_title.setText(title_text if len(title_text) <= 160 else title_text[:157] + "…")
 
         x_key = self.combo_x.currentData()
         y_key = self.combo_y.currentData()
