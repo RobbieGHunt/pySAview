@@ -311,20 +311,22 @@ def test_spin_filter_in_detector_view(main_window: MainWindow):
     total = det._total_frames
     assert total > 0
 
-    # Test Spin Up (F=0)
+    # Test Spin Up (F=1)
     idx_up = det.combo_spin_filter.findData("up")
     det.combo_spin_filter.setCurrentIndex(idx_up)
     assert len(det._filtered_indices) == total // 2
-    assert "Up (F=0)" in det.lbl_step_info.text()
+    assert all(det.scan_data.variables["Flipper1"].data[i] == 1 for i in det._filtered_indices)
+    assert "u — Up (F=1 / ON)" in det.lbl_step_info.text()
     det.btn_next.click()
     assert det._current_filtered_pos == 1
-    assert "Up (F=0)" in det.lbl_step_info.text()
+    assert "u — Up (F=1 / ON)" in det.lbl_step_info.text()
 
-    # Test Spin Down (F=1)
+    # Test Spin Down (F=0)
     idx_down = det.combo_spin_filter.findData("down")
     det.combo_spin_filter.setCurrentIndex(idx_down)
     assert len(det._filtered_indices) == total // 2
-    assert "Down (F=1)" in det.lbl_step_info.text()
+    assert all(det.scan_data.variables["Flipper1"].data[i] == 0 for i in det._filtered_indices)
+    assert "d — Down (F=0 / OFF)" in det.lbl_step_info.text()
 
     # Test All Frames
     idx_all = det.combo_spin_filter.findData("all")

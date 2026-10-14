@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Literal
 import numpy as np
 from sa_nxs_explorer.core.normalization import normalize_signal
+from sa_nxs_explorer.core.curve_colors import spin_palette, DATASET_SYMBOLS
 
 
 @dataclass
@@ -28,6 +29,7 @@ class PlottedCurve:
     x_units: str = ""
     y_units: str = ""
     wavelength: float | None = None
+    symbol: str = "o"
 
 
 @dataclass
@@ -79,22 +81,6 @@ def compute_normalized_y(
     return result.values, result.sigma
 
 
-CURVE_PALETTES = [
-    # 0: Blue / Sky / Red
-    {"all": "#2563eb", "up": "#0284c7", "down": "#e11d48"},
-    # 1: Emerald / Mint / Amber
-    {"all": "#059669", "up": "#10b981", "down": "#d97706"},
-    # 2: Violet / Purple / Magenta
-    {"all": "#7c3aed", "up": "#8b5cf6", "down": "#db2777"},
-    # 3: Cyan / Sky / Orange
-    {"all": "#0891b2", "up": "#06b6d4", "down": "#ea580c"},
-    # 4: Indigo / Lavender / Crimson
-    {"all": "#4338ca", "up": "#6366f1", "down": "#dc2626"},
-    # 5: Green / Lime / Fuchsia
-    {"all": "#16a34a", "up": "#22c55e", "down": "#c026d3"},
-]
-
-
 def split_by_flipper(
     x_data: np.ndarray,
     y_data: np.ndarray,
@@ -103,19 +89,24 @@ def split_by_flipper(
     spin_mode: str = "split",
     palette_index: int = 0,
     dataset_name: str = "",
+    dataset_count: int = 1,
+    down_colormap: str = "Blues",
+    up_colormap: str = "Reds",
+    dark: bool = False,
 ) -> list[PlottedCurve]:
     """Split X and Y curves by spin state (Flipper 0 or 1).
 
     spin_mode:
       - 'all': Single curve with all points
-      - 'split': Two curves (Spin Up / Flipper=0 and Spin Down / Flipper=1)
+      - 'split': Two curves (d / Flipper OFF=0 and u / Flipper ON=1)
       - 'flipper0': Only Flipper=0
       - 'flipper1': Only Flipper=1
     """
     indices = np.arange(len(x_data))
     f = np.asarray(flipper_data)
 
-    pal = CURVE_PALETTES[palette_index % len(CURVE_PALETTES)]
+    pal = spin_palette(palette_index, dataset_count, down=down_colormap, up=up_colormap, dark=dark)
+    symbol = DATASET_SYMBOLS[palette_index % len(DATASET_SYMBOLS)]
     color_all = pal["all"]
     color_up = pal["up"]
     color_down = pal["down"]
@@ -132,6 +123,7 @@ def split_by_flipper(
                 color=color_all,
                 indices=indices,
                 dataset_name=dataset_name,
+                symbol=symbol,
             )
         ]
 
@@ -148,13 +140,14 @@ def split_by_flipper(
         sorted_idx0 = idx0[sort_order0]
         curves.append(
             PlottedCurve(
-                label=f"{prefix}Spin Up (Flipper OFF / 0)",
+                label=f"{prefix}d (OFF)",
                 x=x_data[sorted_idx0],
                 y=y_data[sorted_idx0],
                 y_err=y_err[sorted_idx0] if y_err is not None else None,
-                color=color_up,
+                color=color_down,
                 indices=sorted_idx0,
                 dataset_name=dataset_name,
+                symbol=symbol,
             )
         )
 
@@ -164,13 +157,14 @@ def split_by_flipper(
         sorted_idx1 = idx1[sort_order1]
         curves.append(
             PlottedCurve(
-                label=f"{prefix}Spin Down (Flipper ON / 1)",
+                label=f"{prefix}u (ON)",
                 x=x_data[sorted_idx1],
                 y=y_data[sorted_idx1],
                 y_err=y_err[sorted_idx1] if y_err is not None else None,
-                color=color_down,
+                color=color_up,
                 indices=sorted_idx1,
                 dataset_name=dataset_name,
+                symbol=symbol,
             )
         )
 
@@ -187,6 +181,7 @@ def split_by_flipper(
                 color=color_all,
                 indices=indices,
                 dataset_name=dataset_name,
+                symbol=symbol,
             )
         ]
 

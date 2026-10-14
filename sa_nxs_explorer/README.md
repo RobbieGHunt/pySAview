@@ -22,7 +22,8 @@ Processing conventions and P0 changes are described in
 ### 2. 📈 Scan Charts (Reflectometry X-Y Plotter)
 - **Channel selection**: Plot any scanned variable (`th`, `tth`, `Detector1`, `Monitor1`, `Time`, etc.).
 - **$Q$ Momentum Transfer conversion**: Converts incident angle $\theta$ (deg) to $Q = \frac{4\pi}{\lambda}\sin(\theta)$ with configurable neutron wavelength $\lambda$ (default: 5.21 Å).
-- **Polarization / Spin state separation**: Splits curves automatically by `Flipper1` into **Spin Up** (Flipper OFF / 0) and **Spin Down** (Flipper ON / 1) states.
+- **Polarization / Spin state separation**: Splits curves automatically by `Flipper1` into **d / Spin Down** (Flipper OFF / 0) and **u / Spin Up** (Flipper ON / 1) states.
+- **Multi-file spin colors**: `d` uses Matplotlib `Blues` and `u` uses `Reds` by default. Independent palette selectors include all Matplotlib defaults and reversed maps. Loaded scans use different shades and marker shapes; hiding a scan preserves the other scans' colors.
 - **Count Normalization**:
   - Raw counts
   - Unscaled beam-monitor ratio (`Detector1 / Monitor1`)

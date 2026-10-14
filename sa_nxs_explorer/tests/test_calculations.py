@@ -80,13 +80,13 @@ def test_split_by_flipper():
     # Split mode
     curves = split_by_flipper(x, y, y_err, flipper, spin_mode="split")
     assert len(curves) == 2
-    c_up = curves[0]
-    c_down = curves[1]
-    assert "Flipper OFF / 0" in c_up.label
-    assert "Flipper ON / 1" in c_down.label
-    np.testing.assert_array_equal(c_up.x, [1.0, 2.0, 3.0])
-    np.testing.assert_array_equal(c_up.y, [10.0, 30.0, 50.0])
-    np.testing.assert_array_equal(c_down.y, [20.0, 40.0, 60.0])
+    c_down = curves[0]
+    c_up = curves[1]
+    assert c_down.label == "d (OFF)"
+    assert c_up.label == "u (ON)"
+    np.testing.assert_array_equal(c_down.x, [1.0, 2.0, 3.0])
+    np.testing.assert_array_equal(c_down.y, [10.0, 30.0, 50.0])
+    np.testing.assert_array_equal(c_up.y, [20.0, 40.0, 60.0])
 
     # Combined mode
     curves_all = split_by_flipper(x, y, y_err, flipper, spin_mode="all")

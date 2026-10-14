@@ -8,6 +8,7 @@ from typing import Any
 
 import numpy as np
 import pyqtgraph as pg
+from matplotlib import colormaps
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
     QButtonGroup,
@@ -149,10 +150,10 @@ class ScanPlotView(QWidget):
 
         proc_layout.addWidget(QLabel("Polarization (Spin State):"))
         self.combo_spin = QComboBox()
-        self.combo_spin.addItem("Split by Flipper1 (Up vs Down)", "split")
+        self.combo_spin.addItem("Split by Flipper1 (d / u)", "split")
         self.combo_spin.addItem("Combined (All points)", "all")
-        self.combo_spin.addItem("Spin Up only (Flipper 0)", "flipper0")
-        self.combo_spin.addItem("Spin Down only (Flipper 1)", "flipper1")
+        self.combo_spin.addItem("d — Down only (Flipper OFF / 0)", "flipper0")
+        self.combo_spin.addItem("u — Up only (Flipper ON / 1)", "flipper1")
         self.combo_spin.currentIndexChanged.connect(self._on_axis_or_setting_changed)
         proc_layout.addWidget(self.combo_spin)
 
@@ -162,6 +163,20 @@ class ScanPlotView(QWidget):
         grp_display = QGroupBox("Chart Display Options")
         disp_layout = QVBoxLayout(grp_display)
         disp_layout.setSpacing(6)
+
+        disp_layout.addWidget(QLabel("d / Down palette (Flipper OFF):"))
+        self.combo_down_colormap = QComboBox()
+        self.combo_down_colormap.addItems(sorted(colormaps, key=str.casefold))
+        self.combo_down_colormap.setCurrentText("Blues")
+        disp_layout.addWidget(self.combo_down_colormap)
+        disp_layout.addWidget(QLabel("u / Up palette (Flipper ON):"))
+        self.combo_up_colormap = QComboBox()
+        self.combo_up_colormap.addItems(sorted(colormaps, key=str.casefold))
+        self.combo_up_colormap.setCurrentText("Reds")
+        disp_layout.addWidget(self.combo_up_colormap)
+        for combo in (self.combo_down_colormap, self.combo_up_colormap):
+            combo.setToolTip("Choose a Matplotlib colormap; each loaded scan gets a different shade. Reversed palettes end in _r.")
+            combo.currentTextChanged.connect(self._on_axis_or_setting_changed)
 
         scales_row = QHBoxLayout()
         self.chk_log_y = QCheckBox("Log Y")
@@ -819,7 +834,12 @@ class ScanPlotView(QWidget):
                 curves = split_by_flipper(
                     x_data[valid], result.values[valid],
                     result.sigma[valid] if result.sigma is not None else None,
-                    f_data[valid], spin_mode=effective_spin, palette_index=idx,
+                    f_data[valid], spin_mode=effective_spin,
+                    palette_index=list(self.loaded_scans).index(k),
+                    dataset_count=len(self.loaded_scans),
+                    down_colormap=self.combo_down_colormap.currentText(),
+                    up_colormap=self.combo_up_colormap.currentText(),
+                    dark=self.is_dark_mode,
                     dataset_name=f"#{scan.metadata.run_number}" if is_multi and scan.metadata.run_number else (name if is_multi else ""),
                 )
                 for curve in curves:
@@ -902,7 +922,7 @@ class ScanPlotView(QWidget):
             cerr = perr[valid] if perr is not None else None
 
             pen = pg.mkPen(curve.color, width=2) if style in ("both", "line") else None
-            symbol = "o" if style in ("both", "points") else None
+            symbol = curve.symbol if style in ("both", "points") else None
             brush = curve.color if style in ("both", "points") else None
 
             self.plot_widget.plot(

@@ -92,8 +92,8 @@ class DetectorView(QWidget):
         ctrl_bar.addWidget(QLabel("Spin:"))
         self.combo_spin_filter = QComboBox()
         self.combo_spin_filter.addItem("All Frames", "all")
-        self.combo_spin_filter.addItem("Spin Up (F=0)", "up")
-        self.combo_spin_filter.addItem("Spin Down (F=1)", "down")
+        self.combo_spin_filter.addItem("u — Spin Up (F=1)", "up")
+        self.combo_spin_filter.addItem("d — Spin Down (F=0)", "down")
         self.combo_spin_filter.currentIndexChanged.connect(self._on_spin_filter_changed)
         ctrl_bar.addWidget(self.combo_spin_filter)
 
@@ -397,10 +397,10 @@ class DetectorView(QWidget):
             self._filtered_indices = list(range(self._total_frames))
         elif mode == "up":
             f_data = flipper.data
-            self._filtered_indices = [i for i in range(min(self._total_frames, len(f_data))) if float(f_data[i]) < 0.5]
+            self._filtered_indices = [i for i in range(min(self._total_frames, len(f_data))) if float(f_data[i]) == 1]
         elif mode == "down":
             f_data = flipper.data
-            self._filtered_indices = [i for i in range(min(self._total_frames, len(f_data))) if float(f_data[i]) >= 0.5]
+            self._filtered_indices = [i for i in range(min(self._total_frames, len(f_data))) if float(f_data[i]) == 0]
 
         if not self._filtered_indices:
             self._filtered_indices = list(range(self._total_frames))
@@ -794,10 +794,10 @@ class DetectorView(QWidget):
         # Update metadata banner
         th_val = self.scan_data.variables["th"].data[frame_idx] if "th" in self.scan_data.variables else 0.0
         tth_val = self.scan_data.variables["tth"].data[frame_idx] if "tth" in self.scan_data.variables else 0.0
-        flip_val = self.scan_data.variables["Flipper1"].data[frame_idx] if "Flipper1" in self.scan_data.variables else 0.0
+        flip_val = self.scan_data.variables["Flipper1"].data[frame_idx] if "Flipper1" in self.scan_data.variables else np.nan
         total_counts = float(np.sum(frame))
 
-        spin_str = "Up (F=0)" if flip_val < 0.5 else "Down (F=1)"
+        spin_str = {0: "d — Down (F=0 / OFF)", 1: "u — Up (F=1 / ON)"}.get(flip_val, "Unknown flipper state")
         filt_count = len(self._filtered_indices) if self._filtered_indices else self._total_frames
         step_pos = (self._current_filtered_pos + 1) if self._filtered_indices else (frame_idx + 1)
         info_str = (
