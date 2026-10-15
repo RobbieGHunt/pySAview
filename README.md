@@ -66,3 +66,9 @@ The u/d shade bars always display the full selected colormaps. Drag either trian
 ### Source data and scan ownership
 
 Measurement files are opened read-only and must never be overwritten by the app. Processing changes only in-memory data. Export destinations reject NeXus/HDF5 extensions and aliases of loaded source files. Each scan owns its working ROI independently; applying a user ROI preserves the original file ROI. Reusing an ROI across scans must be an explicit operation, never automatic inheritance. Future ROI/session saves belong in separate sidecar files.
+
+### ROI definitions
+
+In the 2D Detector ROI panel, **Save ROI…** saves the currently displayed fixed region or all tracked frame regions into a new `.json` file. Existing files are never overwritten by this operation; choose a new name. Definitions include a format version, pixel convention, detector dimensions, source path and frame count.
+
+**Load ROI…** explicitly stages the definition for the active scan only. Check its overlay for drift, adjust it if needed, then choose **Apply ROI to Scan Chart**. Fixed definitions may be reused with matching detector dimensions; tracked definitions require the original source path and frame count. Moving a tracked ROI manually changes it into a fixed ROI. Applied working definitions survive switching scans in the running app; reopen them from JSON after restarting (full session persistence remains future work). Reset restores the file ROI without modifying it. Counting intervals do not quantify uncertainty introduced by peak tracking.

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from sa_nxs_explorer.core.roi_record import ROIRecord
+
 from dataclasses import dataclass, field
 from typing import Any
 import numpy as np
@@ -99,3 +101,5 @@ class ScanData:
     detector_roi: tuple[float, float, float, float] | None = None  # (x0, x1, y0, y1)
     detector_path: str = ""
     working_detector_roi: tuple[float, float, float, float] | None = None  # in-memory, scan-specific; file ROI stays unchanged
+
+    working_roi_record: ROIRecord | None = None

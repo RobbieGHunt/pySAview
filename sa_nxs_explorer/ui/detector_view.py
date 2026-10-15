@@ -13,6 +13,8 @@ from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QGroupBox,
+    QFileDialog,
+    QMessageBox,
     QHBoxLayout,
     QLabel,
     QPushButton,
@@ -24,6 +26,7 @@ from PyQt6.QtWidgets import (
 )
 
 from sa_nxs_explorer.core.models import ScanData
+from sa_nxs_explorer.core.roi_record import ROIRecord, save_roi, load_roi
 from sa_nxs_explorer.core.nexus_reader import NexusReader
 from sa_nxs_explorer.core.scan_calculations import integrate_roi_2d
 from sa_nxs_explorer.core.roi import pixel_bounds
@@ -280,6 +283,15 @@ class DetectorView(QWidget):
         self.btn_reset_roi.clicked.connect(self._reset_to_file_roi)
         btns_row.addWidget(self.btn_reset_roi)
         roi_ctrl_layout.addLayout(btns_row)
+        sidecar_row = QHBoxLayout()
+        self.btn_save_roi = QPushButton("Save ROI…")
+        self.btn_load_roi = QPushButton("Load ROI…")
+        self.btn_save_roi.clicked.connect(self._save_roi_definition)
+        self.btn_load_roi.clicked.connect(self._load_roi_definition)
+        self.btn_load_roi.setToolTip("Explicitly load a fixed ROI into this scan only; review it for drift before applying.")
+        sidecar_row.addWidget(self.btn_save_roi)
+        sidecar_row.addWidget(self.btn_load_roi)
+        roi_ctrl_layout.addLayout(sidecar_row)
 
         self.lbl_roi_status = QLabel("Drag yellow box on detector to adjust ROI.")
         self.lbl_roi_status.setStyleSheet("color: #64748b; font-size: 11px;")
@@ -334,6 +346,17 @@ class DetectorView(QWidget):
         self.lbl_roi_status.setText("Drag yellow box on detector to adjust ROI, or click 'Auto-Fit ROI'.")
         self.lbl_roi_status.setStyleSheet("color: #64748b; font-size: 11px;")
 
+        record = scan_data.working_roi_record
+        if record is not None:
+            record.validate_scan(scan_data.detector_shape, scan_data.file_path)
+            if record.mode == "tracked":
+                self._per_frame_rois = list(record.bounds)
+                existing = scan_data.variables.get("ROI_Counts")
+                self._per_frame_counts = existing.data.copy() if existing is not None else reader.compute_per_frame_scan_roi(self._per_frame_rois)
+                self._auto_fit_active = True
+                self.lbl_roi_status.setText("Restored this scan's tracked ROI (counting intervals exclude tracking uncertainty).")
+            else:
+                self.lbl_roi_status.setText("Restored this scan's fixed ROI.")
         self._total_frames = scan_data.detector_shape[0]
         self.slider_step.setEnabled(True)
         self.spin_step.setEnabled(True)
@@ -346,7 +369,7 @@ class DetectorView(QWidget):
             self.plot_2d.removeItem(self._roi_rect_item)
             self._roi_rect_item = None
 
-        initial_roi = scan_data.working_detector_roi or scan_data.detector_roi or (354.0, 382.0, 285.0, 743.0)
+        initial_roi = (record.bounds[0] if record is not None else None) or scan_data.working_detector_roi or scan_data.detector_roi or (354.0, 382.0, 285.0, 743.0)
         x0, x1, y0, y1 = initial_roi
         pos_x = min(x0, x1)
         pos_y = min(y0, y1)
@@ -634,15 +657,72 @@ class DetectorView(QWidget):
         self.lbl_roi_status.setText("Reset to default file ROI.")
         self.lbl_roi_status.setStyleSheet("color: #64748b; font-size: 11px;")
 
+    def _current_roi_record(self):
+        shape = self.scan_data.detector_shape
+        tracked = self._auto_fit_active and self._per_frame_rois is not None
+        bounds = tuple(tuple(r) for r in self._per_frame_rois) if tracked else (tuple(self._get_current_roi_bounds()),)
+        return ROIRecord("tracked" if tracked else "fixed", (shape[2], shape[1]), shape[0], bounds, self.scan_data.file_path)
+
+    def _emit_roi(self, counts, bounds):
+        self.scan_data.working_roi_record = self._current_roi_record()
+        self.scan_data.working_detector_roi = tuple(bounds)
+        self.roi_applied.emit(counts, bounds)
+
+    def _save_roi_definition(self):
+        if self.scan_data is None or not self.scan_data.has_detector_2d:
+            return
+        path, _ = QFileDialog.getSaveFileName(self, "Save ROI definition (new file)", "scan.roi.json", "ROI definitions (*.json)")
+        if not path:
+            return
+        try:
+            save_roi(path, self._current_roi_record())
+        except (ValueError, OSError, TypeError) as error:
+            QMessageBox.warning(self, "ROI not saved", str(error))
+            return
+        self.lbl_roi_status.setText("ROI definition saved separately; measurement file unchanged.")
+
+    def _load_roi_definition(self):
+        if self.scan_data is None or not self.scan_data.has_detector_2d:
+            return
+        path, _ = QFileDialog.getOpenFileName(self, "Load ROI into this scan", "", "ROI definitions (*.json)")
+        if not path:
+            return
+        try:
+            record = load_roi(path)
+            record.validate_scan(self.scan_data.detector_shape, self.scan_data.file_path)
+        except (ValueError, OSError, TypeError) as error:
+            QMessageBox.warning(self, "ROI not loaded", str(error))
+            return
+        # Stage only: users review the overlay before applying it to the chart.
+        self._auto_fit_active = record.mode == "tracked"
+        self._per_frame_rois = list(record.bounds) if self._auto_fit_active else None
+        self._per_frame_counts = None
+        if self._auto_fit_active:
+            self._per_frame_counts = self.reader.compute_per_frame_scan_roi(self._per_frame_rois)
+        bounds = record.bounds[min(self._current_frame_idx, len(record.bounds)-1)]
+        x0, x1, y0, y1 = bounds
+        self._updating_roi_internally = True
+        self._roi_rect_item.setPos([min(x0, x1), min(y0, y1)])
+        self._roi_rect_item.setSize([abs(x1-x0), abs(y1-y0)])
+        self._updating_roi_internally = False
+        self._sync_spinboxes_from_bounds(*bounds)
+        self._update_profiles_and_counts(*bounds)
+        self.lbl_roi_status.setText("Loaded into this scan only. Review for drift, then Apply ROI to Scan Chart.")
+
     def _apply_roi_to_scan_chart(self) -> None:
         """Compute full scan integration for the current ROI and emit roi_applied."""
         if self.reader is None or self.scan_data is None:
             return
 
+        try:
+            self._current_roi_record()
+        except (ValueError, TypeError) as error:
+            QMessageBox.warning(self, "Invalid ROI", str(error))
+            return
         if self._auto_fit_active and self._per_frame_counts is not None and self._per_frame_rois is not None:
             roi_counts = self._per_frame_counts
             cur_roi = self._per_frame_rois[self._current_frame_idx] if 0 <= self._current_frame_idx < len(self._per_frame_rois) else self._get_current_roi_bounds()
-            self.roi_applied.emit(roi_counts, cur_roi)
+            self._emit_roi(roi_counts, cur_roi)
             self.lbl_roi_status.setText(
                 f"Auto-Fit ROI ({len(self._per_frame_rois)} frames) applied to Scan Chart!"
             )
@@ -657,7 +737,7 @@ class DetectorView(QWidget):
 
         if roi_counts is not None:
             # Emit signal for MainWindow / ScanPlotView
-            self.roi_applied.emit(roi_counts, roi_bounds)
+            self._emit_roi(roi_counts, roi_bounds)
             self.lbl_roi_status.setText(
                 f"ROI applied to Scan Chart! (X: [{x0:.0f}..{x1:.0f}], Y: [{y0:.0f}..{y1:.0f}])"
             )
@@ -717,13 +797,13 @@ class DetectorView(QWidget):
         mean_c = float(np.mean(centers))
         std_c = float(np.std(centers))
         self.lbl_roi_status.setText(
-            f"Auto-Fit active: {len(rois)} frames tracked (Peak X: {mean_c:.1f} ± {std_c:.1f} px). Applied to Scan Chart!"
+            f"Auto-Fit active: {len(rois)} frames tracked (Peak X: {mean_c:.1f} ± {std_c:.1f} px). Applied to Scan Chart! Counting intervals exclude tracking uncertainty."
         )
         self.lbl_roi_status.setStyleSheet("color: #10b981; font-weight: 600; font-size: 11px;")
 
         # Automatically apply to scan chart
         cur_roi = rois[self._current_frame_idx] if 0 <= self._current_frame_idx < len(rois) else initial_roi
-        self.roi_applied.emit(counts, cur_roi)
+        self._emit_roi(counts, cur_roi)
 
     def _update_profiles_and_counts(self, x0: float, x1: float, y0: float, y1: float) -> None:
         if self._current_frame_data is None:
