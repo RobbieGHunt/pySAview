@@ -35,3 +35,25 @@ def test_axis_fonts_and_hidden_legend_survive_replot_and_theme(qtbot):
         assert axis.labelStyle["font-size"] == "18pt"
     view.chk_show_legend.setChecked(True)
     assert view.legend.isVisible()
+
+
+def test_axis_titles_keep_text_units_and_contrast(qtbot):
+    view = ScanPlotView()
+    qtbot.addWidget(view)
+    view.add_scan(scan())
+    original = {name: (view.plot_widget.getAxis(name).labelText,
+                       view.plot_widget.getAxis(name).labelUnits)
+                for name in ("left", "bottom")}
+    for dark in (True, False, True):
+        view.set_theme(dark)
+        view.spin_axis_font_size.setValue(20 if dark else 12)
+        view.chk_show_legend.setChecked(not dark)
+        view.chk_show_data_panel.setChecked(not dark)
+        view._update_plot()
+        for name in ("left", "bottom"):
+            axis = view.plot_widget.getAxis(name)
+            assert axis.labelText
+            assert (axis.labelText, axis.labelUnits) == original[name]
+            assert axis.label.isVisible()
+            assert axis.labelStyle["color"] == ("#f1f5f9" if dark else "#1e293b")
+            assert axis.labelText in axis.label.toPlainText()

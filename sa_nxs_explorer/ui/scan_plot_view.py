@@ -811,7 +811,9 @@ class ScanPlotView(QWidget):
         for name in ("left", "bottom", "top", "right"):
             axis = self.plot_widget.getAxis(name)
             axis.setTickFont(font)
-            axis.setLabel(axis.labelText, units=axis.labelUnits or "", **{"font-size": f"{size:g}pt"})
+            axis.setLabel(axis.labelText, units=axis.labelUnits or "",
+                          color="#f1f5f9" if self.is_dark_mode else "#1e293b",
+                          **{"font-size": f"{size:g}pt"})
 
     def _update_plot(self) -> None:
         self._apply_chart_display()
