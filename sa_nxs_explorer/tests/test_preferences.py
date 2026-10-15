@@ -12,6 +12,9 @@ def test_preferences_roundtrip_empty_workspace(qtbot, tmp_path):
     first.act_dark_mode.setChecked(True)
     chart = first.view_charts
     chart.combo_up_colormap.setCurrentText("viridis")
+    chart.chk_show_legend.setChecked(False)
+    chart.chk_show_data_panel.setChecked(False)
+    chart.spin_axis_font_size.setValue(17)
     chart.spin_style_controls["d"]["marker_size"].setValue(9)
     chart._on_shade_range_changed(.2, .8)
     chart.combo_norm.setCurrentIndex(chart.combo_norm.findData("monitor"))
@@ -26,6 +29,10 @@ def test_preferences_roundtrip_empty_workspace(qtbot, tmp_path):
     assert second.last_load_directory == str(tmp_path)
     assert second.is_dark_mode
     assert restored.combo_up_colormap.currentText() == "viridis"
+    assert not restored.chk_show_legend.isChecked()
+    assert not restored.legend.isVisible()
+    assert restored.bottom_tabs.isHidden()
+    assert restored.spin_axis_font_size.value() == 17
     assert restored.spin_style_controls["d"]["marker_size"].value() == 9
     assert restored.shade_range == (.2, .8)
     assert restored.combo_norm.currentData() == "monitor"

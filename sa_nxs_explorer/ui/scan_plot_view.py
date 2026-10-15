@@ -9,6 +9,7 @@ from typing import Any
 import numpy as np
 import pyqtgraph as pg
 from matplotlib import colormaps
+from PyQt6.QtGui import QFont
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
     QButtonGroup,
@@ -246,6 +247,20 @@ class ScanPlotView(QWidget):
         self.chk_errors.setChecked(True)
         self.chk_errors.toggled.connect(self._on_axis_or_setting_changed)
         disp_layout.addWidget(self.chk_errors)
+        self.chk_show_legend = QCheckBox("Show legend")
+        self.chk_show_legend.setChecked(True)
+        self.chk_show_legend.toggled.connect(self._apply_chart_display)
+        disp_layout.addWidget(self.chk_show_legend)
+        font_row = QFormLayout()
+        self.spin_axis_font_size = QDoubleSpinBox()
+        self.spin_axis_font_size.setRange(6, 32)
+        self.spin_axis_font_size.setDecimals(0)
+        self.spin_axis_font_size.setValue(11)
+        self.spin_axis_font_size.setSuffix(" pt")
+        self.spin_axis_font_size.setToolTip("Font size for axis titles and tick labels.")
+        self.spin_axis_font_size.valueChanged.connect(self._apply_chart_display)
+        font_row.addRow("Axis font size", self.spin_axis_font_size)
+        disp_layout.addLayout(font_row)
 
         self.chk_waterfall = QCheckBox("Waterfall: offset scans")
         self.chk_waterfall.setToolTip("Numbered scans ascend from the base; other files follow in load order. Both spins share an offset. Tables and exports are unchanged.")
@@ -393,7 +408,11 @@ class ScanPlotView(QWidget):
         right_layout.addWidget(self.plot_widget, 3)
 
         # Bottom Panel: Statistics and Spreadsheet
-        bottom_tabs = QTabWidget()
+        self.chk_show_data_panel = QCheckBox("Show curve statistics and plotted data points")
+        self.chk_show_data_panel.setChecked(True)
+        right_layout.addWidget(self.chk_show_data_panel)
+        bottom_tabs = self.bottom_tabs = QTabWidget()
+        self.chk_show_data_panel.toggled.connect(bottom_tabs.setVisible)
 
         # Tab 1: Curve Statistics
         tab_stats = QWidget()
@@ -765,7 +784,18 @@ class ScanPlotView(QWidget):
         for controls in self.spin_style_controls.values():
             controls["preview"].setColormap(controls["colormap"].currentText())
 
+    def _apply_chart_display(self, *_args) -> None:
+        self.legend.setVisible(self.chk_show_legend.isChecked())
+        size = self.spin_axis_font_size.value()
+        font = QFont()
+        font.setPointSizeF(size)
+        for name in ("left", "bottom", "top", "right"):
+            axis = self.plot_widget.getAxis(name)
+            axis.setTickFont(font)
+            axis.setLabel(axis.labelText, units=axis.labelUnits or "", **{"font-size": f"{size:g}pt"})
+
     def _update_plot(self) -> None:
+        self._apply_chart_display()
         # Collect checked scans
         checked_scans: list[tuple[str, ScanData]] = []
         if self._has_explicit_overlay_keys:
@@ -1068,6 +1098,7 @@ class ScanPlotView(QWidget):
                 ))
 
         apply_plot_theme(self.plot_widget, self.is_dark_mode)
+        self._apply_chart_display()
 
         # Update curve stats and spreadsheet
         self._update_stats_table(all_curves)

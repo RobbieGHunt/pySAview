@@ -10,7 +10,7 @@ def controls(window):
     result = {name: getattr(chart, name) for name in (
         "combo_norm", "combo_uncertainty", "combo_spin", "combo_style",
         "spin_wavelength", "spin_reference_rate", "chk_log_x", "chk_log_y",
-        "chk_errors", "chk_waterfall", "combo_waterfall_mode", "spin_waterfall_spacing")}
+        "chk_errors", "chk_show_legend", "spin_axis_font_size", "chk_show_data_panel", "chk_waterfall", "combo_waterfall_mode", "spin_waterfall_spacing")}
     for spin, items in chart.spin_style_controls.items():
         for name in ("colormap", "line_style", "line_width", "marker_size"):
             result[f"{spin}/{name}"] = items[name]
@@ -69,6 +69,7 @@ def restore_preferences(window):
     chart = window.view_charts
     chart.combo_waterfall_mode.setEnabled(chart.chk_waterfall.isChecked())
     chart.spin_waterfall_spacing.setEnabled(chart.chk_waterfall.isChecked())
+    chart.bottom_tabs.setVisible(chart.chk_show_data_panel.isChecked())
     chart._on_axis_or_setting_changed()
     window.view_detector._on_cmap_changed(window.view_detector.combo_cmap.currentText())
     if type(data.get("dark")) is bool:
