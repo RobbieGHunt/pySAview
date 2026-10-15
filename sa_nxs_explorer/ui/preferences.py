@@ -2,7 +2,7 @@
 import json
 import math
 from PyQt6.QtCore import QSignalBlocker
-from PyQt6.QtWidgets import QCheckBox, QComboBox, QDoubleSpinBox
+from PyQt6.QtWidgets import QAbstractButton, QCheckBox, QComboBox, QDoubleSpinBox
 
 
 def controls(window):
@@ -22,7 +22,7 @@ def controls(window):
 def save_preferences(window):
     values = {}
     for name, widget in controls(window).items():
-        if isinstance(widget, QCheckBox):
+        if isinstance(widget, QAbstractButton):
             values[name] = widget.isChecked()
         elif isinstance(widget, QComboBox):
             values[name] = widget.currentData() if widget.currentData() is not None else widget.currentText()
@@ -52,7 +52,7 @@ def restore_preferences(window):
             if name not in saved:
                 continue
             value = saved.get(name)
-            if isinstance(widget, QCheckBox) and type(value) is bool:
+            if isinstance(widget, QAbstractButton) and type(value) is bool:
                 widget.setChecked(value)
             elif isinstance(widget, QComboBox):
                 index = widget.findData(value)

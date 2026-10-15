@@ -408,11 +408,22 @@ class ScanPlotView(QWidget):
         right_layout.addWidget(self.plot_widget, 3)
 
         # Bottom Panel: Statistics and Spreadsheet
-        self.chk_show_data_panel = QCheckBox("Show curve statistics and plotted data points")
-        self.chk_show_data_panel.setChecked(True)
-        right_layout.addWidget(self.chk_show_data_panel)
+        data_header = QHBoxLayout()
+        data_title = QLabel("Curve Statistics & Plotted Data Points")
+        data_title.setStyleSheet("font-weight: 700; font-size: 13px; color: #0284c7;")
+        data_header.addWidget(data_title, 1)
+        self.btn_toggle_data_panel = QPushButton()
+        self.btn_toggle_data_panel.setCheckable(True)
+        self.btn_toggle_data_panel.setChecked(True)
+        self.btn_toggle_data_panel.setFixedSize(28, 26)
+        self.btn_toggle_data_panel.setAccessibleName("Collapse or expand curve data panel")
+        # Retain the existing preference key for previously saved visibility.
+        self.chk_show_data_panel = self.btn_toggle_data_panel
+        data_header.addWidget(self.btn_toggle_data_panel)
+        right_layout.addLayout(data_header)
         bottom_tabs = self.bottom_tabs = QTabWidget()
-        self.chk_show_data_panel.toggled.connect(bottom_tabs.setVisible)
+        self.chk_show_data_panel.toggled.connect(self._update_data_panel_toggle)
+        self._update_data_panel_toggle()
 
         # Tab 1: Curve Statistics
         tab_stats = QWidget()
@@ -784,7 +795,15 @@ class ScanPlotView(QWidget):
         for controls in self.spin_style_controls.values():
             controls["preview"].setColormap(controls["colormap"].currentText())
 
+    def _update_data_panel_toggle(self, *_args) -> None:
+        expanded = self.btn_toggle_data_panel.isChecked()
+        self.bottom_tabs.setVisible(expanded)
+        self.btn_toggle_data_panel.setIcon(icons.get_icon(
+            "panel_bottom_close" if expanded else "panel_bottom_open", is_dark=self.is_dark_mode))
+        self.btn_toggle_data_panel.setToolTip("Collapse data panel" if expanded else "Expand data panel")
+
     def _apply_chart_display(self, *_args) -> None:
+        self._update_data_panel_toggle()
         self.legend.setVisible(self.chk_show_legend.isChecked())
         size = self.spin_axis_font_size.value()
         font = QFont()
