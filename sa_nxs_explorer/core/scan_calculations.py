@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 import numpy as np
+from sa_nxs_explorer.core.roi import pixel_bounds
 from sa_nxs_explorer.core.normalization import normalize_signal
 from sa_nxs_explorer.core.curve_colors import spin_palette, DATASET_SYMBOLS
 
@@ -236,15 +237,8 @@ def integrate_roi_2d(
     Returns:
       (total_counts, x_profile, y_profile)
     """
-    x0, x1, y0, y1 = roi
     ny, nx = frame.shape
-    ix0 = max(0, min(nx - 1, int(round(min(x0, x1)))))
-    ix1 = max(0, min(nx, int(round(max(x0, x1)))))
-    iy0 = max(0, min(ny - 1, int(round(min(y0, y1)))))
-    iy1 = max(0, min(ny, int(round(max(y0, y1)))))
-
-    if ix1 <= ix0 or iy1 <= iy0:
-        return 0.0, np.zeros(nx), np.zeros(ny)
+    ix0, ix1, iy0, iy1 = pixel_bounds(roi, nx, ny)
 
     sub = frame[iy0:iy1, ix0:ix1]
     total = float(np.sum(sub))
@@ -435,8 +429,7 @@ def auto_fit_scan_rois(
             rois.append((center - width / 2.0, center + width / 2.0, y0, y1))
             prev_center = center
 
-            ix0 = max(0, min(nx, int(round(center - width / 2.0))))
-            ix1 = max(0, min(nx, int(round(center + width / 2.0))))
+            ix0, ix1, c_iy0, c_iy1 = pixel_bounds(rois[-1], nx, ny)
             if use_vol and vol is not None and ix0 >= x_min_bound and ix1 <= x_max_bound:
                 counts[i] = float(np.sum(vol[i, ix0 - x_min_bound:ix1 - x_min_bound, :]))
             else:
@@ -478,8 +471,7 @@ def auto_fit_scan_rois(
         rois.append((center - width / 2.0, center + width / 2.0, y0, y1))
         prev_center = center
 
-        ix0 = max(0, min(nx, int(round(center - width / 2.0))))
-        ix1 = max(0, min(nx, int(round(center + width / 2.0))))
+        ix0, ix1, c_iy0, c_iy1 = pixel_bounds(rois[-1], nx, ny)
         counts[i] = float(np.sum(frame[c_iy0:c_iy1, ix0:ix1]))
 
     return rois, counts

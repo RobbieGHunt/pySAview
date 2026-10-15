@@ -117,3 +117,7 @@ need additional models; no exact Poisson claim is made for them.
 Regression tests include analytic zero-count limits, explicit variance formulas,
 count-rate scaling, shared-monitor cancellation, and coverage checks using the
 Poisson/binomial sampling distributions.
+
+## Detector ROI pixel selection
+
+ROI bounds are expressed in displayed detector coordinates (`displayed_frame = raw_frame.T`). Bounds round to the nearest integer, with ties to even, and clip to the actual detector dimensions. Slices include the lower bound and exclude the upper bound. No fractional pixel weighting is used. Reversed endpoints are accepted; empty or wholly outside regions contain zero counts. Preview, profiles, fixed scan integration and tracked integration share this convention. Tracked integration requires exactly one ROI per frame; missing frame definitions must not be silently filled with zero counts. Original measurement files remain read-only.

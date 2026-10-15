@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 import h5py
 import numpy as np
+from sa_nxs_explorer.core.roi import pixel_bounds
 
 from sa_nxs_explorer.core.models import (
     DatasetPreview,
@@ -293,14 +294,7 @@ class NexusReader:
         if ds.ndim != 3:
             return None
 
-        x0, x1, y0, y1 = roi
-        nx = ds.shape[1]
-        ny = ds.shape[2]
-
-        ix0 = max(0, min(nx, int(round(min(x0, x1)))))
-        ix1 = max(0, min(nx, int(round(max(x0, x1)))))
-        iy0 = max(0, min(ny, int(round(min(y0, y1)))))
-        iy1 = max(0, min(ny, int(round(max(y0, y1)))))
+        ix0, ix1, iy0, iy1 = pixel_bounds(roi, ds.shape[1], ds.shape[2])
 
         if ix1 <= ix0 or iy1 <= iy0:
             return np.zeros(ds.shape[0], dtype=float)
@@ -324,13 +318,10 @@ class NexusReader:
         ny = ds.shape[2]
         counts = np.zeros(n_frames, dtype=float)
 
-        for i in range(min(n_frames, len(rois))):
-            x0, x1, y0, y1 = rois[i]
-            ix0 = max(0, min(nx, int(round(min(x0, x1)))))
-            ix1 = max(0, min(nx, int(round(max(x0, x1)))))
-            iy0 = max(0, min(ny, int(round(min(y0, y1)))))
-            iy1 = max(0, min(ny, int(round(max(y0, y1)))))
-
+        if len(rois) != n_frames:
+            raise ValueError("Tracked ROI must supply exactly one region per detector frame")
+        bounds = [pixel_bounds(roi, nx, ny) for roi in rois]
+        for i, (ix0, ix1, iy0, iy1) in enumerate(bounds):
             if ix1 > ix0 and iy1 > iy0:
                 counts[i] = float(np.sum(ds[i, ix0:ix1, iy0:iy1]))
 

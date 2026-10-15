@@ -26,6 +26,7 @@ from PyQt6.QtWidgets import (
 from sa_nxs_explorer.core.models import ScanData
 from sa_nxs_explorer.core.nexus_reader import NexusReader
 from sa_nxs_explorer.core.scan_calculations import integrate_roi_2d
+from sa_nxs_explorer.core.roi import pixel_bounds
 from sa_nxs_explorer.ui import icons
 from sa_nxs_explorer.ui.theme import apply_plot_theme, get_safe_colormap
 
@@ -743,7 +744,8 @@ class DetectorView(QWidget):
         # Plot horizontal cut
         self.plot_x_cut.clear()
         pen_x = "#38bdf8" if self.is_dark_mode else "#0284c7"
-        x_coords = np.arange(int(round(min(x0, x1))), int(round(min(x0, x1))) + len(x_profile))
+        ix0, ix1, iy0, iy1 = pixel_bounds((x0, x1, y0, y1), frame.shape[1], frame.shape[0])
+        x_coords = np.arange(ix0, ix1)
         self.plot_x_cut.plot(x_coords, x_profile, pen=pg.mkPen(pen_x, width=2), symbol="o", symbolSize=3)
         self.plot_x_cut.setLabel("bottom", "X Pixel", color="#f1f5f9" if self.is_dark_mode else "#0f172a")
         self.plot_x_cut.setLabel("left", "Counts", color="#f1f5f9" if self.is_dark_mode else "#0f172a")
@@ -751,7 +753,7 @@ class DetectorView(QWidget):
         # Plot vertical cut
         self.plot_y_cut.clear()
         pen_y = "#f43f5e" if self.is_dark_mode else "#e11d48"
-        y_coords = np.arange(int(round(min(y0, y1))), int(round(min(y0, y1))) + len(y_profile))
+        y_coords = np.arange(iy0, iy1)
         self.plot_y_cut.plot(y_coords, y_profile, pen=pg.mkPen(pen_y, width=2), symbol="o", symbolSize=3)
         self.plot_y_cut.setLabel("bottom", "Y Pixel", color="#f1f5f9" if self.is_dark_mode else "#0f172a")
         self.plot_y_cut.setLabel("left", "Counts", color="#f1f5f9" if self.is_dark_mode else "#0f172a")
