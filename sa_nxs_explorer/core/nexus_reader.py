@@ -50,7 +50,8 @@ def decode_attr_str(val: Any) -> str:
 class NexusReader:
     """Read-only lazy accessor for NeXus (.nxs) files."""
 
-    def __init__(self, path: str | Path) -> None:
+    def __init__(self, path: str | Path, *, cancelled=None) -> None:
+        self._cancelled = cancelled or (lambda: False)
         self.path = Path(path)
         if not self.path.exists():
             raise FileNotFoundError(f"File not found: {self.path}")
@@ -299,8 +300,16 @@ class NexusReader:
         if ix1 <= ix0 or iy1 <= iy0:
             return np.zeros(ds.shape[0], dtype=float)
 
-        sub = ds[:, ix0:ix1, iy0:iy1]
-        return np.asarray(np.sum(sub, axis=(1, 2)), dtype=float)
+        counts = np.empty(ds.shape[0], dtype=float)
+        bytes_per_frame = max(1, (ix1-ix0) * (iy1-iy0) * ds.dtype.itemsize)
+        chunk_frames = max(1, min(16, (8 * 1024 * 1024) // bytes_per_frame))
+        for start in range(0, ds.shape[0], chunk_frames):
+            if self._cancelled():
+                raise InterruptedError("File loading cancelled")
+            stop = min(start + chunk_frames, ds.shape[0])
+            sub = ds[start:stop, ix0:ix1, iy0:iy1]
+            counts[start:stop] = np.sum(sub, axis=(1, 2))
+        return counts
 
     def compute_per_frame_scan_roi(
         self, rois: list[tuple[float, float, float, float]]

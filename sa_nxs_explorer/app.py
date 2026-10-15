@@ -62,7 +62,7 @@ def main() -> int:
         target_file = Path(args.file).resolve()
 
     if target_file and target_file.exists():
-        window.load_file(target_file)
+        window.start_load_files([target_file])
 
     window.show()
     return app.exec()

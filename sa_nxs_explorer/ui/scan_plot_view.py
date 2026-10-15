@@ -578,6 +578,8 @@ class ScanPlotView(QWidget):
             self._update_plot()
 
     def _refresh_axis_combos(self) -> None:
+        if getattr(self, "_defer_plot", False):
+            return
         prev_x = self.combo_x.currentData()
         prev_y = self.combo_y.currentData()
 
@@ -816,6 +818,8 @@ class ScanPlotView(QWidget):
                           **{"font-size": f"{size:g}pt"})
 
     def _update_plot(self) -> None:
+        if getattr(self, "_defer_plot", False):
+            return
         self._apply_chart_display()
         # Collect checked scans
         checked_scans: list[tuple[str, ScanData]] = []

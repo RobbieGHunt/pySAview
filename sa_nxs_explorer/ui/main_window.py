@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from PyQt6.QtCore import Qt, QSettings
+from PyQt6.QtCore import Qt, QSettings, QTimer, pyqtSlot
 from PyQt6.QtGui import QAction, QDragEnterEvent, QDropEvent, QIcon, QKeySequence
 from PyQt6.QtWidgets import (
     QApplication,
@@ -15,6 +15,7 @@ from PyQt6.QtWidgets import (
     QFileDialog,
     QLabel,
     QMainWindow,
+    QProgressDialog,
     QMessageBox,
     QSizePolicy,
     QSplitter,
@@ -25,6 +26,8 @@ from PyQt6.QtWidgets import (
 )
 
 from sa_nxs_explorer.core.nexus_reader import NexusReader
+from sa_nxs_explorer.core.models import ScanData, ScanMetadata
+from sa_nxs_explorer.ui.file_loading import FileLoadThread
 from sa_nxs_explorer.ui import icons
 from sa_nxs_explorer.ui.preferences import restore_preferences, save_preferences
 from sa_nxs_explorer.ui.detector_view import DetectorView
@@ -44,6 +47,10 @@ class MainWindow(QMainWindow):
         self.resize(1300, 860)
         self.setAcceptDrops(True)
 
+        self._load_jobs = {}
+        self._load_token = 0
+        self._load_dialog = None
+        self._closing = False
         self.loaded_readers: dict[str, NexusReader] = {}
         self.loaded_scans: dict[str, Any] = {}
         self.active_file_path: Path | None = None
@@ -262,7 +269,7 @@ class MainWindow(QMainWindow):
         )
         if file_paths:
             self.last_load_directory = str(Path(file_paths[0]).resolve().parent)
-            self.load_files([Path(p) for p in file_paths], clear_existing=True)
+            self.start_load_files([Path(p) for p in file_paths], clear_existing=True)
 
     def _on_action_add(self) -> None:
         start_dir = self.last_load_directory if Path(self.last_load_directory).is_dir() else str(Path.home())
@@ -274,7 +281,7 @@ class MainWindow(QMainWindow):
         )
         if file_paths:
             self.last_load_directory = str(Path(file_paths[0]).resolve().parent)
-            self.load_files([Path(p) for p in file_paths], clear_existing=False)
+            self.start_load_files([Path(p) for p in file_paths], clear_existing=False)
 
     def _on_action_open_example(self) -> None:
         # Locate example_data/005572.nxs and 005594.nxs
@@ -290,13 +297,144 @@ class MainWindow(QMainWindow):
                 files_to_load.append(p)
 
         if files_to_load:
-            self.load_files(files_to_load, clear_existing=False)
+            self.start_load_files(files_to_load, clear_existing=False)
         else:
             QMessageBox.warning(self, "Example Not Found", f"Could not find example scans in {example_dir}")
 
     def _on_action_reload(self) -> None:
         if self.active_file_path and self.active_file_path.exists():
-            self.load_file(self.active_file_path, make_active=True)
+            self.start_load_files([self.active_file_path])
+
+    def cancel_loading(self, token=None) -> None:
+        job = self._load_jobs.get(self._load_token if token is None else token)
+        if job is not None:
+            job.cancelled.set()
+            self.status_bar.showMessage("Cancelling load; completed files will be retained.")
+
+    def start_load_files(self, paths, clear_existing=False) -> None:
+        """Start a cancellable batch; all view updates remain on the GUI thread."""
+        if self._closing or not paths:
+            return
+        self.cancel_loading()
+        if self._load_dialog is not None:
+            self._load_dialog.close()
+            self._load_dialog.deleteLater()
+        self._load_token += 1
+        token = self._load_token
+        # Deduplicate while preserving the user's load order.
+        paths = list(dict.fromkeys(Path(p).resolve() for p in paths))
+        job = FileLoadThread(token, paths, self)
+        job.clear_existing = clear_existing
+        job.accepted = []
+        job.initial_active = self.active_file_path
+        self._load_jobs[token] = job
+        self.view_charts._defer_plot = True
+        dialog = self._load_dialog = QProgressDialog("Preparing files…", "Cancel", 0, len(paths), self)
+        dialog.setWindowTitle("Loading NeXus scans")
+        dialog.setWindowModality(Qt.WindowModality.NonModal)
+        dialog.setAutoClose(False)
+        dialog.setAutoReset(False)
+        dialog.canceled.connect(lambda: self.cancel_loading(token))
+        dialog.show()
+        job.parsed.connect(self._on_scan_parsed)
+        job.progress.connect(self._on_load_progress)
+        job.finished.connect(self._on_load_finished)
+        job.start()
+
+    @pyqtSlot(int, int, str)
+    def _on_load_progress(self, token, completed, filename):
+        if token != self._load_token or self._closing or self._load_dialog is None:
+            return
+        job = self._load_jobs.get(token)
+        if job is None or job.cancelled.is_set():
+            return
+        self._load_dialog.setValue(completed)
+        self._load_dialog.setLabelText(f"{completed}/{self._load_dialog.maximum()} files processed" + (f" — {filename}" if filename else ""))
+
+    def _clear_workspace(self):
+        self.view_detector._play_timer.stop()
+        self.view_hierarchy.close()
+        for reader in self.loaded_readers.values():
+            reader.close()
+        self.loaded_readers.clear()
+        self.loaded_scans.clear()
+        self.active_file_path = None
+        self.session_files_view.clear_all()
+        self.view_charts.clear_scans()
+        self.view_detector.set_data(None, ScanData("", ScanMetadata(), {}))
+        self.view_detector._current_frame_data = None
+        self.view_detector.img_item.clear()
+        self.view_hierarchy.tree.clear()
+        self.view_metadata.set_data(ScanData("", ScanMetadata(), {}))
+
+    @pyqtSlot(int, object)
+    def _on_scan_parsed(self, token, scan):
+        job = self._load_jobs.get(token)
+        if self._closing or token != self._load_token or job is None or job.cancelled.is_set():
+            return
+        reader = None
+        try:
+            # A separate read-only handle is owned exclusively by the GUI.
+            reader = NexusReader(scan.file_path)
+            if job.clear_existing and not job.accepted:
+                self._clear_workspace()
+            key = scan.file_path
+            previous = self.loaded_readers.get(key)
+            if previous is not None:
+                previous.close()
+            self.loaded_readers[key] = reader
+            self.loaded_scans[key] = scan
+            self.view_charts.add_scan(scan, make_active=not job.accepted)
+            self.session_files_view.blockSignals(True)
+            try:
+                self.session_files_view.add_file(scan, make_active=False)
+            finally:
+                self.session_files_view.blockSignals(False)
+            job.accepted.append(Path(key))
+            self.last_load_directory = str(Path(key).parent)
+            if previous is not None and self.active_file_path == Path(key):
+                self.set_active_file(Path(key))
+        except Exception as error:
+            if reader is not None and reader not in self.loaded_readers.values():
+                reader.close()
+            job.errors.append((scan.file_path, str(error)))
+
+    @pyqtSlot()
+    def _on_load_finished(self):
+        job = self.sender()
+        self._load_jobs.pop(job.token, None)
+        if self._closing:
+            job.deleteLater()
+            if not self._load_jobs:
+                QTimer.singleShot(0, self.close)
+            return
+        if job.token == self._load_token:
+            if self._load_dialog is not None:
+                self._load_dialog.close()
+                self._load_dialog.deleteLater()
+                self._load_dialog = None
+            self.view_charts._defer_plot = False
+            self._update_file_combo()
+            job.accepted = [path for path in job.accepted if str(path) in self.loaded_scans]
+            if job.accepted:
+                if self.active_file_path is None or self.active_file_path == job.initial_active:
+                    self.set_active_file(job.accepted[0])
+                elif self.active_file_path in job.accepted:
+                    self.set_active_file(self.active_file_path)
+                self.tabs.setCurrentIndex(1)
+            self.view_charts._refresh_axis_combos()
+            self.view_charts._update_plot()
+            state = "Cancelled" if job.cancelled.is_set() else "Finished"
+            self.status_bar.showMessage(f"{state}: {len(job.accepted)} files loaded, {len(job.errors)} failed.")
+            if job.errors:
+                message = QMessageBox(self)
+                message.setWindowTitle("Some scans could not be loaded")
+                message.setIcon(QMessageBox.Icon.Warning)
+                message.setText(f"{len(job.errors)} file(s) failed. Successfully loaded scans have been retained.")
+                message.setDetailedText("\n\n".join(f"{path}: {error}" for path, error in job.errors))
+                message.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+                message.show()
+        job.deleteLater()
 
     def load_file(self, path: Path | str, make_active: bool = True) -> bool:
         """Load and parse a single NeXus file into the session."""
@@ -409,6 +547,7 @@ class MainWindow(QMainWindow):
         if self.active_file_path is None:
             return
 
+        self.cancel_loading()
         key = str(self.active_file_path)
         if key in self.loaded_readers:
             try:
@@ -476,9 +615,18 @@ class MainWindow(QMainWindow):
             if path.suffix.lower() in (".nxs", ".h5", ".hdf5"):
                 valid_paths.append(path)
         if valid_paths:
-            self.load_files(valid_paths, clear_existing=False)
+            self.start_load_files(valid_paths, clear_existing=False)
 
     def closeEvent(self, event) -> None:
+        if self._load_jobs:
+            self._closing = True
+            for job in self._load_jobs.values():
+                job.cancelled.set()
+            if self._load_dialog is not None:
+                self._load_dialog.close()
+            self.status_bar.showMessage("Finishing the current file read before closing…")
+            event.ignore()
+            return
         save_preferences(self)
         for reader in self.loaded_readers.values():
             try:
