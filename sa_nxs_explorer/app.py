@@ -60,11 +60,6 @@ def main() -> int:
     target_file: Path | None = None
     if args.file:
         target_file = Path(args.file).resolve()
-    else:
-        # Default to example scan if present
-        default_example = Path(__file__).resolve().parent / "example_data" / "005572.nxs"
-        if default_example.exists():
-            target_file = default_example
 
     if target_file and target_file.exists():
         window.load_file(target_file)

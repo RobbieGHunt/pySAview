@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QSettings
 from PyQt6.QtGui import QAction, QDragEnterEvent, QDropEvent, QIcon, QKeySequence
 from PyQt6.QtWidgets import (
     QApplication,
@@ -26,6 +26,7 @@ from PyQt6.QtWidgets import (
 
 from sa_nxs_explorer.core.nexus_reader import NexusReader
 from sa_nxs_explorer.ui import icons
+from sa_nxs_explorer.ui.preferences import restore_preferences, save_preferences
 from sa_nxs_explorer.ui.detector_view import DetectorView
 from sa_nxs_explorer.ui.file_structure_view import FileStructureView
 from sa_nxs_explorer.ui.metadata_view import MetadataView
@@ -37,7 +38,7 @@ from sa_nxs_explorer.ui.theme import DARK_THEME, LIGHT_THEME
 class MainWindow(QMainWindow):
     """Primary application window housing all NeXus explorer tabs."""
 
-    def __init__(self, parent: QWidget | None = None) -> None:
+    def __init__(self, parent: QWidget | None = None, *, settings=None) -> None:
         super().__init__(parent)
         self.setWindowTitle("SuperADAM NeXus Explorer")
         self.resize(1300, 860)
@@ -48,8 +49,11 @@ class MainWindow(QMainWindow):
         self.active_file_path: Path | None = None
         self.is_dark_mode: bool = False
 
+        self.settings = settings if settings is not None else QSettings("ILL SuperADAM", "pySAview")
+        self.last_load_directory = str(Path.home())
         self._init_ui()
         self._apply_app_theme()
+        restore_preferences(self)
 
     @property
     def current_file_path(self) -> Path | None:
@@ -249,7 +253,7 @@ class MainWindow(QMainWindow):
         self._apply_app_theme()
 
     def _on_action_open(self) -> None:
-        start_dir = str(self.active_file_path.parent) if self.active_file_path else str(Path.cwd())
+        start_dir = self.last_load_directory if Path(self.last_load_directory).is_dir() else str(Path.home())
         file_paths, _ = QFileDialog.getOpenFileNames(
             self,
             "Open NeXus Scan File(s)",
@@ -257,10 +261,11 @@ class MainWindow(QMainWindow):
             "NeXus / HDF5 Files (*.nxs *.h5 *.hdf5);;All Files (*.*)",
         )
         if file_paths:
+            self.last_load_directory = str(Path(file_paths[0]).resolve().parent)
             self.load_files([Path(p) for p in file_paths], clear_existing=True)
 
     def _on_action_add(self) -> None:
-        start_dir = str(self.active_file_path.parent) if self.active_file_path else str(Path.cwd())
+        start_dir = self.last_load_directory if Path(self.last_load_directory).is_dir() else str(Path.home())
         file_paths, _ = QFileDialog.getOpenFileNames(
             self,
             "Add NeXus Scan File(s) to Session",
@@ -268,6 +273,7 @@ class MainWindow(QMainWindow):
             "NeXus / HDF5 Files (*.nxs *.h5 *.hdf5);;All Files (*.*)",
         )
         if file_paths:
+            self.last_load_directory = str(Path(file_paths[0]).resolve().parent)
             self.load_files([Path(p) for p in file_paths], clear_existing=False)
 
     def _on_action_open_example(self) -> None:
@@ -327,6 +333,7 @@ class MainWindow(QMainWindow):
             if self.tabs.currentIndex() == 0 and scan_data.variables:
                 self.tabs.setCurrentIndex(1)
 
+            self.last_load_directory = str(target.parent)
             return True
         except Exception as e:
             QMessageBox.critical(self, "Error Loading File", f"Failed to load NeXus file:\n{target.name}\n\n{e}")
@@ -472,6 +479,7 @@ class MainWindow(QMainWindow):
             self.load_files(valid_paths, clear_existing=False)
 
     def closeEvent(self, event) -> None:
+        save_preferences(self)
         for reader in self.loaded_readers.values():
             try:
                 reader.close()
