@@ -93,6 +93,7 @@ def split_by_flipper(
     dataset_count: int = 1,
     down_colormap: str = "Blues",
     up_colormap: str = "Reds",
+    shade_range: tuple[float, float] | None = None,
     dark: bool = False,
 ) -> list[PlottedCurve]:
     """Split X and Y curves by spin state (Flipper 0 or 1).
@@ -106,7 +107,7 @@ def split_by_flipper(
     indices = np.arange(len(x_data))
     f = np.asarray(flipper_data)
 
-    pal = spin_palette(palette_index, dataset_count, down=down_colormap, up=up_colormap, dark=dark)
+    pal = spin_palette(palette_index, dataset_count, down=down_colormap, up=up_colormap, dark=dark, shade_range=shade_range)
     symbol = DATASET_SYMBOLS[palette_index % len(DATASET_SYMBOLS)]
     color_all = pal["all"]
     color_up = pal["up"]

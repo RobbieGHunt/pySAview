@@ -37,8 +37,8 @@ def test_independent_spin_line_and_marker_styles(qtbot):
 
 def test_default_spin_colors_follow_superadam_convention():
     palette = spin_palette()
-    assert palette["up"] == to_hex(colormaps["Reds"](0.625))
-    assert palette["down"] == to_hex(colormaps["Blues"](0.625))
+    assert palette["up"] == to_hex(colormaps["Reds"](0.5))
+    assert palette["down"] == to_hex(colormaps["Blues"](0.5))
     for dark in [False, True]:
         shades = [spin_palette(i, 12, dark=dark) for i in range(12)]
         assert len({p["up"] for p in shades}) == 12

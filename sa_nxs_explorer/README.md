@@ -24,7 +24,7 @@ Processing conventions and P0 changes are described in
 - **$Q$ Momentum Transfer conversion**: Converts incident angle $\theta$ (deg) to $Q = \frac{4\pi}{\lambda}\sin(\theta)$ with configurable neutron wavelength $\lambda$ (default: 5.21 Å).
 - **Polarization / Spin state separation**: Splits curves automatically by `Flipper1` into **d / Spin Down** (Flipper OFF / 0) and **u / Spin Up** (Flipper ON / 1) states.
 - **Multi-file spin colors**: `d` uses Matplotlib `Blues` and `u` uses `Reds` by default. Independent palette selectors include all Matplotlib defaults and reversed maps. Loaded scans use different shades and marker shapes; hiding a scan preserves the other scans' colors.
-- **Chart Display Options tab**: Separate `d` and `u` controls for colormap (with a shade preview), solid/dashed line style, line width, and marker size. Set marker size to zero to hide one spin family's markers. Palette sampling avoids pale endpoints for clearer red/blue contrast.
+- **Chart Display Options tab**: Separate `d` and `u` controls for colormap (with a shade preview), solid/dashed line style, line width, and marker size. Set marker size to zero to hide one spin family's markers. Full colormap shade bars have draggable endpoint arrows; both spin families share the selected sampling range, initially 0–100%.
 - **Count Normalization**:
   - Raw counts
   - Unscaled beam-monitor ratio (`Detector1 / Monitor1`)

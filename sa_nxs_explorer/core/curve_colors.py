@@ -7,19 +7,19 @@ DATASET_SYMBOLS = ("o", "s", "t", "d", "+", "x", "star", "p", "h", "t1", "t2", "
 
 
 def palette_range(dark=False):
-    """Use broad shades while avoiding the least legible endpoints."""
-    return (0.20, 0.85) if dark else (0.30, 0.95)
+    """Default to the full colormap in either theme."""
+    return (0.0, 1.0)
 
 
-def spin_palette(index=0, count=1, *, down="Blues", up="Reds", dark=False):
-    """Sample one shade per loaded scan, avoiding nearly-white/dark endpoints.
+def spin_palette(index=0, count=1, *, down="Blues", up="Reds", dark=False, shade_range=None):
+    """Sample evenly within the user-selected shade range.
 
     Visibility does not change a scan's index. Both spin channels use the same
     position in their independently selected colormaps.
     """
     count = max(1, count)
     fraction = index / max(1, count - 1) if count > 1 else 0.5
-    low, high = palette_range(dark)
+    low, high = shade_range if shade_range is not None else palette_range(dark)
     position = low + (high - low) * fraction
     return {"down": to_hex(colormaps[down](position)),
             "up": to_hex(colormaps[up](position)),

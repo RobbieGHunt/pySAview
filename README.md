@@ -58,3 +58,7 @@ Legacy `run.vbs`, `sa_nxs_launcher.py`, `create_shortcut.ps1`, and
 ### Waterfall display
 
 In **Chart Display Options**, enable **Waterfall: offset scans**. Logarithmic mode defaults to one decade per scan (multiply by `10 ** (rank * spacing)`); linear mode adds `rank * spacing` in plotted Y units. The mode selects the corresponding Y axis scale; the axis controls remain available. Both spin channels of a file share its offset. Numbered `number.nxs` files ascend from the base by scan number; other files follow in load order. Only visible scans occupy ranks. Offsets apply equally to interval endpoints and never change normalization, statistical results, tables, or exported numerical data. Legend labels identify offsets.
+
+### Shared shade range
+
+The u/d shade bars always display the full selected colormaps. Drag either triangular endpoint on either bar to choose a shared sampling range. Loaded scans are spaced evenly between the arrows; a single scan uses the midpoint. The initial range is 0–100%, and changing theme or colormap preserves the selected range.

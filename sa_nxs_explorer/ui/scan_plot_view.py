@@ -35,7 +35,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from sa_nxs_explorer.core.curve_colors import palette_range
+from sa_nxs_explorer.ui.colormap_range import ColormapRange
 from sa_nxs_explorer.core.waterfall import waterfall_order, display_values
 from sa_nxs_explorer.core.models import ScanData
 from sa_nxs_explorer.core.scan_calculations import (
@@ -176,6 +176,7 @@ class ScanPlotView(QWidget):
         disp_layout = QVBoxLayout(grp_display)
         disp_layout.setSpacing(6)
 
+        self.shade_range = (0.0, 1.0)
         self.spin_style_controls = {}
         for spin, title, default_map in (("d", "d / Down — Flipper OFF (0)", "Blues"),
                                           ("u", "u / Up — Flipper ON (1)", "Reds")):
@@ -185,8 +186,9 @@ class ScanPlotView(QWidget):
             palette.addItems(sorted(colormaps, key=str.casefold))
             palette.setCurrentText(default_map)
             palette.setToolTip("Matplotlib colormap for this spin family; loaded files use different shades.")
-            preview = QLabel()
-            preview.setFixedHeight(12)
+            preview = ColormapRange()
+            preview.setColormap(default_map)
+            preview.rangeChanged.connect(self._on_shade_range_changed)
             form.addRow("Colormap:", palette)
             form.addRow("Shades:", preview)
             line_style = QComboBox()
@@ -752,14 +754,15 @@ class ScanPlotView(QWidget):
             self.chk_log_y.setChecked(self.combo_waterfall_mode.currentData() == "log")
         self._on_axis_or_setting_changed()
 
-    def _update_palette_previews(self) -> None:
-        from matplotlib.colors import to_hex
+    def _on_shade_range_changed(self, low, high) -> None:
+        self.shade_range = (low, high)
         for controls in self.spin_style_controls.values():
-            cmap = colormaps[controls["colormap"].currentText()]
-            low, high = palette_range(self.is_dark_mode)
-            stops = ", ".join(f"stop:{i/4:g} {to_hex(cmap(low + (high-low)*i/4))}" for i in range(5))
-            controls["preview"].setStyleSheet(
-                f"background: qlineargradient(x1:0,y1:0,x2:1,y2:0,{stops}); border-radius: 3px;")
+            controls["preview"].setRange(low, high)
+        self._update_plot()
+
+    def _update_palette_previews(self) -> None:
+        for controls in self.spin_style_controls.values():
+            controls["preview"].setColormap(controls["colormap"].currentText())
 
     def _update_plot(self) -> None:
         # Collect checked scans
@@ -928,6 +931,7 @@ class ScanPlotView(QWidget):
                     dataset_count=len(self.loaded_scans),
                     down_colormap=self.combo_down_colormap.currentText(),
                     up_colormap=self.combo_up_colormap.currentText(),
+                    shade_range=self.shade_range,
                     dark=self.is_dark_mode,
                     dataset_name=f"#{scan.metadata.run_number}" if is_multi and scan.metadata.run_number else (name if is_multi else ""),
                 )
