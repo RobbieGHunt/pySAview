@@ -62,3 +62,7 @@ In **Chart Display Options**, enable **Waterfall: offset scans**. Logarithmic mo
 ### Shared shade range
 
 The u/d shade bars always display the full selected colormaps. Drag either triangular endpoint on either bar to choose a shared sampling range. Loaded scans are spaced evenly between the arrows; a single scan uses the midpoint. The initial range is 0–100%, and changing theme or colormap preserves the selected range.
+
+### Source data and scan ownership
+
+Measurement files are opened read-only and must never be overwritten by the app. Processing changes only in-memory data. Export destinations reject NeXus/HDF5 extensions and aliases of loaded source files. Each scan owns its working ROI independently; applying a user ROI preserves the original file ROI. Reusing an ROI across scans must be an explicit operation, never automatic inheritance. Future ROI/session saves belong in separate sidecar files.

@@ -37,6 +37,7 @@ from PyQt6.QtWidgets import (
 
 from sa_nxs_explorer.ui.colormap_range import ColormapRange
 from sa_nxs_explorer.core.waterfall import waterfall_order, display_values
+from sa_nxs_explorer.core.source_safety import validate_output_path
 from sa_nxs_explorer.core.models import ScanData
 from sa_nxs_explorer.core.scan_calculations import (
     CurveStats,
@@ -638,7 +639,7 @@ class ScanPlotView(QWidget):
             return
 
         from sa_nxs_explorer.core.models import ScanVariable
-        target_scan.detector_roi = roi_bounds
+        target_scan.working_detector_roi = tuple(roi_bounds)
         target_scan.variables["ROI_Counts"] = ScanVariable(
             index=len(target_scan.variables),
             name="ROI_Counts",
@@ -1122,6 +1123,7 @@ class ScanPlotView(QWidget):
             return
 
         try:
+            validate_output_path(file_path, [scan.file_path for scan in self.loaded_scans.values()])
             with open(file_path, "w", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
                 writer.writerow(["Dataset", "Curve", "OriginalStepIndex", "X", "Y", "StandardUncertainty", "LowerBound", "UpperBound", "UncertaintyMethod", "Normalization", "ReferenceMonitorRate", "XUnits", "YUnits", "WavelengthAngstrom", "SourceFile", "ProcessingWarnings", "ProcessingStatus"])

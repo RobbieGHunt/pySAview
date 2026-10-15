@@ -98,3 +98,4 @@ class ScanData:
     detector_shape: tuple[int, ...] | None = None
     detector_roi: tuple[float, float, float, float] | None = None  # (x0, x1, y0, y1)
     detector_path: str = ""
+    working_detector_roi: tuple[float, float, float, float] | None = None  # in-memory, scan-specific; file ROI stays unchanged

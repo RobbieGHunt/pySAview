@@ -345,7 +345,7 @@ class DetectorView(QWidget):
             self.plot_2d.removeItem(self._roi_rect_item)
             self._roi_rect_item = None
 
-        initial_roi = scan_data.detector_roi or (354.0, 382.0, 285.0, 743.0)
+        initial_roi = scan_data.working_detector_roi or scan_data.detector_roi or (354.0, 382.0, 285.0, 743.0)
         x0, x1, y0, y1 = initial_roi
         pos_x = min(x0, x1)
         pos_y = min(y0, y1)
