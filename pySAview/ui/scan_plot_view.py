@@ -154,7 +154,7 @@ class ScanPlotView(QWidget):
         proc_layout.addWidget(QLabel("Counting uncertainty:"))
         self.combo_uncertainty = QComboBox()
         self.combo_uncertainty.addItem("Exact count intervals", "exact")
-        self.combo_uncertainty.addItem("Propagated standard uncertainty (1σ)", "standard")
+        self.combo_uncertainty.addItem("Propagated uncertainty", "standard")
         self.combo_uncertainty.setToolTip("Exact intervals assume independent unweighted Poisson counts. Supplied variances use first-order propagation.")
         self.combo_uncertainty.currentIndexChanged.connect(self._on_axis_or_setting_changed)
         proc_layout.addWidget(self.combo_uncertainty)
@@ -163,7 +163,7 @@ class ScanPlotView(QWidget):
         for level in range(1, 7):
             self.combo_sigma.addItem(f"{level}σ", level)
         self.combo_sigma.setCurrentIndex(1)
-        self.combo_sigma.setToolTip("Gaussian-equivalent coverage for exact count intervals: 1σ ≈ 68.27%, 2σ ≈ 95.45%, 3σ ≈ 99.73%. Exact bounds remain asymmetric. Propagated standard uncertainties are separately reported at 1σ.")
+        self.combo_sigma.setToolTip("Gaussian-equivalent coverage for exact count intervals: 1σ ≈ 68.27%, 2σ ≈ 95.45%, 3σ ≈ 99.73%. Exact bounds remain asymmetric. For propagated uncertainty, displayed bounds are ± the selected number of standard uncertainties. The exported standard uncertainty itself remains 1σ.")
         self.combo_sigma.currentIndexChanged.connect(self._on_axis_or_setting_changed)
         sigma_row.addRow("Sigma:", self.combo_sigma)
         proc_layout.addLayout(sigma_row)
@@ -761,7 +761,7 @@ class ScanPlotView(QWidget):
         # Toggle wavelength input visibility
         x_key = self.combo_x.currentData()
         is_q = x_key == "Q"
-        self.combo_sigma.setEnabled(self.combo_uncertainty.currentData() == "exact")
+        self.combo_sigma.setEnabled(True)
         self.lbl_wavelength.setVisible(is_q)
         self.spin_wavelength.setVisible(is_q)
         is_reference = self.combo_norm.currentData() == "monitor_time"

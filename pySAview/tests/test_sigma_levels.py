@@ -58,6 +58,18 @@ def test_sigma_changes_exact_bounds_not_values_or_standard_uncertainties(qtbot, 
     assert "3 sigma equivalent" in rows[0]["UncertaintyMethod"]
     assert float(rows[0]["UpperBound"]) == changed.y_upper[0]
     view.combo_uncertainty.setCurrentIndex(view.combo_uncertainty.findData("standard"))
-    assert not view.combo_sigma.isEnabled()
+    assert view.combo_sigma.isEnabled()
     standard = view._current_curves[0]
-    np.testing.assert_allclose(standard.y_upper, standard.y+standard.y_err)
+    np.testing.assert_allclose(standard.y_upper, standard.y+3*standard.y_err)
+
+
+@pytest.mark.parametrize("level", range(1,7))
+def test_propagated_bounds_scale_without_changing_standard_uncertainty(level):
+    result = normalize_signal([10.,20.], variance=[4.,9.], uncertainty="standard", sigma_level=level)
+    np.testing.assert_allclose(result.sigma, [2.,3.])
+    np.testing.assert_allclose(result.lower, result.values-level*result.sigma)
+    np.testing.assert_allclose(result.upper, result.values+level*result.sigma)
+    assert f"{level} sigma bounds" in result.method
+    default = normalize_signal([10.], variance=[4.], uncertainty="standard")
+    assert default.lower[0] == 6.
+    assert default.upper[0] == 14.

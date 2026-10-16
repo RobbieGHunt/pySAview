@@ -186,9 +186,9 @@ def normalize_signal(data, mode="raw", *, monitor=None, time=None,
                 upper[valid] = scale * hi
                 method = f"conditional exact {100*confidence:.10g}% Poisson ratio interval ({sigma_level:g} sigma equivalent)"
         else:
-            lower[valid] = values[valid] - sigma[valid]
-            upper[valid] = values[valid] + sigma[valid]
-            method = "propagated standard uncertainty (first order)"
+            lower[valid] = values[valid] - sigma_level * sigma[valid]
+            upper[valid] = values[valid] + sigma_level * sigma[valid]
+            method = f"propagated standard uncertainty (first order); {sigma_level:g} sigma bounds; standard uncertainty reported at 1 sigma"
     # Overflow cannot become an apparently valid plotted observation.
     reject(~np.isfinite(values), "nonfinite normalized value")
     if sigma is not None:

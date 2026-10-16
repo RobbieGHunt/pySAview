@@ -78,8 +78,9 @@ For zero counts, the default 2σ raw interval is `[0, 3.783184333...]`;
 at 1σ it is `[0, 1.841021645...]`. The selector applies to exact Poisson
 and Poisson-ratio intervals, including known-exposure and fixed-reference
 scaling. Exported standard uncertainties remain 1σ; explicit variance
-inputs and standard-uncertainty mode retain their separate first-order
-interpretation. The selected coverage is recorded in the interval method.
+inputs and propagated-uncertainty mode use first-order bounds of
+`value ± selected_sigma * standard_uncertainty`, also defaulting to 2σ.
+These approximate propagated bounds are not exact Poisson intervals. The selected coverage is recorded in the interval method.
 
 For independent detector and monitor Poisson counts measured simultaneously,
 conditioning on `N+M` gives a binomial observation with
@@ -131,3 +132,5 @@ Poisson/binomial sampling distributions.
 ROI bounds are expressed in displayed detector coordinates (`displayed_frame = raw_frame.T`). Bounds round to the nearest integer, with ties to even, and clip to the actual detector dimensions. Slices include the lower bound and exclude the upper bound. No fractional pixel weighting is used. Reversed endpoints are accepted; empty or wholly outside regions contain zero counts. Preview, profiles, fixed scan integration and tracked integration share this convention. Tracked integration requires exactly one ROI per frame; missing frame definitions must not be silently filled with zero counts. Original measurement files remain read-only.
 
 Gaussian-equivalent coverage follows the [normal distribution CDF](https://docs.scipy.org/doc/scipy/tutorial/stats/continuous_norm.html); Poisson limits still use the exact count construction above.
+
+The Sigma selector applies to both exact and propagated display modes. The numerical StandardUncertainty column always retains the 1σ standard uncertainty, while LowerBound/UpperBound and their method describe the selected display width.
