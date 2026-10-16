@@ -8,7 +8,7 @@ from PyQt6.QtWidgets import QAbstractButton, QCheckBox, QComboBox, QDoubleSpinBo
 def controls(window):
     chart = window.view_charts
     result = {name: getattr(chart, name) for name in (
-        "combo_norm", "combo_uncertainty", "combo_spin", "combo_style",
+        "combo_norm", "combo_uncertainty", "combo_sigma", "combo_spin", "combo_style",
         "spin_wavelength", "spin_reference_rate", "chk_log_x", "chk_log_y",
         "chk_errors", "chk_show_legend", "spin_axis_font_size", "chk_show_data_panel", "chk_waterfall", "combo_waterfall_mode", "spin_waterfall_spacing")}
     for spin, items in chart.spin_style_controls.items():

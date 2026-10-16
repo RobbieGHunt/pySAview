@@ -12,6 +12,7 @@ def test_preferences_roundtrip_empty_workspace(qtbot, tmp_path):
     first.act_dark_mode.setChecked(True)
     chart = first.view_charts
     chart.combo_up_colormap.setCurrentText("viridis")
+    chart.combo_sigma.setCurrentIndex(chart.combo_sigma.findData(3))
     chart.chk_show_legend.setChecked(False)
     chart.chk_show_data_panel.setChecked(False)
     chart.spin_axis_font_size.setValue(17)
@@ -29,6 +30,7 @@ def test_preferences_roundtrip_empty_workspace(qtbot, tmp_path):
     assert second.last_load_directory == str(tmp_path)
     assert second.is_dark_mode
     assert restored.combo_up_colormap.currentText() == "viridis"
+    assert restored.combo_sigma.currentData() == 3
     assert not restored.chk_show_legend.isChecked()
     assert not restored.legend.isVisible()
     assert restored.bottom_tabs.isHidden()

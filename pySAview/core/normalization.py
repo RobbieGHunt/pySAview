@@ -5,11 +5,19 @@ standard uncertainties use first-order derivatives, not confidence intervals.
 See docs/normalization.md for formulas and the limits of these assumptions.
 """
 
+from math import erf, sqrt
 from dataclasses import dataclass
 import numpy as np
 from scipy.stats import beta, chi2
 
-CONFIDENCE = 0.6826894921370859
+def confidence_from_sigma(sigma_level):
+    """Central Gaussian-equivalent coverage for an exact count interval."""
+    if not np.isfinite(sigma_level) or not 1 <= sigma_level <= 6:
+        raise ValueError("Sigma must be between 1 and 6")
+    return erf(float(sigma_level) / sqrt(2.0))
+
+
+CONFIDENCE = confidence_from_sigma(2)
 
 
 @dataclass
@@ -86,13 +94,14 @@ def poisson_ratio_interval(counts, monitor, confidence=CONFIDENCE):
 def normalize_signal(data, mode="raw", *, monitor=None, time=None,
                      count_data=True, variance=None, monitor_variance=None,
                      uncertainty="exact", reference_monitor_rate=1.0,
-                     numerator_is_monitor=False, input_units="counts"):
+                     numerator_is_monitor=False, input_units="counts", sigma_level=2):
     """Prepare values, uncertainty bounds, and reasons for excluded points.
 
     raw: N; time: N/t; monitor: N/M; monitor_time: fixed_rate*N/M.
     The fixed rate is an exact display convention, shared across all scans.
     No mode falls back and no denominator is replaced by a fabricated value.
     """
+    confidence = confidence_from_sigma(sigma_level)
     n = _vector(data, "Signal")
     if mode not in {"raw", "time", "monitor", "monitor_time", "monitor_cps"}:
         raise ValueError(f"Unknown normalization: {mode}")
@@ -167,15 +176,15 @@ def normalize_signal(data, mode="raw", *, monitor=None, time=None,
             method = "shared monitor cancels exactly"
         elif uncertainty == "exact" and poisson and monitor_variance is None:
             if m is None:
-                lo, hi = poisson_interval(n[valid])
+                lo, hi = poisson_interval(n[valid], confidence)
                 lower[valid] = lo / denominator[valid]
                 upper[valid] = hi / denominator[valid]
-                method = "Garwood exact 68.27% Poisson interval"
+                method = f"Garwood exact {100*confidence:.10g}% Poisson interval ({sigma_level:g} sigma equivalent)"
             else:
-                lo, hi = poisson_ratio_interval(n[valid], m[valid])
+                lo, hi = poisson_ratio_interval(n[valid], m[valid], confidence)
                 lower[valid] = scale * lo
                 upper[valid] = scale * hi
-                method = "conditional exact 68.27% Poisson ratio interval"
+                method = f"conditional exact {100*confidence:.10g}% Poisson ratio interval ({sigma_level:g} sigma equivalent)"
         else:
             lower[valid] = values[valid] - sigma[valid]
             upper[valid] = values[valid] + sigma[valid]

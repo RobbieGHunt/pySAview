@@ -109,11 +109,8 @@ def test_scan_charts_view(main_window: MainWindow):
     assert view.chk_log_y.isChecked() is True
 
     # Check stats table
-    assert view.stats_table.rowCount() == 2
-    peak_y = float(view.stats_table.item(0, 3).text())
-    assert peak_y > 0
-
-    # Check curve data table
+    assert view.bottom_tabs.count() == 1
+    assert view.bottom_tabs.tabText(0) == "Plotted Data Points"
     assert view.curve_data_table.rowCount() == 302
 
 

@@ -14,7 +14,7 @@ def test_zero_count_has_exact_upper_limit_and_separate_zero_variance_estimate():
     assert result.sigma[0] == 0  # plug-in variance estimate, not a confidence limit
     assert result.lower[0] == 0
     assert result.upper[0] == pytest.approx(-np.log((1 - CONFIDENCE) / 2))
-    assert result.upper[0] == pytest.approx(1.841021645, rel=1e-8)
+    assert result.upper[0] == pytest.approx(3.783184333682032, rel=1e-8)
     assert "Garwood" in result.method
 
 

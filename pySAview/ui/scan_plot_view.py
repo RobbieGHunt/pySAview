@@ -41,9 +41,7 @@ from pySAview.core.waterfall import waterfall_order, display_values
 from pySAview.core.source_safety import validate_output_path
 from pySAview.core.models import ScanData
 from pySAview.core.scan_calculations import (
-    CurveStats,
     PlottedCurve,
-    calculate_curve_stats,
     compute_q,
     split_by_flipper,
 )
@@ -155,11 +153,20 @@ class ScanPlotView(QWidget):
 
         proc_layout.addWidget(QLabel("Counting uncertainty:"))
         self.combo_uncertainty = QComboBox()
-        self.combo_uncertainty.addItem("Exact 68.27% count intervals", "exact")
-        self.combo_uncertainty.addItem("Propagated standard uncertainty", "standard")
+        self.combo_uncertainty.addItem("Exact count intervals", "exact")
+        self.combo_uncertainty.addItem("Propagated standard uncertainty (1σ)", "standard")
         self.combo_uncertainty.setToolTip("Exact intervals assume independent unweighted Poisson counts. Supplied variances use first-order propagation.")
         self.combo_uncertainty.currentIndexChanged.connect(self._on_axis_or_setting_changed)
         proc_layout.addWidget(self.combo_uncertainty)
+        sigma_row = QFormLayout()
+        self.combo_sigma = QComboBox()
+        for level in range(1, 7):
+            self.combo_sigma.addItem(f"{level}σ", level)
+        self.combo_sigma.setCurrentIndex(1)
+        self.combo_sigma.setToolTip("Gaussian-equivalent coverage for exact count intervals: 1σ ≈ 68.27%, 2σ ≈ 95.45%, 3σ ≈ 99.73%. Exact bounds remain asymmetric. Propagated standard uncertainties are separately reported at 1σ.")
+        self.combo_sigma.currentIndexChanged.connect(self._on_axis_or_setting_changed)
+        sigma_row.addRow("Sigma:", self.combo_sigma)
+        proc_layout.addLayout(sigma_row)
 
         proc_layout.addWidget(QLabel("Polarization (Spin State):"))
         self.combo_spin = QComboBox()
@@ -418,7 +425,7 @@ class ScanPlotView(QWidget):
 
         # Bottom Panel: Statistics and Spreadsheet
         data_header = QHBoxLayout()
-        data_title = QLabel("Curve Statistics & Plotted Data Points")
+        data_title = QLabel("Plotted Data Points")
         data_title.setStyleSheet("font-weight: 700; font-size: 13px; color: #0284c7;")
         data_header.addWidget(data_title, 1)
         self.btn_toggle_data_panel = QPushButton()
@@ -434,19 +441,7 @@ class ScanPlotView(QWidget):
         self.chk_show_data_panel.toggled.connect(self._update_data_panel_toggle)
         self._update_data_panel_toggle()
 
-        # Tab 1: Curve Statistics
-        tab_stats = QWidget()
-        stats_layout = QVBoxLayout(tab_stats)
-        stats_layout.setContentsMargins(4, 4, 4, 4)
-        self.stats_table = QTableWidget(0, 7)
-        self.stats_table.setHorizontalHeaderLabels([
-            "Curve", "Points", "Peak X", "Peak Y", "Centroid X", "Y Sum (Integrated)", "Y Min / Max"
-        ])
-        self.stats_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        stats_layout.addWidget(self.stats_table)
-        bottom_tabs.addTab(tab_stats, "Curve Statistics")
-
-        # Tab 2: Spreadsheet Data Table
+        # Numerical data table
         tab_data = QWidget()
         data_tbl_layout = QVBoxLayout(tab_data)
         data_tbl_layout.setContentsMargins(4, 4, 4, 4)
@@ -766,6 +761,7 @@ class ScanPlotView(QWidget):
         # Toggle wavelength input visibility
         x_key = self.combo_x.currentData()
         is_q = x_key == "Q"
+        self.combo_sigma.setEnabled(self.combo_uncertainty.currentData() == "exact")
         self.lbl_wavelength.setVisible(is_q)
         self.spin_wavelength.setVisible(is_q)
         is_reference = self.combo_norm.currentData() == "monitor_time"
@@ -861,7 +857,6 @@ class ScanPlotView(QWidget):
                 self.plot_widget.plotItem.legend.clear()
                 self.plot_widget.plotItem.legend.anchor(itemPos=(1, 0), parentPos=(1, 0), offset=(-15, 15))
             self._current_curves = []
-            self.stats_table.setRowCount(0)
             self.curve_data_table.setRowCount(0)
             return
 
@@ -956,6 +951,7 @@ class ScanPlotView(QWidget):
                     variance=y_var.variance,
                     monitor_variance=mon_var.variance if mon_var is not None else None,
                     uncertainty=self.combo_uncertainty.currentData(),
+                    sigma_level=self.combo_sigma.currentData(),
                     reference_monitor_rate=self.spin_reference_rate.value(),
                     numerator_is_monitor=y_key == "Monitor1",
                     input_units=y_var.unit,
@@ -1135,21 +1131,8 @@ class ScanPlotView(QWidget):
         apply_plot_theme(self.plot_widget, self.is_dark_mode)
         self._apply_chart_display()
 
-        # Update curve stats and spreadsheet
-        self._update_stats_table(all_curves)
+        # Update spreadsheet
         self._update_data_table(all_curves, x_label, y_label)
-
-    def _update_stats_table(self, curves: list[PlottedCurve]) -> None:
-        self.stats_table.setRowCount(len(curves))
-        for row, c in enumerate(curves):
-            st = calculate_curve_stats(c.x, c.y)
-            self.stats_table.setItem(row, 0, QTableWidgetItem(c.label))
-            self.stats_table.setItem(row, 1, QTableWidgetItem(str(st.n_points)))
-            self.stats_table.setItem(row, 2, QTableWidgetItem(f"{st.peak_x:.4g}"))
-            self.stats_table.setItem(row, 3, QTableWidgetItem(f"{st.peak_y:.4g}"))
-            self.stats_table.setItem(row, 4, QTableWidgetItem(f"{st.centroid_x:.4g}"))
-            self.stats_table.setItem(row, 5, QTableWidgetItem(f"{st.y_sum:.4g}"))
-            self.stats_table.setItem(row, 6, QTableWidgetItem(f"{st.y_min:.4g} / {st.y_max:.4g}"))
 
     def _update_data_table(self, curves: list[PlottedCurve], x_label: str, y_label: str) -> None:
         total_rows = sum(len(c.x) for c in curves)

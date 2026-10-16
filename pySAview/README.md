@@ -30,10 +30,10 @@ Processing conventions and P0 changes are described in
   - Unscaled beam-monitor ratio (`Detector1 / Monitor1`)
   - Normalized to dwell time (`Detector1 / Time`, cps)
   - Monitor ratio multiplied by a visible fixed reference monitor rate, shared across scans
-- **Counting Uncertainty**: Exact 68.27% Poisson confidence intervals by default; independently identified first-order standard uncertainties as an alternative or for supplied variances.
+- **Counting Uncertainty**: Exact count intervals default to 2σ-equivalent coverage, with a Sigma selector for 1σ–6σ; independently identified first-order standard uncertainties as an alternative or for supplied variances.
 - **Processing Status**: Formula, uncertainty method, wavelength, invalid-point exclusions, and unit assumptions are shown beside the plot. Missing/incompatible channels never silently change the selected processing.
 - **Interactive cursor tracker**: Live mouse coordinate readout ($X$, $Y$).
-- **Data Summary & Export**: Curve statistics (peak position, centroid, integrated counts) and 1-click CSV data export.
+- **Data Summary & Export**: Collapsible Plotted Data Points table with standard uncertainties and exact bounds, plus CSV and PNG/SVG plot export. Generic Curve Statistics has been removed.
 
 ### 3. 2D Detector Viewer & User-Defined ROI Integration
 - **2D Frame Visualization**: Renders 1024×1024 2D position-sensitive detector (PSD) frames, oriented 90° CW and mirrored horizontally to match beamline physical geometry.

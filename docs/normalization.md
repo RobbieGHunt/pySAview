@@ -58,8 +58,11 @@ proof that the underlying intensity is exactly zero.
 
 ## Exact counting confidence intervals
 
-The default display uses equal-tailed **68.26894921370859% confidence limits**.
-These are confidence intervals, not symmetric `±1σ` error bars. Because counts
+The **Sigma** selector defaults to **2σ**, equivalent to equal-tailed
+**95.44997361036415% confidence limits**. Choices 1σ through 6σ use
+`confidence = erf(sigma / sqrt(2))` (1σ ≈ 68.27%, 3σ ≈ 99.73%).
+These are exact count confidence intervals at Gaussian-equivalent coverage,
+not symmetric error bars or a multiplication of the 1σ bounds. Because counts
 are discrete, coverage is at least nominal and can exceed it.
 
 For raw counts, Garwood limits on the Poisson mean are:
@@ -71,7 +74,12 @@ upper = 0.5 * chi2.isf(alpha/2, 2*(N+1))
 ```
 
 Divide these bounds by the known exposure for time-normalized rates.
-For zero counts, the raw interval is `[0, 1.841021645...]`.
+For zero counts, the default 2σ raw interval is `[0, 3.783184333...]`;
+at 1σ it is `[0, 1.841021645...]`. The selector applies to exact Poisson
+and Poisson-ratio intervals, including known-exposure and fixed-reference
+scaling. Exported standard uncertainties remain 1σ; explicit variance
+inputs and standard-uncertainty mode retain their separate first-order
+interpretation. The selected coverage is recorded in the interval method.
 
 For independent detector and monitor Poisson counts measured simultaneously,
 conditioning on `N+M` gives a binomial observation with
@@ -121,3 +129,5 @@ Poisson/binomial sampling distributions.
 ## Detector ROI pixel selection
 
 ROI bounds are expressed in displayed detector coordinates (`displayed_frame = raw_frame.T`). Bounds round to the nearest integer, with ties to even, and clip to the actual detector dimensions. Slices include the lower bound and exclude the upper bound. No fractional pixel weighting is used. Reversed endpoints are accepted; empty or wholly outside regions contain zero counts. Preview, profiles, fixed scan integration and tracked integration share this convention. Tracked integration requires exactly one ROI per frame; missing frame definitions must not be silently filled with zero counts. Original measurement files remain read-only.
+
+Gaussian-equivalent coverage follows the [normal distribution CDF](https://docs.scipy.org/doc/scipy/tutorial/stats/continuous_norm.html); Poisson limits still use the exact count construction above.

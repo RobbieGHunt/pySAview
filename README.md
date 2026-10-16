@@ -77,7 +77,7 @@ In the 2D Detector ROI panel, **Save ROI…** saves the currently displayed fixe
 
 Startup opens an empty workspace unless a file is explicitly passed on the command line. Example scans remain available from File → Open Example Scans. The last successful load folder and local preferences (theme, chart processing and display options, spin styles, shared shade range, and detector colormap/contrast) are remembered on normal exit using Qt user settings. File lists, ROI definitions and plot zoom are not automatically restored. No session files are created and measurement files remain read-only.
 
-The panel icon button above the chart tables collapses or expands Curve Statistics and Plotted Data Points without changing their data. Chart Display Options includes **Axis font size** (axis titles and tick labels) and **Show legend**. These settings and the table-panel visibility are remembered on exit.
+The panel icon button above the chart tables collapses or expands Plotted Data Points without changing their data. Chart Display Options includes **Axis font size** (axis titles and tick labels) and **Show legend**. These settings and the table-panel visibility are remembered on exit.
 
 ### Loading many files
 
@@ -90,3 +90,5 @@ Source readers remain read-only. Worker file handles are closed inside the worke
 ### Application package name
 
 The application folder and Python module are `pySAview`. Start with `python -m pySAview`, the installed `pysaview` command, or `pySAview/run.bat`. After updating an existing checkout, rerun the installation command above to refresh the editable package and installed command. The Windows standalone build uses `pySAview/packaging/pySAview.spec` and produces `pySAview.exe`.
+
+Curve Statistics has been removed. The collapsible bottom panel retains only Plotted Data Points. In Data & Processing, **Sigma** selects 1σ–6σ Gaussian-equivalent coverage for exact count intervals, defaulting to 2σ. This preference is remembered; standard uncertainties remain separately identified at 1σ.
