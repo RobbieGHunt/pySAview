@@ -1,97 +1,196 @@
 # pySAview
 
-SuperADAM NeXus file inspection, detector viewing, and quick scan comparison.
+A graphical explorer for ILL SuperADAM neutron reflectometry NeXus (`.nxs`)
+files. Quickly inspect file trees, view detector images, and plot or compare
+one-dimensional scans.
 
-The application supports read-only measurement inspection, independent per-scan
-ROIs, configurable uncertainty bounds, background batch loading, and plot/data
-export. The other PNR tools are maintained separately.
+**Original measurement files are read-only.** Processing happens in memory;
+data, plots and ROI definitions are exported to separate files.
 
-See [the application guide](pySAview/README.md) for the feature inventory.
+## Features
+
+The interface is organized into four main tabs:
+
+| Tab | What you can do |
+| --- | --- |
+| **File Hierarchy** | Browse the HDF5/NeXus file tree, inspect shapes, data types, units and attributes, and preview datasets as text, tables, 1D plots or 2D images. |
+| **Scan Charts** | Select scan channels, compare files, separate spin states, switch between angle and Q, normalize counts, and inspect uncertainty bounds and individual data points. |
+| **2D Detector** | Browse or play detector frames, filter by spin, define a fixed ROI or track drift, and inspect horizontal/vertical profiles. Apply an ROI to the scan chart or save its definition. |
+| **Metadata & Motors** | Inspect experiment details, sample environment and searchable instrument motor values, targets, offsets and units. |
+
+File loading runs in the background with progress and cancellation. Light/dark
+themes, customizable chart styles and collapsible panels help when comparing
+many scans.
 
 ## Installation and launch
 
-Requires Python 3.12.
+Requires **Python 3.12**. Run these commands from a terminal:
 
 ```powershell
+git clone https://github.com/RobbieGHunt/pySAview.git
+cd pySAview
 python -m venv .venv
-.venv\Scripts\python.exe -m pip install -e ".[dev]"
+.venv\Scripts\python.exe -m pip install -e .
 .venv\Scripts\python.exe -m pySAview
 ```
 
-## Tests
+Ensure `python` refers to Python 3.12 before creating the environment.
+The commands above use Windows paths.
+
+After installation, Windows users can double-click **[pySAview/run.bat](pySAview/run.bat)**.
+It uses this checkout's `.venv` and reports a missing environment rather than
+selecting a different Python installation. Existing local `Launch_pySAview.bat`
+wrappers remain compatible.
+
+Alternatively, use `.venv\Scripts\pysaview.exe` or open a particular file:
 
 ```powershell
+.venv\Scripts\python.exe -m pySAview "C:\path\to\scan.nxs"
+```
+
+When updating an existing installation, rerun the `pip install -e .` command
+after pulling the latest changes.
+
+## Using pySAview
+
+### Open and compare scans
+
+Startup opens an empty workspace. Use **Open** to replace the current file set,
+**Add** to extend it, or drag files into the window. Example scans are available
+explicitly from **File → Open Example Scans**.
+
+The active file determines the file-tree, detector and metadata views.
+Checkboxes in **Loaded Scans** select the curves included in the chart overlay.
+These are separate selections, so you can inspect one file while comparing
+several others.
+
+During batch loading, **Cancel** retains files already loaded. Failed files are
+reported together while the remaining files continue loading. An Open operation
+keeps the previous workspace until the first replacement scan loads successfully.
+
+### Select channels and processing
+
+In **Scan Charts → Data & Processing**, select the X/Y channels, normalization,
+uncertainty method and spin display. Incident angle can be converted to
+`Q = 4π sin(θ) / λ`, with a configurable wavelength (initially 5.21 Å).
+
+| Normalization | Plotted value |
+| --- | --- |
+| Raw counts | `N` |
+| Time | `N / t` |
+| Monitor | `N / M` |
+| Fixed reference monitor rate | `r_ref × N / M` |
+
+Here `N` is detector/ROI counts, `M` is monitor counts and `t` is dwell time.
+The reference rate is an explicit scale shared across scans, rather than a
+separate scale estimated for each scan.
+
+**Sigma** offers **1σ–6σ**, defaulting to **2σ**. Exact count intervals use the
+corresponding Gaussian-equivalent confidence coverage; propagated bounds use
+± the selected number of standard uncertainties. Numerical standard uncertainty
+values remain separately identified at 1σ. The processing banner identifies the
+method, exclusions and relevant assumptions.
+
+The collapsible **Plotted Data Points** panel shows source step indices, X/Y
+values, standard uncertainties, interval bounds and their method.
+
+### Spin states and chart appearance
+
+Spin separation follows `Flipper1`:
+
+| Flipper | Incident spin | Default colormap |
+| --- | --- | --- |
+| OFF / 0 | `d` — down | Blues |
+| ON / 1 | `u` — up | Reds |
+
+This supports the two-channel `u`/`d` workflow. Full four-channel separation
+(`uu`, `ud`, `dd`, `du`) is not established by this mapping.
+
+In **Chart Display Options**, choose each spin's Matplotlib colormap, solid or
+dashed lines, line width and marker size. Set marker size to zero to hide markers.
+Both full-colormap previews have draggable arrows: their shared positions select
+the range over which scan colors are evenly spaced. Hiding a scan preserves the
+other scans' colors.
+
+The same tab controls **Axis font size**, **Show legend**, log axes and the
+optional **Waterfall** display. Waterfall spacing is logarithmic by default,
+with a linear option; both spins from a scan share an offset. Numbered
+`number.nxs` files ascend by scan number, followed by unnumbered files in load
+order. Tables and CSV exports retain the unshifted values.
+
+### Define and reuse an ROI
+
+In **2D Detector**, drag or resize the ROI, enter numeric bounds, or use
+**Auto-Fit ROI** to track drift within the scan. The detector orientation matches
+the beamline display convention: rotate 90° clockwise and mirror horizontally.
+Use the frame controls and profile plots to inspect the selection, then choose
+**Apply ROI to Scan Chart** to calculate `ROI_Counts`.
+
+Each scan owns its ROI independently. **Reset to File ROI** restores the original
+file definition. Applying a working ROI never changes that original definition
+or writes to the measurement file.
+
+**Save ROI…** creates a separate JSON definition containing the coordinate
+convention, detector dimensions, source path and fixed bounds or all tracked
+frame bounds. It requires a new output filename.
+
+**Load ROI…** stages an overlay for the current scan. Review it for drift before
+applying it. Fixed definitions can be explicitly reused with matching detector
+dimensions; tracked definitions require the original scan path and frame count.
+Moving a tracked ROI manually changes it into a fixed ROI.
+
+### Export results
+
+**Export CSV** and **Export Plot** sit side by side below the chart controls:
+
+- **CSV** saves full-precision calculated values, standard uncertainties, bounds
+  and processing provenance, without waterfall offsets.
+- **PNG / SVG** saves the current chart appearance, including axes, display
+  offsets and the legend when visible.
+
+Export destinations are checked to prevent overwriting measurement files.
+
+### Remembered preferences
+
+On normal exit, the app remembers the last load folder, theme, processing/display
+choices, Sigma, spin styling, shade range, axis fonts, legend and data-panel
+visibility, and detector display preferences.
+
+File lists, ROIs and plot zoom are not automatically restored after restarting.
+Save ROI definitions separately when needed; full session saving is deferred.
+
+## Scientific scope and limitations
+
+pySAview is an inspection and quick-comparison tool. Monitor-normalized intensity
+is not automatically calibrated reflectivity: direct-beam, footprint, detector
+efficiency, dead-time and polarization corrections are not implied.
+
+Read **[Normalization and uncertainty](docs/normalization.md)** for formulas,
+exact count-interval assumptions, supplied variance handling, invalid-point
+policy and ROI pixel conventions. Counting intervals do not include uncertainty
+introduced by automatic peak tracking.
+
+Background loading keeps file parsing off the GUI thread. Interactive ROI
+integration/tracking and final chart/table rendering still run on the GUI thread.
+
+## Development and tests
+
+Install development dependencies and run the suite from the repository root:
+
+```powershell
+.venv\Scripts\python.exe -m pip install -e ".[dev]"
 $env:QT_QPA_PLATFORM = "offscreen"
 .venv\Scripts\python.exe -m pytest
 ```
 
-The supplied scans are used by the reader and UI integration tests.
+Tests cover normalization, coverage, zero-count limits, ROI integration and
+ownership, source-file protection, exports, preferences, background loading
+and UI behavior. Supplied example scans support the real-file integration tests.
 
-## Scientific processing
+The Windows standalone build configuration is
+[pySAview/packaging/build.ps1](pySAview/packaging/build.ps1), using
+`pySAview/packaging/pySAview.spec` to produce `pySAview.exe`.
 
-See [normalization and uncertainty](docs/normalization.md) for the formulas,
-statistical assumptions, exact low-count intervals, and invalid-point policy.
+## License
 
-Monitor mode is the unscaled count ratio `N/M`. The reference-rate mode uses
-a visible fixed scale shared across files; it does not silently rescale each
-scan to its own mean monitor. Standard uncertainties and exact confidence
-limits are exported separately, with their methods identified.
-
-## Incremental development
-
-Validated normalization, selectable Sigma bounds, per-scan ROI definitions,
-background file loading, chart styling and local preferences are implemented.
-Background ROI integration/tracking and further many-file workflow improvements
-remain planned. Full session saving is deferred. The magnetometry application
-is maintained separately.
-
-## Supported launchers
-
-On Windows, use `pySAview/run.bat`, which runs the repository's own
-`.venv` and reports a missing environment rather than choosing another Python
-installation. The module entry point `python -m pySAview` and installed
-`pysaview` command remain supported.
-
-Legacy `run.vbs`, `sa_nxs_launcher.py`, `create_shortcut.ps1`, and
-`SuperADAM_Explorer.lnk` have been removed. The old local
-`sa_nxs_explorer/run.bat` forwarding launcher is also retired. Existing local
-`Launch_pySAview.bat` wrappers remain supported and point to the current
-`pySAview/run.bat`.
-
-### Waterfall display
-
-In **Chart Display Options**, enable **Waterfall: offset scans**. Logarithmic mode defaults to one decade per scan (multiply by `10 ** (rank * spacing)`); linear mode adds `rank * spacing` in plotted Y units. The mode selects the corresponding Y axis scale; the axis controls remain available. Both spin channels of a file share its offset. Numbered `number.nxs` files ascend from the base by scan number; other files follow in load order. Only visible scans occupy ranks. Offsets apply equally to interval endpoints and never change normalization, statistical results, tables, or exported numerical data. Legend labels identify offsets.
-
-### Shared shade range
-
-The u/d shade bars always display the full selected colormaps. Drag either triangular endpoint on either bar to choose a shared sampling range. Loaded scans are spaced evenly between the arrows; a single scan uses the midpoint. The initial range is 0–100%, and changing theme or colormap preserves the selected range.
-
-### Source data and scan ownership
-
-Measurement files are opened read-only and must never be overwritten by the app. Processing changes only in-memory data. Export destinations reject NeXus/HDF5 extensions and aliases of loaded source files. Each scan owns its working ROI independently; applying a user ROI preserves the original file ROI. Reusing an ROI across scans must be an explicit operation, never automatic inheritance. ROI definitions are saved in separate JSON files; full session saving is deferred.
-
-### ROI definitions
-
-In the 2D Detector ROI panel, **Save ROI…** saves the currently displayed fixed region or all tracked frame regions into a new `.json` file. Existing files are never overwritten by this operation; choose a new name. Definitions include a format version, pixel convention, detector dimensions, source path and frame count.
-
-**Load ROI…** explicitly stages the definition for the active scan only. Check its overlay for drift, adjust it if needed, then choose **Apply ROI to Scan Chart**. Fixed definitions may be reused with matching detector dimensions; tracked definitions require the original source path and frame count. Moving a tracked ROI manually changes it into a fixed ROI. Applied working definitions survive switching scans in the running app; reopen them from JSON after restarting (full session persistence remains future work). Reset restores the file ROI without modifying it. Counting intervals do not quantify uncertainty introduced by peak tracking.
-
-### Startup and preferences
-
-Startup opens an empty workspace unless a file is explicitly passed on the command line. Example scans remain available from File → Open Example Scans. The last successful load folder and local preferences (theme, chart processing and display options, spin styles, shared shade range, and detector colormap/contrast) are remembered on normal exit using Qt user settings. File lists, ROI definitions and plot zoom are not automatically restored. No session files are created and measurement files remain read-only.
-
-The panel icon button above the chart tables collapses or expands Plotted Data Points without changing their data. Chart Display Options includes **Axis font size** (axis titles and tick labels) and **Show legend**. These settings and the table-panel visibility are remembered on exit.
-
-### Loading many files
-
-Open, Add, drag-and-drop, Reload, example loading and command-line startup parse files in a background worker. A modeless progress window reports the batch and offers Cancel. Completed files are retained on cancellation; an Open replacement keeps the previous workspace until the first new scan has parsed successfully. New requests cancel prior work, and stale results are discarded. Failures are collected into one report while other scans continue loading. Chart and table rebuilding is deferred until the batch ends.
-
-Source readers remain read-only. Worker file handles are closed inside the worker; GUI inspection uses separate handles. Detector ROI reads are chunked (targeting up to 8 MiB per chunk, with at least one frame), and cancellation is checked between files and chunks. An in-flight HDF5 read cannot be forcibly interrupted. Closing the app requests cancellation and waits asynchronously for safe worker cleanup. Final plot/table rendering and interactive detector processing still run on the GUI thread; background ROI editing/tracking is a later increment.
-
-**Export Plot** sits beside **Export CSV** below the chart controls. It saves the current chart as PNG or SVG, including axis titles, styling, waterfall offsets and the legend when visible. CSV continues to export the unshifted numerical data. The graph right-click export entry is replaced by this protected save action.
-
-### Application package name
-
-The application folder and Python module are `pySAview`. Start with `python -m pySAview`, the installed `pysaview` command, or `pySAview/run.bat`. After updating an existing checkout, rerun the installation command above to refresh the editable package and installed command. The Windows standalone build uses `pySAview/packaging/pySAview.spec` and produces `pySAview.exe`.
-
-Curve Statistics has been removed. The collapsible bottom panel retains only Plotted Data Points. In Data & Processing, **Sigma** selects 1σ–6σ Gaussian-equivalent coverage for exact count intervals, defaulting to 2σ. This preference is remembered and also sets propagated bounds to ± the selected number of standard uncertainties (2σ by default). Exported standard uncertainty values remain separately identified at 1σ.
+See [LICENSE](LICENSE).
