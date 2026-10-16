@@ -2,10 +2,9 @@
 
 SuperADAM NeXus file inspection, detector viewing, and quick scan comparison.
 
-The initial import preserves the existing `pySAview` application,
-tests, resources, launchers, and supplied example scans without changing
-application behavior. Machine-specific shortcuts and Python caches are excluded.
-The other PNR tools are maintained separately.
+The application supports read-only measurement inspection, independent per-scan
+ROIs, configurable uncertainty bounds, background batch loading, and plot/data
+export. The other PNR tools are maintained separately.
 
 See [the application guide](pySAview/README.md) for the feature inventory.
 
@@ -40,10 +39,11 @@ limits are exported separately, with their methods identified.
 
 ## Incremental development
 
-The current scope is the viewer's P0 work: validated normalization and
-uncertainty, explicit channel/unit compatibility, and visible processing status.
-Persistent ROI/session state, background processing, and further layout changes
-remain later milestones. The magnetometry application is maintained separately.
+Validated normalization, selectable Sigma bounds, per-scan ROI definitions,
+background file loading, chart styling and local preferences are implemented.
+Background ROI integration/tracking and further many-file workflow improvements
+remain planned. Full session saving is deferred. The magnetometry application
+is maintained separately.
 
 ## Supported launchers
 
@@ -53,7 +53,10 @@ installation. The module entry point `python -m pySAview` and installed
 `pysaview` command remain supported.
 
 Legacy `run.vbs`, `sa_nxs_launcher.py`, `create_shortcut.ps1`, and
-`SuperADAM_Explorer.lnk` are retired and should not be used.
+`SuperADAM_Explorer.lnk` have been removed. The old local
+`sa_nxs_explorer/run.bat` forwarding launcher is also retired. Existing local
+`Launch_pySAview.bat` wrappers remain supported and point to the current
+`pySAview/run.bat`.
 
 ### Waterfall display
 
@@ -65,7 +68,7 @@ The u/d shade bars always display the full selected colormaps. Drag either trian
 
 ### Source data and scan ownership
 
-Measurement files are opened read-only and must never be overwritten by the app. Processing changes only in-memory data. Export destinations reject NeXus/HDF5 extensions and aliases of loaded source files. Each scan owns its working ROI independently; applying a user ROI preserves the original file ROI. Reusing an ROI across scans must be an explicit operation, never automatic inheritance. Future ROI/session saves belong in separate sidecar files.
+Measurement files are opened read-only and must never be overwritten by the app. Processing changes only in-memory data. Export destinations reject NeXus/HDF5 extensions and aliases of loaded source files. Each scan owns its working ROI independently; applying a user ROI preserves the original file ROI. Reusing an ROI across scans must be an explicit operation, never automatic inheritance. ROI definitions are saved in separate JSON files; full session saving is deferred.
 
 ### ROI definitions
 
