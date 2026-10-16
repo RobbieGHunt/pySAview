@@ -2,12 +2,12 @@
 
 SuperADAM NeXus file inspection, detector viewing, and quick scan comparison.
 
-The initial import preserves the existing `sa_nxs_explorer` application,
+The initial import preserves the existing `pySAview` application,
 tests, resources, launchers, and supplied example scans without changing
 application behavior. Machine-specific shortcuts and Python caches are excluded.
 The other PNR tools are maintained separately.
 
-See [the application guide](sa_nxs_explorer/README.md) for the feature inventory.
+See [the application guide](pySAview/README.md) for the feature inventory.
 
 ## Installation and launch
 
@@ -16,7 +16,7 @@ Requires Python 3.12.
 ```powershell
 python -m venv .venv
 .venv\Scripts\python.exe -m pip install -e ".[dev]"
-.venv\Scripts\python.exe -m sa_nxs_explorer
+.venv\Scripts\python.exe -m pySAview
 ```
 
 ## Tests
@@ -47,10 +47,10 @@ remain later milestones. The magnetometry application is maintained separately.
 
 ## Supported launchers
 
-On Windows, use `sa_nxs_explorer/run.bat`, which runs the repository's own
+On Windows, use `pySAview/run.bat`, which runs the repository's own
 `.venv` and reports a missing environment rather than choosing another Python
-installation. The module entry point `python -m sa_nxs_explorer` and installed
-`sa-nxs-explorer` command remain supported.
+installation. The module entry point `python -m pySAview` and installed
+`pysaview` command remain supported.
 
 Legacy `run.vbs`, `sa_nxs_launcher.py`, `create_shortcut.ps1`, and
 `SuperADAM_Explorer.lnk` are retired and should not be used.
@@ -86,3 +86,7 @@ Open, Add, drag-and-drop, Reload, example loading and command-line startup parse
 Source readers remain read-only. Worker file handles are closed inside the worker; GUI inspection uses separate handles. Detector ROI reads are chunked (targeting up to 8 MiB per chunk, with at least one frame), and cancellation is checked between files and chunks. An in-flight HDF5 read cannot be forcibly interrupted. Closing the app requests cancellation and waits asynchronously for safe worker cleanup. Final plot/table rendering and interactive detector processing still run on the GUI thread; background ROI editing/tracking is a later increment.
 
 **Export Plot** sits beside **Export CSV** below the chart controls. It saves the current chart as PNG or SVG, including axis titles, styling, waterfall offsets and the legend when visible. CSV continues to export the unshifted numerical data. The graph right-click export entry is replaced by this protected save action.
+
+### Application package name
+
+The application folder and Python module are `pySAview`. Start with `python -m pySAview`, the installed `pysaview` command, or `pySAview/run.bat`. After updating an existing checkout, rerun the installation command above to refresh the editable package and installed command. The Windows standalone build uses `pySAview/packaging/pySAview.spec` and produces `pySAview.exe`.

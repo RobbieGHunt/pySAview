@@ -9,21 +9,21 @@ dependencies = ["PyQt6>=6.7", "pyqtgraph>=0.13.7", "numpy>=2.0", "h5py>=3.11", "
 dev = ["pytest>=8", "pytest-qt>=4.4", "pyinstaller>=6.10"]
 
 [project.gui-scripts]
-sa-nxs-explorer = "sa_nxs_explorer.app:main"
+pysaview = "pySAview.app:main"
 
 [build-system]
 requires = ["setuptools>=69"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-include = ["sa_nxs_explorer*"]
-exclude = ["sa_nxs_explorer.tests*"]
+include = ["pySAview*"]
+exclude = ["pySAview.tests*"]
 
 [tool.setuptools.package-data]
-sa_nxs_explorer = ["resources/*.svg", "example_data/*.nxs"]
+pySAview = ["resources/*.svg", "example_data/*.nxs"]
 
 [tool.pytest.ini_options]
-testpaths = ["sa_nxs_explorer/tests"]
+testpaths = ["pySAview/tests"]
 pythonpath = ["."]
 qt_api = "pyqt6"
 addopts = "-p no:cacheprovider"
