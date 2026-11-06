@@ -26,12 +26,13 @@ def main_window(qtbot, example_nxs_path: Path) -> MainWindow:
 
 
 def test_window_tabs_and_loading(main_window: MainWindow):
-    assert main_window.tabs.count() == 4
-    tab_titles = [main_window.tabs.tabText(i) for i in range(4)]
+    assert main_window.tabs.count() == 5
+    tab_titles = [main_window.tabs.tabText(i) for i in range(5)]
     assert "File Hierarchy" in tab_titles[0]
     assert "Scan Charts" in tab_titles[1]
     assert "2D Detector" in tab_titles[2]
-    assert "Metadata & Motors" in tab_titles[3]
+    assert "Off-Specular" in tab_titles[3]
+    assert "Metadata & Motors" in tab_titles[4]
 
     assert main_window.current_file_path is not None
     assert "005572.nxs" in main_window.current_file_path.name

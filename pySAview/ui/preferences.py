@@ -16,6 +16,8 @@ def controls(window):
             result[f"{spin}/{name}"] = items[name]
     for name in ("combo_cmap", "chk_log_img", "chk_show_roi"):
         result[f"detector/{name}"] = getattr(window.view_detector, name)
+    for name in ("combo_cmap", "chk_log", "chk_show_roi", "combo_norm", "combo_y_axis", "spin_wavelength"):
+        result[f"offspec/{name}"] = getattr(window.view_offspec, name)
     return result
 
 
@@ -72,5 +74,7 @@ def restore_preferences(window):
     chart.bottom_tabs.setVisible(chart.chk_show_data_panel.isChecked())
     chart._on_axis_or_setting_changed()
     window.view_detector._on_cmap_changed(window.view_detector.combo_cmap.currentText())
+    window.view_offspec._on_cmap_changed(window.view_offspec.combo_cmap.currentText())
+    window.view_offspec._set_enabled(False)
     if type(data.get("dark")) is bool:
         window.act_dark_mode.setChecked(data["dark"])

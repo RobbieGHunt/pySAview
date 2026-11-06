@@ -32,6 +32,7 @@ inspection and check files in **Loaded Scans** to compare them on the chart.
 | **File Hierarchy** | Browse datasets and attributes; preview data as plots, images, tables or text. |
 | **Scan Charts** | Plot selected channels, compare scans, separate spin states, normalize counts and display uncertainties. |
 | **2D Detector** | Browse detector frames, define or track an ROI, inspect profiles and apply ROI counts to the chart. |
+| **Off-Specular** | Heatmap of every detector frame integrated along Y (full height, scan ROI or custom rows), shown as X pixel versus scan point, α_i versus α_f or Qx versus Qz, with spin selection or spin asymmetry, normalization, crosshair cuts and PNG export. |
 | **Metadata & Motors** | View experiment details, sample environment and instrument positions. |
 
 Chart processing includes angle-to-Q conversion, time or monitor normalization,
@@ -48,6 +49,9 @@ remembered between launches.
 
 See [Normalization and uncertainty](docs/normalization.md) for calculation
 methods and statistical conventions.
+
+The α_i–α_f view is calibrated per scan from the direct beam visible in the
+detector images; see [Off-specular angle calibration](docs/off_specular.md).
 
 ## Development and tests
 

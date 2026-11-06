@@ -33,6 +33,7 @@ from pySAview.ui.preferences import restore_preferences, save_preferences
 from pySAview.ui.detector_view import DetectorView
 from pySAview.ui.file_structure_view import FileStructureView
 from pySAview.ui.metadata_view import MetadataView
+from pySAview.ui.off_specular_view import OffSpecularView
 from pySAview.ui.scan_plot_view import ScanPlotView
 from pySAview.ui.session_files_view import SessionFilesView
 from pySAview.ui.theme import DARK_THEME, LIGHT_THEME
@@ -85,11 +86,13 @@ class MainWindow(QMainWindow):
         self.view_hierarchy = FileStructureView()
         self.view_charts = ScanPlotView()
         self.view_detector = DetectorView()
+        self.view_offspec = OffSpecularView()
         self.view_metadata = MetadataView()
 
         self.tabs.addTab(self.view_hierarchy, "File Hierarchy")
         self.tabs.addTab(self.view_charts, "Scan Charts")
         self.tabs.addTab(self.view_detector, "2D Detector")
+        self.tabs.addTab(self.view_offspec, "Off-Specular")
         self.tabs.addTab(self.view_metadata, "Metadata & Motors")
 
         # Connect session files view signals
@@ -186,10 +189,15 @@ class MainWindow(QMainWindow):
         act_tab2.triggered.connect(lambda: self.tabs.setCurrentIndex(2))
         menu_view.addAction(act_tab2)
 
-        act_tab3 = QAction("Metadata Tab", self)
+        act_tab3 = QAction("Off-Specular Tab", self)
         act_tab3.setShortcut(QKeySequence("Ctrl+4"))
         act_tab3.triggered.connect(lambda: self.tabs.setCurrentIndex(3))
         menu_view.addAction(act_tab3)
+
+        act_tab4 = QAction("Metadata Tab", self)
+        act_tab4.setShortcut(QKeySequence("Ctrl+5"))
+        act_tab4.triggered.connect(lambda: self.tabs.setCurrentIndex(4))
+        menu_view.addAction(act_tab4)
 
         # Help Menu
         menu_help = menubar.addMenu("&Help")
@@ -238,7 +246,8 @@ class MainWindow(QMainWindow):
         self.tabs.setTabIcon(0, icons.get_icon("folder_tree", is_dark=is_d))
         self.tabs.setTabIcon(1, icons.get_icon("chart", is_dark=is_d))
         self.tabs.setTabIcon(2, icons.get_icon("scan", is_dark=is_d))
-        self.tabs.setTabIcon(3, icons.get_icon("sliders", is_dark=is_d))
+        self.tabs.setTabIcon(3, icons.get_icon("grid", is_dark=is_d))
+        self.tabs.setTabIcon(4, icons.get_icon("sliders", is_dark=is_d))
 
         # Action vector icons
         self.act_toggle_sidebar.setIcon(icons.get_icon("panel_left", is_dark=is_d))
@@ -254,6 +263,7 @@ class MainWindow(QMainWindow):
         self.view_hierarchy.set_theme(is_d)
         self.view_charts.set_theme(is_d)
         self.view_detector.set_theme(is_d)
+        self.view_offspec.set_theme(is_d)
 
     def _toggle_dark_mode(self, checked: bool) -> None:
         self.is_dark_mode = checked
@@ -364,6 +374,7 @@ class MainWindow(QMainWindow):
         self.view_detector.set_data(None, ScanData("", ScanMetadata(), {}))
         self.view_detector._current_frame_data = None
         self.view_detector.img_item.clear()
+        self.view_offspec.set_data(None)
         self.view_hierarchy.tree.clear()
         self.view_metadata.set_data(ScanData("", ScanMetadata(), {}))
 
@@ -518,6 +529,7 @@ class MainWindow(QMainWindow):
         # Update views
         self.view_hierarchy.set_file(target)
         self.view_detector.set_data(reader, scan_data)
+        self.view_offspec.set_data(scan_data)
         self.view_metadata.set_data(scan_data)
 
         # Update session files sidebar active selection
@@ -569,6 +581,7 @@ class MainWindow(QMainWindow):
         else:
             self.active_file_path = None
             self.view_hierarchy.tree.clear()
+            self.view_offspec.set_data(None)
             self.setWindowTitle("SuperADAM NeXus Explorer")
             self.status_bar.showMessage("Ready. Open one or more NeXus (.nxs) files to begin.")
 
@@ -598,6 +611,7 @@ class MainWindow(QMainWindow):
         """Update scan plot view when a new ROI is applied from detector view."""
         cur_path = str(self.active_file_path) if self.active_file_path else None
         self.view_charts.update_roi_counts(roi_counts, roi_bounds, file_path=cur_path)
+        self.view_offspec.refresh_roi()
         x0, x1, y0, y1 = roi_bounds
         self.status_bar.showMessage(
             f"User ROI Applied to Scan Charts: X [{x0:.0f}..{x1:.0f}], Y [{y0:.0f}..{y1:.0f}]  |  Total ROI Counts: {np.sum(roi_counts):,.0f}"
@@ -628,6 +642,7 @@ class MainWindow(QMainWindow):
             event.ignore()
             return
         save_preferences(self)
+        self.view_offspec.shutdown()
         for reader in self.loaded_readers.values():
             try:
                 reader.close()
@@ -651,6 +666,7 @@ class MainWindow(QMainWindow):
             "<li>Poisson count error propagation and monitor rate normalization</li>"
             "<li>Q momentum transfer conversion with wavelength selection</li>"
             "<li>2D detector frame movie player (90° CW oriented) with interactive ROI overlay</li>"
+            "<li>Off-specular map: detector frames integrated along Y versus X pixel and scan point</li>"
             "<li>Motor positions and sample environment dashboard</li>"
             "</ul>",
         )
