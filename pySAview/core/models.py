@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pySAview.core.roi_record import ROIRecord
+from pySAview.core.angle_calibration import AngleCalibration
 
 from dataclasses import dataclass, field
 from typing import Any
@@ -103,3 +104,5 @@ class ScanData:
     working_detector_roi: tuple[float, float, float, float] | None = None  # in-memory, scan-specific; file ROI stays unchanged
 
     working_roi_record: ROIRecord | None = None
+    # In-memory, scan-specific detector angle calibration for α_i / α_f maps.
+    angle_calibration: AngleCalibration | None = None
