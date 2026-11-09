@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import csv
 from pathlib import Path
 from typing import Any
 
@@ -38,7 +37,7 @@ from PyQt6.QtWidgets import (
 
 from pySAview.ui.colormap_range import ColormapRange
 from pySAview.core.waterfall import waterfall_order, display_values
-from pySAview.core.source_safety import validate_output_path
+from pySAview.core.export_tables import reflectivity_table, write_table
 from pySAview.core.models import ScanData
 from pySAview.core.scan_calculations import (
     PlottedCurve,
@@ -49,7 +48,14 @@ from pySAview.core.normalization import (
     is_count_channel, normalize_signal, log_error_bounds,
 )
 from pySAview.ui import icons
+from pySAview.ui.plot_tools import (
+    TABLE_FILTERS, ask_output_path, export_plot_image, install_context_export, tool_button,
+)
 from pySAview.ui.theme import apply_plot_theme
+
+
+OVERFLOW_NOTE = ("Offset exceeds display range; reduce spacing. Overflowing points are hidden; "
+                 "original data are retained.")
 
 
 class ScanPlotView(QWidget):
@@ -134,7 +140,11 @@ class ScanPlotView(QWidget):
         self.combo_norm.addItem("Raw Counts (counts)", "raw")
         self.combo_norm.addItem("Counts / Monitor1 (unscaled ratio)", "monitor")
         self.combo_norm.addItem("Normalized to Time (cps)", "time")
-        self.combo_norm.addItem("Monitor ratio × fixed reference rate", "monitor_time")
+        self.combo_norm.addItem("Monitor norm. cps", "monitor_time")
+        self.combo_norm.setItemData(
+            self.combo_norm.count() - 1,
+            "Counts / Monitor1 × a fixed reference monitor rate (monitor counts/s): counts per second "
+            "at that monitor rate. Set the rate below.", Qt.ItemDataRole.ToolTipRole)
         self.combo_norm.currentIndexChanged.connect(self._on_axis_or_setting_changed)
         proc_layout.addWidget(self.combo_norm)
 
@@ -298,18 +308,6 @@ class ScanPlotView(QWidget):
         self.btn_reset.clicked.connect(self._reset_zoom)
         ctrl_layout.addWidget(self.btn_reset)
 
-        self.btn_export_csv = QPushButton("Export CSV")
-        self.btn_export_csv.setIcon(icons.get_icon("download", is_dark=self.is_dark_mode))
-        self.btn_export_csv.clicked.connect(self._export_csv)
-        export_row = QHBoxLayout()
-        export_row.addWidget(self.btn_export_csv)
-        self.btn_export_plot = QPushButton("Export Plot")
-        self.btn_export_plot.setIcon(icons.get_icon("download", is_dark=self.is_dark_mode))
-        self.btn_export_plot.setToolTip("Save the current chart, including axes and visible legend, as PNG or SVG.")
-        self.btn_export_plot.clicked.connect(self._export_plot)
-        export_row.addWidget(self.btn_export_plot)
-        ctrl_layout.addLayout(export_row)
-
         ctrl_layout.addStretch()
         controls_scroll = QScrollArea()
         controls_scroll.setWidgetResizable(True)
@@ -334,87 +332,66 @@ class ScanPlotView(QWidget):
         header_row.addWidget(self.lbl_title, 1)
 
         self.lbl_coords = QLabel("Cursor: (X: -- , Y: --)")
-        self.lbl_coords.setStyleSheet("color: #64748b; font-size: 12px;")
-        self.lbl_coords.setFixedWidth(240)
+        self.lbl_coords.setStyleSheet("color: #64748b; font-size: 11px;")
+        self.lbl_coords.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         self.lbl_coords.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        header_row.addWidget(self.lbl_coords)
         right_layout.addLayout(header_row)
-        self.lbl_processing = QLabel("Open a scan to inspect processing.")
+        # Only warnings/notes are shown; the full processing description is kept in
+        # ``processing_status`` (export header, docs/normalization.md).
+        self.processing_status = ""
+        self.lbl_processing = QLabel("")
+        self.lbl_processing.setVisible(False)
         self.lbl_processing.setWordWrap(True)
         self.lbl_processing.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         self.lbl_processing.setMinimumWidth(0)
         self.lbl_processing.setTextFormat(Qt.TextFormat.PlainText)
         self.lbl_processing.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        self.lbl_processing.setStyleSheet("font-size: 12px; padding: 4px;")
+        self.lbl_processing.setStyleSheet("color: #b45309; font-size: 11px; padding: 2px 4px;")
         right_layout.addWidget(self.lbl_processing)
 
         # Interactive Plot Toolbar (Pan, Box Zoom, Zoom In, Zoom Out, Auto-scale, Log Toggles)
         toolbar_row = QHBoxLayout()
         toolbar_row.setSpacing(6)
 
-        self.btn_pan = QPushButton("Pan")
-        self.btn_pan.setCheckable(True)
+        self.btn_pan = tool_button("Pan: drag to move the chart", checkable=True)
         self.btn_pan.setChecked(True)
-        self.btn_pan.setToolTip("Pan Mode: Drag with left mouse button to pan chart")
         self.btn_pan.clicked.connect(self._set_mouse_mode_pan)
-        toolbar_row.addWidget(self.btn_pan)
-
-        self.btn_box_zoom = QPushButton("Box Zoom")
-        self.btn_box_zoom.setCheckable(True)
-        self.btn_box_zoom.setToolTip("Box Zoom Mode: Drag with left mouse button to draw a zoom rectangle")
+        self.btn_box_zoom = tool_button("Box zoom: drag a rectangle to zoom", checkable=True)
         self.btn_box_zoom.clicked.connect(self._set_mouse_mode_box_zoom)
-        toolbar_row.addWidget(self.btn_box_zoom)
-
         self.mouse_mode_group = QButtonGroup(self)
         self.mouse_mode_group.addButton(self.btn_pan)
         self.mouse_mode_group.addButton(self.btn_box_zoom)
-
-        self.btn_zoom_in = QPushButton("Zoom In")
-        self.btn_zoom_in.setToolTip("Zoom into chart center (+30%)")
+        self.btn_zoom_in = tool_button("Zoom in")
         self.btn_zoom_in.clicked.connect(self._zoom_in)
-        toolbar_row.addWidget(self.btn_zoom_in)
-
-        self.btn_zoom_out = QPushButton("Zoom Out")
-        self.btn_zoom_out.setToolTip("Zoom out from chart center (-30%)")
+        self.btn_zoom_out = tool_button("Zoom out")
         self.btn_zoom_out.clicked.connect(self._zoom_out)
-        toolbar_row.addWidget(self.btn_zoom_out)
-
-        self.btn_reset_view = QPushButton("Fit All")
-        self.btn_reset_view.setToolTip("Auto-scale / Reset view to fit all data curves")
+        self.btn_reset_view = tool_button("Fit all curves")
         self.btn_reset_view.clicked.connect(self._reset_zoom)
-        toolbar_row.addWidget(self.btn_reset_view)
-
-        toolbar_row.addSpacing(10)
-
-        self.btn_tool_log_y = QPushButton("Log Y")
-        self.btn_tool_log_y.setCheckable(True)
+        self.btn_tool_log_y = tool_button("Log Y: logarithmic / linear Y axis", checkable=True)
         self.btn_tool_log_y.setChecked(self.chk_log_y.isChecked())
-        self.btn_tool_log_y.setToolTip("Toggle Logarithmic / Linear scale on Y axis")
         self.btn_tool_log_y.toggled.connect(self._on_tool_log_y_toggled)
-        toolbar_row.addWidget(self.btn_tool_log_y)
-
-        self.btn_tool_log_x = QPushButton("Log X")
-        self.btn_tool_log_x.setCheckable(True)
+        self.btn_tool_log_x = tool_button("Log X: logarithmic / linear X axis", checkable=True)
         self.btn_tool_log_x.setChecked(self.chk_log_x.isChecked())
-        self.btn_tool_log_x.setToolTip("Toggle Logarithmic / Linear scale on X axis")
         self.btn_tool_log_x.toggled.connect(self._on_tool_log_x_toggled)
-        toolbar_row.addWidget(self.btn_tool_log_x)
-
-        toolbar_row.addSpacing(10)
-
-        self.btn_toggle_q = QPushButton("Axis: θ (deg)")
-        self.btn_toggle_q.setCheckable(True)
-        self.btn_toggle_q.setToolTip("Toggle horizontal axis between Incident Angle θ (deg) and Momentum Transfer Q (Å⁻¹)")
+        self.btn_toggle_q = tool_button("X axis: toggle incident angle θ (°) / momentum transfer Q (Å⁻¹)",
+                                        checkable=True)
+        self._set_x_symbol("θ")
         self.btn_toggle_q.clicked.connect(self._toggle_theta_q)
-        toolbar_row.addWidget(self.btn_toggle_q)
-
-        toolbar_row.addStretch(1)
+        self.btn_export_plot = tool_button("Export the chart as a PNG or SVG image")
+        self.btn_export_plot.clicked.connect(self.export_image)
+        for btn in (self.btn_pan, self.btn_box_zoom, self.btn_zoom_in, self.btn_zoom_out, self.btn_reset_view):
+            toolbar_row.addWidget(btn)
+        toolbar_row.addSpacing(8)
+        for btn in (self.btn_tool_log_y, self.btn_tool_log_x, self.btn_toggle_q, self.btn_export_plot):
+            toolbar_row.addWidget(btn)
+        toolbar_row.addSpacing(8)
+        # The cursor readout shares the toolbar row, as in the other plot tabs.
+        toolbar_row.addWidget(self.lbl_coords, 1)
         right_layout.addLayout(toolbar_row)
 
         # pyqtgraph Plot
         self.plot_widget = pg.PlotWidget()
-        # Export belongs beside CSV and uses our source-file destination guard.
-        self.plot_widget.scene().contextMenu.clear()
+        install_context_export(self.plot_widget, self._default_export_name("reflectivity", ".png"), self._source_paths)
         self.legend = self.plot_widget.addLegend()
         self.legend.anchor(itemPos=(1, 0), parentPos=(1, 0), offset=(-15, 15))
         self.plot_widget.showGrid(x=True, y=True, alpha=0.3)
@@ -696,18 +673,23 @@ class ScanPlotView(QWidget):
         self.is_dark_mode = is_dark
         self._update_palette_previews()
         self.btn_reset.setIcon(icons.get_icon("maximize", is_dark=is_dark))
-        self.btn_export_csv.setIcon(icons.get_icon("download", is_dark=is_dark))
-        self.btn_export_plot.setIcon(icons.get_icon("download", is_dark=is_dark))
         self.btn_pan.setIcon(icons.get_icon("hand", is_dark=is_dark))
         self.btn_box_zoom.setIcon(icons.get_icon("box_select", is_dark=is_dark))
         self.btn_zoom_in.setIcon(icons.get_icon("zoom_in", is_dark=is_dark))
         self.btn_zoom_out.setIcon(icons.get_icon("zoom_out", is_dark=is_dark))
         self.btn_reset_view.setIcon(icons.get_icon("maximize", is_dark=is_dark))
-        self.btn_tool_log_y.setIcon(icons.get_icon("activity", is_dark=is_dark))
-        self.btn_tool_log_x.setIcon(icons.get_icon("activity", is_dark=is_dark))
-        self.btn_toggle_q.setIcon(icons.get_icon("sliders", is_dark=is_dark))
+        self.btn_tool_log_y.setIcon(icons.get_icon("log_y", is_dark=is_dark))
+        self.btn_tool_log_x.setIcon(icons.get_icon("log_x", is_dark=is_dark))
+        self.btn_export_plot.setIcon(icons.get_icon("download", is_dark=is_dark))
+        self._set_x_symbol(getattr(self, "_x_symbol", "θ"))
         apply_plot_theme(self.plot_widget, is_dark)
         self._update_plot()
+
+    def _set_x_symbol(self, symbol: str) -> None:
+        """Show the current X axis (θ or Q) as an icon in the toolbar colour scheme."""
+        self._x_symbol = symbol
+        self.btn_toggle_q.setIcon(icons.get_text_icon(symbol, is_dark=self.is_dark_mode))
+        self.btn_toggle_q.setAccessibleName(f"X axis: {symbol}")
 
     def _toggle_theta_q(self) -> None:
         """Quickly toggle horizontal axis between Incident Angle θ and Momentum Transfer Q."""
@@ -771,7 +753,7 @@ class ScanPlotView(QWidget):
         # Synchronize plot toolbar buttons
         self.btn_toggle_q.blockSignals(True)
         self.btn_toggle_q.setChecked(is_q)
-        self.btn_toggle_q.setText("Axis: Q (Å⁻¹)" if is_q else "Axis: θ (deg)")
+        self._set_x_symbol("Q" if is_q else "θ")
         self.btn_toggle_q.blockSignals(False)
 
         self.btn_tool_log_y.blockSignals(True)
@@ -851,7 +833,7 @@ class ScanPlotView(QWidget):
 
         if not checked_scans:
             self.lbl_title.setText("No Datasets Selected")
-            self.lbl_processing.setText("No datasets selected for plotting.")
+            self._set_processing("No datasets selected for plotting.", [])
             self.plot_widget.clear()
             if self.plot_widget.plotItem.legend is not None:
                 self.plot_widget.plotItem.legend.clear()
@@ -1016,19 +998,25 @@ class ScanPlotView(QWidget):
         formulas = {"raw": "Y", "monitor": "N / Monitor1", "time": "N / dwell time",
                     "monitor_time": f"(N / Monitor1) × {self.spin_reference_rate.value():g} monitor counts/s (fixed reference)"}
         status = f"Processing: {formulas.get(norm_mode, norm_mode)}; {'; '.join(sorted(methods)) or 'no compatible data'}; {excluded} invalid points excluded."
+        notes = []  # shown under the title; the method description is not repeated there
+        if self.combo_uncertainty.currentData() == "exact" and any(m.startswith("propagated") for m in methods):
+            notes.append("Exact intervals unavailable for data with supplied variances; "
+                         "propagated uncertainty is shown instead.")
         if x_key == "Q":
             status += f" Wavelength: {self.spin_wavelength.value():g} Å."
         hidden = sum(np.count_nonzero((c.x <= 0) if self.chk_log_x.isChecked() else np.zeros(len(c.x), dtype=bool))
                      + np.count_nonzero((c.y <= 0) if self.chk_log_y.isChecked() else np.zeros(len(c.y), dtype=bool)) for c in all_curves)
         if hidden:
-            status += f" Log axes hide nonpositive coordinates ({hidden} coordinate values); retained in table/export."
+            notes.append(f"Log axes hide nonpositive coordinates ({hidden} coordinate values); retained in table/export.")
         if self.chk_log_y.isChecked() and any(c.y_lower is not None and np.any(c.y_lower <= 0) for c in all_curves):
-            status += " Nonpositive lower bounds cannot be drawn on a log axis; use linear view/table."
+            notes.append("Nonpositive lower bounds cannot be drawn on a log axis; use linear view/table.")
         self._processing_warnings = warnings
         if assumptions:
-            status += " Unit assumptions: " + "; ".join(sorted(assumptions)) + "."
+            notes.append("Unit assumptions: " + "; ".join(sorted(assumptions)) + ".")
         if warnings:
-            status += " " + " | ".join(warnings)
+            notes.append(" | ".join(warnings))
+        if notes:
+            status += " " + " ".join(notes)
         waterfall = self.chk_waterfall.isChecked()
         offset_mode = self.combo_waterfall_mode.currentData()
         spacing = self.spin_waterfall_spacing.value()
@@ -1039,7 +1027,7 @@ class ScanPlotView(QWidget):
         if waterfall:
             units = "decades" if offset_mode == "log" else "Y units"
             status += f" Waterfall display: {spacing:g} {units} per scan, ascending scan number then unnumbered load order; spins share offsets. Table/export values are unshifted."
-        self.lbl_processing.setText(status)
+        self._set_processing(status, notes)
 
         # Clear existing items
         self.plot_widget.clear()
@@ -1076,8 +1064,9 @@ class ScanPlotView(QWidget):
             upper_display = display_values(curve.y_upper, rank, spacing, offset_mode) if waterfall else curve.y_upper
             perr = curve.y_err
 
-            if waterfall and np.any(np.isfinite(curve.y) & ~np.isfinite(py)):
-                self.lbl_processing.setText(self.lbl_processing.text() + " Offset exceeds display range; reduce spacing. Overflowing points are hidden; original data are retained.")
+            if waterfall and np.any(np.isfinite(curve.y) & ~np.isfinite(py)) and OVERFLOW_NOTE not in notes:
+                notes.append(OVERFLOW_NOTE)
+                self._set_processing(self.processing_status + " " + OVERFLOW_NOTE, notes)
             valid = np.isfinite(px) & np.isfinite(py)
             if log_x:
                 valid &= (px > 0)
@@ -1132,6 +1121,7 @@ class ScanPlotView(QWidget):
         self._apply_chart_display()
 
         # Update spreadsheet
+        self._axis_labels = (x_label, y_label)
         self._update_data_table(all_curves, x_label, y_label)
 
     def _update_data_table(self, curves: list[PlottedCurve], x_label: str, y_label: str) -> None:
@@ -1160,80 +1150,49 @@ class ScanPlotView(QWidget):
                 self.curve_data_table.setItem(cur_row, 8, QTableWidgetItem(c.uncertainty_method))
                 cur_row += 1
 
-    def _export_plot(self) -> None:
+    def _set_processing(self, status: str, notes: list[str]) -> None:
+        self.processing_status = status
+        self.lbl_processing.setText(" ".join(notes))
+        self.lbl_processing.setVisible(bool(notes))
+
+    def _source_paths(self) -> list[str]:
+        return [scan.file_path for scan in self.loaded_scans.values()]
+
+    def _default_export_name(self, kind: str, suffix: str):
+        def name() -> str:
+            stems = sorted({Path(c.source_path).stem for c in self._current_curves if c.source_path})
+            stem = stems[0] if len(stems) == 1 else ("overlay" if stems else "scan")
+            return f"{stem}_{kind}{suffix}"
+        return name
+
+    def has_export_data(self) -> bool:
+        return bool(self._current_curves)
+
+    def export_image(self) -> Path | None:
+        """Save the chart (axes and visible legend) as PNG or SVG."""
         if not self._current_curves:
             QMessageBox.information(self, "No Data", "No curves currently plotted to export.")
-            return
-        path, selected = QFileDialog.getSaveFileName(
-            self, "Export Plot", "scan_plot.png", "PNG image (*.png);;SVG vector image (*.svg)")
-        if not path:
-            return
-        try:
-            target = Path(path)
-            if not target.suffix:
-                target = target.with_suffix(".svg" if "*.svg" in selected else ".png")
-            validate_output_path(target, [scan.file_path for scan in self.loaded_scans.values()])
-            from pyqtgraph.exporters import ImageExporter
-            if target.suffix.lower() == ".png":
-                exporter = ImageExporter(self.plot_widget.plotItem)
-                exporter.export(str(target))
-            elif target.suffix.lower() == ".svg":
-                # Render through Qt directly: pyqtgraph's SVG postprocessor
-                # cannot parse some paths generated by current Qt versions.
-                from PyQt6.QtSvg import QSvgGenerator
-                from PyQt6.QtGui import QPainter
-                from PyQt6.QtCore import QRectF, QSize
-                import math
-                rect = self.plot_widget.plotItem.sceneBoundingRect()
-                bounds = QRectF(0, 0, rect.width(), rect.height())
-                generator = QSvgGenerator()
-                generator.setFileName(str(target))
-                generator.setSize(QSize(math.ceil(rect.width()), math.ceil(rect.height())))
-                generator.setViewBox(bounds)
-                painter = QPainter(generator)
-                if not painter.isActive():
-                    raise OSError("Could not open SVG output")
-                try:
-                    self.plot_widget.plotItem.setExportMode(True, {"antialias": True})
-                    painter.fillRect(bounds, self.plot_widget.backgroundBrush())
-                    self.plot_widget.scene().render(painter, bounds, rect)
-                finally:
-                    painter.end()
-                    self.plot_widget.plotItem.setExportMode(False)
-            else:
-                raise ValueError("Choose a .png or .svg output file")
-        except Exception as error:
-            QMessageBox.critical(self, "Export Failed", f"Failed to save plot:\n{error}")
+            return None
+        return export_plot_image(self, self.plot_widget.plotItem, self._default_export_name("reflectivity", ".png")(),
+                                 self._source_paths(), "Export Reflectivity Plot Image")
 
-    def _export_csv(self) -> None:
+    def export_data(self) -> Path | None:
+        """Save the plotted curves (unshifted values, intervals, processing) as tab-delimited text."""
         if not self._current_curves:
             QMessageBox.information(self, "No Data", "No curves currently plotted to export.")
-            return
-
-        file_path, _ = QFileDialog.getSaveFileName(
-            self, "Export Plotted Data as CSV", "scan_curve_data.csv", "CSV Files (*.csv)"
-        )
-        if not file_path:
-            return
-
+            return None
         try:
-            validate_output_path(file_path, [scan.file_path for scan in self.loaded_scans.values()])
-            with open(file_path, "w", newline="", encoding="utf-8") as f:
-                writer = csv.writer(f)
-                writer.writerow(["Dataset", "Curve", "OriginalStepIndex", "X", "Y", "StandardUncertainty", "LowerBound", "UpperBound", "UncertaintyMethod", "Normalization", "ReferenceMonitorRate", "XUnits", "YUnits", "WavelengthAngstrom", "SourceFile", "ProcessingWarnings", "ProcessingStatus"])
-                for c in self._current_curves:
-                    ds_name = c.dataset_name or "Default"
-                    for i in range(len(c.x)):
-                        idx = c.indices[i] if i < len(c.indices) else i
-                        err = c.y_err[i] if c.y_err is not None and i < len(c.y_err) else ""
-                        writer.writerow([ds_name, c.label, idx, c.x[i], c.y[i], err,
-                                         c.y_lower[i] if c.y_lower is not None else "",
-                                         c.y_upper[i] if c.y_upper is not None else "",
-                                         c.uncertainty_method, c.normalization,
-                                         c.reference_monitor_rate, c.x_units, c.y_units,
-                                         c.wavelength, c.source_path,
-                                         " | ".join(getattr(self, "_processing_warnings", [])), self.lbl_processing.text()])
-
-            QMessageBox.information(self, "Export Succeeded", f"Exported {sum(len(c.x) for c in self._current_curves)} data points to {Path(file_path).name}.")
-        except Exception as e:
-            QMessageBox.critical(self, "Export Failed", f"Failed to save CSV:\n{e}")
+            target = ask_output_path(self, "Export Reflectivity Data (tab-delimited)",
+                                     self._default_export_name("reflectivity", ".txt")(), TABLE_FILTERS,
+                                     self._source_paths())
+            if target is None:
+                return None
+            header, columns, rows = reflectivity_table(
+                self._current_curves, *getattr(self, "_axis_labels", ("X", "Y")), self.processing_status,
+                getattr(self, "_processing_warnings", []))
+            count = write_table(target, header, columns, rows, self._source_paths())
+        except Exception as error:  # noqa: BLE001 - shown to the user
+            QMessageBox.critical(self, "Export Failed", f"Failed to save data:\n{error}")
+            return None
+        QMessageBox.information(self, "Export Succeeded", f"Exported {count} data points to {target.name}.")
+        return target

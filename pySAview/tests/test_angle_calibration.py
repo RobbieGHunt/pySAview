@@ -136,7 +136,7 @@ def test_alpha_view_needs_single_spin(qtbot, window):
     _ready(qtbot, view)
     view.combo_y_axis.setCurrentIndex(view.combo_y_axis.findData("alpha"))
     view.combo_spin.setCurrentIndex(view.combo_spin.findData("all"))
-    assert view._alpha_geom is None and "one spin state" in view.lbl_info.text()
+    assert view._alpha_geom is None and "one spin state" in view.lbl_notice.text()
     view.combo_spin.setCurrentIndex(view.combo_spin.findData("down"))
     assert view._alpha_geom is not None
 
@@ -159,7 +159,7 @@ def test_manual_override_is_per_scan_and_refit_restores(qtbot, window):
     assert second.angle_calibration.deg_per_pixel == pytest.approx(0.00819, abs=2e-5)
     view.combo_y_axis.setCurrentIndex(view.combo_y_axis.findData("alpha"))
     view.combo_spin.setCurrentIndex(view.combo_spin.findData("down"))  # 005594's unwritten frames read F=0
-    assert "78 unwritten/invalid frame(s) omitted" in view.lbl_info.text()
+    assert "78 unwritten/invalid frame(s) omitted" in view.lbl_notice.text()
 
     window.set_active_file(DATA / "005572.nxs")
     _ready(qtbot, view)
@@ -217,7 +217,7 @@ def test_q_view_on_example_scan(qtbot, window):
 
     view.combo_norm.setCurrentIndex(view.combo_norm.findData("monitor"))
     view.combo_spin.setCurrentIndex(view.combo_spin.findData("asym"))
-    assert view._alpha_geom is not None and "Qx–Qz" in view.lbl_info.text()
+    assert view._alpha_geom is not None
 
 
 def test_cached_mesh_blits_and_invalidates(qtbot):

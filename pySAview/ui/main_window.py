@@ -88,6 +88,9 @@ class MainWindow(QMainWindow):
         self.view_detector = DetectorView()
         self.view_offspec = OffSpecularView()
         self.view_metadata = MetadataView()
+        # Image/data exports from any tab must refuse every loaded measurement file.
+        for view in (self.view_hierarchy, self.view_detector, self.view_offspec):
+            view.session_source_paths = self._loaded_source_paths
 
         self.tabs.addTab(self.view_hierarchy, "File Hierarchy")
         self.tabs.addTab(self.view_charts, "Scan Charts")
@@ -148,6 +151,8 @@ class MainWindow(QMainWindow):
         menu_file.addAction(self.act_reload)
 
         menu_file.addSeparator()
+        self._create_export_menu(menu_file)
+        menu_file.addSeparator()
 
         self.act_exit = QAction("E&xit", self)
         self.act_exit.setShortcut(QKeySequence.StandardKey.Quit)
@@ -206,6 +211,61 @@ class MainWindow(QMainWindow):
         act_about.triggered.connect(self._show_about)
         menu_help.addAction(act_about)
 
+    def _loaded_source_paths(self) -> list[str]:
+        return [str(key) for key in self.loaded_scans] + [
+            str(getattr(scan, "file_path", "")) for scan in self.loaded_scans.values() if getattr(scan, "file_path", "")]
+
+    def _create_export_menu(self, menu_file) -> None:
+        """File ▸ Export: derived data and figures, always written to separate files."""
+        self.menu_export = menu_file.addMenu("&Export")
+        self.menu_export.setIcon(icons.get_icon("download", is_dark=self.is_dark_mode))
+
+        self.act_export_refl_data = QAction("&Reflectivity Data (tab-delimited)…", self)
+        self.act_export_refl_data.setShortcut(QKeySequence("Ctrl+Shift+E"))
+        self.act_export_refl_data.setToolTip("Plotted Scan Charts curves with each scan's ROI, normalization and intervals")
+        self.act_export_refl_data.triggered.connect(lambda: self.view_charts.export_data())
+        self.act_export_refl_image = QAction("Reflectivity &Plot Image (PNG/SVG)…", self)
+        self.act_export_refl_image.triggered.connect(lambda: self.view_charts.export_image())
+        self.act_export_offspec_data = QAction("&Off-Specular Map Data (tab-delimited)…", self)
+        self.act_export_offspec_data.setToolTip("The active scan's map in the current axes, spin and normalization")
+        self.act_export_offspec_data.triggered.connect(lambda: self._export_offspec(image=False))
+        self.act_export_offspec_image = QAction("Off-Specular &Map Image (PNG/SVG)…", self)
+        self.act_export_offspec_image.triggered.connect(lambda: self._export_offspec(image=True))
+
+        self.menu_export.addAction(self.act_export_refl_data)
+        self.menu_export.addAction(self.act_export_refl_image)
+        self.menu_export.addSeparator()
+        self.menu_export.addAction(self.act_export_offspec_data)
+        self.menu_export.addAction(self.act_export_offspec_image)
+        self.menu_export.setToolTipsVisible(True)
+        self.menu_export.aboutToShow.connect(self._update_export_actions)
+        # Disabled states are only a hint while the menu is open; shortcuts stay live
+        # and each export explains when there is nothing to save.
+        self.menu_export.aboutToHide.connect(lambda: [a.setEnabled(True) for a in self.menu_export.actions()])
+
+    def _update_export_actions(self) -> None:
+        has_curves = self.view_charts.has_export_data()
+        scan = self.view_offspec.scan_data
+        has_detector = bool(scan is not None and scan.has_detector_2d)
+        for action in (self.act_export_refl_data, self.act_export_refl_image):
+            action.setEnabled(has_curves)
+        for action in (self.act_export_offspec_data, self.act_export_offspec_image):
+            action.setEnabled(has_detector)
+
+    def _export_offspec(self, image: bool) -> None:
+        view = self.view_offspec
+        if not view.has_export_data():
+            scan = view.scan_data
+            if scan is None or not scan.has_detector_2d:
+                QMessageBox.information(self, "No Data", "The active file has no 2D detector data to map.")
+                return
+            # The map is computed when its tab is shown; open it so the user sees what will be exported.
+            self.tabs.setCurrentWidget(view)
+            QMessageBox.information(self, "Off-Specular Map", "The off-specular map is being computed. "
+                                    "Choose the export again once the map is shown.")
+            return
+        view.export_image() if image else view.export_data()
+
     def _create_toolbar(self) -> None:
         toolbar = QToolBar("Main Controls")
         toolbar.setMovable(False)
@@ -256,6 +316,7 @@ class MainWindow(QMainWindow):
         self.act_open_example.setIcon(icons.get_icon("sparkles", is_dark=is_d))
         self.act_close_file.setIcon(icons.get_icon("x_circle", is_dark=is_d))
         self.act_reload.setIcon(icons.get_icon("refresh_cw", is_dark=is_d))
+        self.menu_export.setIcon(icons.get_icon("download", is_dark=is_d))
         dark_icon_name = "sun" if is_d else "moon"
         self.act_dark_mode.setIcon(icons.get_icon(dark_icon_name, is_dark=is_d))
 

@@ -132,8 +132,8 @@ def test_detector_view(main_window: MainWindow):
     # Change step to 15
     view.spin_step.setValue(15)
     assert view._current_frame_idx == 15
-    assert "Step 16 of 302" in view.lbl_step_info.text()
-    assert "Mirrored" in view.lbl_step_info.text()
+    assert view.lbl_frame_info.text().startswith("Frame 15 ") and "θ" in view.lbl_frame_info.text()
+    assert not hasattr(view, "lbl_step_info")  # the blue step banner was removed
 
     # Test interactive user-defined ROI
     assert view._roi_rect_item is not None
@@ -197,11 +197,14 @@ def test_detector_view(main_window: MainWindow):
     view.btn_img_reset.click()
 
     # Test log/lin toggle on detector image
-    assert view.btn_img_log.isChecked() is True
-    view.btn_img_log.click()
-    assert view.chk_log_img.isChecked() is False
-    view.btn_img_log.click()
     assert view.chk_log_img.isChecked() is True
+    view.chk_log_img.click()
+    assert view.chk_log_img.isChecked() is False
+    view.chk_log_img.click()
+    assert view.chk_log_img.isChecked() is True
+    for btn in (view.btn_play, view.btn_prev, view.btn_next, view.btn_img_pan, view.btn_img_box_zoom,
+                view.btn_img_zoom_in, view.btn_img_zoom_out, view.btn_img_reset, view.btn_img_export):
+        assert btn.text() == "" and btn.toolTip()  # icon-only, as in the Off-Specular toolbar
 
     # Toggle Play
     view._toggle_play()
@@ -314,17 +317,17 @@ def test_spin_filter_in_detector_view(main_window: MainWindow):
     det.combo_spin_filter.setCurrentIndex(idx_up)
     assert len(det._filtered_indices) == total // 2
     assert all(det.scan_data.variables["Flipper1"].data[i] == 1 for i in det._filtered_indices)
-    assert "u — Up (F=1 / ON)" in det.lbl_step_info.text()
+    assert "u (F=1)" in det.lbl_frame_info.text()
     det.btn_next.click()
     assert det._current_filtered_pos == 1
-    assert "u — Up (F=1 / ON)" in det.lbl_step_info.text()
+    assert "u (F=1)" in det.lbl_frame_info.text()
 
     # Test Spin Down (F=0)
     idx_down = det.combo_spin_filter.findData("down")
     det.combo_spin_filter.setCurrentIndex(idx_down)
     assert len(det._filtered_indices) == total // 2
     assert all(det.scan_data.variables["Flipper1"].data[i] == 0 for i in det._filtered_indices)
-    assert "d — Down (F=0 / OFF)" in det.lbl_step_info.text()
+    assert "d (F=0)" in det.lbl_frame_info.text()
 
     # Test All Frames
     idx_all = det.combo_spin_filter.findData("all")
@@ -342,12 +345,12 @@ def test_detector_view_coordinates_fixed_width_and_cross_cursor(main_window: Mai
 
 def test_q_toggle_and_si_prefix_disabled(main_window: MainWindow):
     charts = main_window.view_charts
-    assert "θ" in charts.btn_toggle_q.text()
+    assert charts.btn_toggle_q.accessibleName() == "X axis: θ"
 
     # Toggle to Q
     charts.btn_toggle_q.click()
     assert charts.combo_x.currentData() == "Q"
-    assert "Q" in charts.btn_toggle_q.text()
+    assert charts.btn_toggle_q.accessibleName() == "X axis: Q"
     assert charts.btn_toggle_q.isChecked() is True
 
     # Verify SI prefix is disabled on bottom axis
@@ -359,7 +362,7 @@ def test_q_toggle_and_si_prefix_disabled(main_window: MainWindow):
     # Toggle back to theta
     charts.btn_toggle_q.click()
     assert charts.combo_x.currentData() == "th"
-    assert "θ" in charts.btn_toggle_q.text()
+    assert charts.btn_toggle_q.accessibleName() == "X axis: θ"
     assert charts.btn_toggle_q.isChecked() is False
 
 

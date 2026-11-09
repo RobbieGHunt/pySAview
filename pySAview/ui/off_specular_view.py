@@ -16,6 +16,7 @@ import pyqtgraph as pg
 from PyQt6.QtCore import QPointF, QRectF, QSize, Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QCursor, QImage, QPainter, QTransform
 from PyQt6.QtWidgets import (
+    QApplication,
     QButtonGroup,
     QCheckBox,
     QComboBox,
@@ -59,8 +60,11 @@ from pySAview.core.off_specular import (
     normalize_map,
     select_frames,
 )
-from pySAview.core.source_safety import validate_output_path
+from pySAview.core.export_tables import map_table, write_table
 from pySAview.ui import icons
+from pySAview.ui.plot_tools import (
+    TABLE_FILTERS, ask_output_path, export_plot_image, install_context_export, tool_button,
+)
 from pySAview.ui.theme import apply_plot_theme, get_safe_colormap
 
 DEFAULT_ROI = (354.0, 382.0, 285.0, 743.0)
@@ -76,12 +80,7 @@ def _decimals_for_step(step: float) -> int:
     return int(min(6, max(0, np.ceil(-np.log10(step) - 0.05))))
 
 
-def _tool_button(tooltip: str) -> QPushButton:
-    button = QPushButton()
-    button.setToolTip(tooltip)
-    button.setFixedSize(34, 30)
-    button.setIconSize(QSize(18, 18))
-    return button
+_tool_button = tool_button
 
 
 CUT_HINT = "Turn on the crosshair tool (⌖ in the map toolbar) and click the map to drop the cuts."
@@ -250,6 +249,7 @@ class OffSpecularView(QWidget):
         self._alpha_geom: dict | None = None
         self._cal_message = ""
         self._colorbar_on_strips = False
+        self.session_source_paths = lambda: []  # every loaded file; set by the main window
         self._cut_values: np.ndarray | None = None  # what the map shows (asymmetry: low counts blanked)
         self._init_ui()
         self._set_enabled(False)
@@ -344,18 +344,14 @@ class OffSpecularView(QWidget):
         bar.addStretch(1)
         main.addLayout(bar)
 
-        banner = QHBoxLayout()
-        self.lbl_info = QLabel("No detector data loaded.")
-        self.lbl_info.setStyleSheet(
-            "background-color: #0284c7; color: #ffffff; padding: 6px 14px; border-radius: 6px; font-weight: 600;"
-        )
-        _fixed_width_text(self.lbl_info)
-        banner.addWidget(self.lbl_info, 1)
-        self.progress = QProgressBar()
-        self.progress.setFixedWidth(180)
-        self.progress.setVisible(False)
-        banner.addWidget(self.progress)
-        main.addLayout(banner)
+        # Only problems and caveats are shown here (hidden otherwise); the settings
+        # above already describe what the map shows.
+        self.lbl_notice = QLabel("")
+        self.lbl_notice.setStyleSheet("color: #b45309; font-size: 11px; padding: 0 2px;")
+        self.lbl_notice.setWordWrap(True)
+        _fixed_width_text(self.lbl_notice)
+        self.lbl_notice.setVisible(False)
+        main.addWidget(self.lbl_notice)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
 
@@ -388,8 +384,8 @@ class OffSpecularView(QWidget):
         self.btn_zoom_out.clicked.connect(lambda: self.plot.getViewBox().scaleBy((1.4, 1.4)))
         self.btn_fit = _tool_button("Fit the whole map")
         self.btn_fit.clicked.connect(lambda: self.plot.autoRange())
-        self.btn_export_png = _tool_button("Export the map as a PNG image")
-        self.btn_export_png.clicked.connect(self._export_image)
+        self.btn_export_png = _tool_button("Export the map as a PNG or SVG image")
+        self.btn_export_png.clicked.connect(self.export_image)
         for btn in (self.btn_zoom_in, self.btn_zoom_out, self.btn_fit, self.btn_export_png):
             tools.addWidget(btn)
         tools.addSpacing(8)
@@ -398,6 +394,12 @@ class OffSpecularView(QWidget):
         self.lbl_coords.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         _fixed_width_text(self.lbl_coords)
         tools.addWidget(self.lbl_coords, 1)
+        self.progress = QProgressBar()
+        self.progress.setFixedWidth(160)
+        self.progress.setTextVisible(False)
+        self.progress.setToolTip("Integrating detector frames")
+        self.progress.setVisible(False)
+        tools.addWidget(self.progress)
         left_layout.addLayout(tools)
 
         self.plot = pg.PlotWidget()
@@ -455,6 +457,10 @@ class OffSpecularView(QWidget):
         group_layout.addWidget(self.lbl_cut_hint)
         for p in (self.plot_row, self.plot_col):
             apply_plot_theme(p, self.is_dark_mode)
+        for widget, kind in ((self.plot, "offspecular"), (self.plot_row, "offspecular_hcut"),
+                             (self.plot_col, "offspecular_vcut")):
+            install_context_export(widget, (lambda k=kind: self._default_export_name(k, ".png")),
+                                   self._source_paths)
         self._row_curve = self.plot_row.plot([], [], connect="finite")
         self._col_curve = self.plot_col.plot([], [], connect="finite")
         right_layout.addWidget(group, 1)
@@ -548,13 +554,13 @@ class OffSpecularView(QWidget):
                        and len(scan_data.detector_shape) == 3)
         self._set_enabled(has_det)
         if not has_det:
-            self.lbl_info.setText("No 2D detector data found in this NeXus file." if scan_data and scan_data.file_path
-                                  else "No detector data loaded.")
+            self._set_notice("No 2D detector data found in this NeXus file." if scan_data and scan_data.file_path
+                             else "")
             self._dirty = False
             return
         self._sync_row_spins()
         self._update_spin_options()
-        self.lbl_info.setText("Off-specular map will be computed when this tab is shown.")
+        self._set_notice("")
         self._dirty = True
         if self.isVisible():
             self._request_compute()
@@ -700,9 +706,8 @@ class OffSpecularView(QWidget):
         try:
             rows = frame_y_bounds(y_range, n_frames, nx, ny)
         except ValueError as error:
-            self.lbl_info.setText(f"Off-specular map unavailable: {error}")
+            self._set_notice(f"Off-specular map unavailable: {error}")
             return
-        y_bounds = (int(rows[:, 0].min()), int(rows[:, 1].max()))
         key = self._cache_key(tuple(map(tuple, rows.tolist())))
         if key == self._pending_key:
             return
@@ -725,8 +730,6 @@ class OffSpecularView(QWidget):
         self.progress.setRange(0, self.scan_data.detector_shape[0])
         self.progress.setValue(0)
         self.progress.setVisible(True)
-        self.lbl_info.setText(f"Integrating detector Y rows [{y_bounds[0]}, {y_bounds[1]}) for every frame…"
-                              if not np.any(rows != rows[0]) else "Integrating each frame over its tracked ROI Y rows…")
         job.start()
 
     def _on_progress(self, token, done, total) -> None:
@@ -753,7 +756,7 @@ class OffSpecularView(QWidget):
             return
         self._pending_key = None
         self.progress.setVisible(False)
-        self.lbl_info.setText(f"Off-specular map failed: {message}")
+        self._set_notice(f"Off-specular map failed: {message}")
 
     def _on_job_finished(self) -> None:
         job = self.sender()
@@ -838,25 +841,13 @@ class OffSpecularView(QWidget):
         if axis is not None:
             axis.setLabel(label)
 
-        y0, y1 = self._map.y_bounds
-        spin_txt = self.combo_spin.currentText().split(" (")[0]
-        rows_txt = (f"Per-frame tracked Y rows within [{y0}, {y1})" if self._map.y_varies
-                    else f"Integrated Y rows [{y0}, {y1})")
-        count_txt = (f"{len(frames)} u/d pairs of {self._map.n_frames} frames" if asym
-                     else f"{len(frames)} of {self._map.n_frames} points")
-        text = (f"{count_txt}  |  {spin_txt}  |  "
-                f"{rows_txt}  |  {norm.units}  |  90° CW + Mirrored")
-        if self._log_active() and np.any(~(norm.values > 0)):
-            text += "  |  Log: zero/invalid pixels left blank"
-        if asym:
-            text += f"  |  Pixels with u+d < {norm.min_counts:g} counts left blank"
-            if mode == "raw":
-                text += "  |  Raw counts assume equal u/d exposure; Counts / Monitor1 corrects for this"
-        if norm.warnings:
-            text += "  |  " + " ".join(norm.warnings)
+        notes = []
+        if asym and mode == "raw":
+            notes.append("Raw-count asymmetry assumes equal u/d exposure; Counts / Monitor1 corrects for this.")
+        notes.extend(norm.warnings)
         if alpha_note:
-            text += "  |  " + alpha_note
-        self.lbl_info.setText(text)
+            notes.append(alpha_note)
+        self._set_notice("  ".join(notes))
 
         self._update_y_ticks()
         self._draw_roi_overlay()
@@ -877,7 +868,7 @@ class OffSpecularView(QWidget):
         self._clear_roi_overlay()
         self._clear_cuts()
         self.lbl_coords.setText("")
-        self.lbl_info.setText(message)
+        self._set_notice(message)
 
     def _asym_mode(self) -> bool:
         return self.combo_spin.currentData() == "asym"
@@ -1182,26 +1173,112 @@ class OffSpecularView(QWidget):
         self.lbl_coords.setText("   ".join(parts) + "   |   " + self._format_value(row, x))
 
     # ------------------------------------------------------------- export
-    def _export_image(self) -> None:
-        if self._norm is None or self.scan_data is None:
+    def _set_notice(self, text: str) -> None:
+        self.lbl_notice.setText(text)
+        self.lbl_notice.setVisible(bool(text))
+
+    def _source_paths(self) -> list[str]:
+        own = [self.scan_data.file_path] if self.scan_data is not None and self.scan_data.file_path else []
+        return own + list(self.session_source_paths())
+
+    def _default_export_name(self, kind: str, suffix: str) -> str:
+        stem = Path(self.scan_data.file_path).stem if self.scan_data is not None and self.scan_data.file_path else "scan"
+        view = {"point": "", "th": "_theta", "alpha": "_alpha", "q": "_q"}.get(self.combo_y_axis.currentData(), "")
+        return f"{stem}_{kind}{view}{suffix}"
+
+    def has_export_data(self) -> bool:
+        return self._norm is not None and self._map is not None and self.scan_data is not None
+
+    def export_image(self) -> Path | None:
+        """Save the map as shown (axes, colour bar, overlays) as PNG or SVG."""
+        if not self.has_export_data():
             QMessageBox.information(self, "No Data", "No off-specular map to export.")
-            return
-        stem = Path(self.scan_data.file_path).stem
-        path, _ = QFileDialog.getSaveFileName(self, "Export Off-Specular Map Image",
-                                              f"{stem}_offspecular.png", "PNG image (*.png)")
-        if not path:
-            return
+            return None
+        return export_plot_image(self, self.plot.getPlotItem(), self._default_export_name("offspecular", ".png"),
+                                 self._source_paths(), "Export Off-Specular Map Image")
+
+    def export_table(self):
+        """(header, columns, rows) of the map in the current axes, spin and normalization.
+
+        Values are the normalized map values with 1σ uncertainty; the log colour
+        scale and the asymmetry low-count blanking are display-only and not applied.
+        """
+        norm, omap = self._norm, self._map
+        axes = self.combo_y_axis.currentData()
+        frames = norm.frame_indices
+        rows = np.arange(frames.size)
+        coords: dict[str, np.ndarray] = {}
+        th = self._variable("th")
+        if axes == "th" and th is not None:
+            theta = np.full(frames.size, np.nan)
+            ok = frames < th.size
+            theta[ok] = th[frames[ok]]
+            coords["Theta (deg)"] = theta
+        if self._alpha_mode():
+            geom = self._alpha_geom
+            if geom is None:
+                raise ValueError(self.lbl_notice.text() or "The angle view is not available for these settings")
+            rows = geom["rows"]
+            alpha_f = geom["base"][:, None] + alpha_f_offsets(omap.nx, geom["cal"])[None, :]
+            alpha_i = np.broadcast_to(geom["alpha_i"][:, None], alpha_f.shape)
+            if self._q_mode():
+                qx, qz = q_from_angles(alpha_i, alpha_f, self.spin_wavelength.value())
+                coords["Qx (1/Angstrom)"], coords["Qz (1/Angstrom)"] = qx, qz
+            else:
+                coords["AlphaI (deg)"], coords["AlphaF (deg)"] = geom["alpha_i"], alpha_f
+        asym = isinstance(norm, AsymmetryMap)
+        columns, data = map_table(frames[rows], norm.values[rows], norm.standard_uncertainty[rows], coords,
+                                  partner_indices=norm.partner_indices[rows] if asym else None)
+        y0, y1 = omap.y_bounds
+        header = [
+            f"Off-specular map: {self.combo_y_axis.currentText()}; detector frames integrated along Y, "
+            "displayed X pixel (90 deg CW + mirrored, as in the 2D Detector tab).",
+            f"Source: {self.scan_data.file_path}",
+            f"Spin: {self.combo_spin.currentText()}"
+            + (" (Frame = u frame, PartnerFrame = paired d frame)" if asym else ""),
+            f"Integrated Y rows: {'per-frame tracked ROI within ' if omap.y_varies else ''}[{y0}, {y1})",
+            f"Normalization: {self.combo_norm.currentText()}; Value units: {norm.units}",
+            "StdUncertainty is first-order 1 sigma (docs/normalization.md, docs/off_specular.md).",
+            "Frame is the 0-based detector frame (scan point) index.",
+        ]
+        if self._alpha_mode():
+            cal = self._alpha_geom["cal"]
+            header.append(f"Angle calibration: {cal.deg_per_pixel!r} deg/pixel ({cal.deg_per_pixel_source}), "
+                          f"x0 = {cal.x0!r} px, alpha_f {'increases' if cal.sign > 0 else 'decreases'} with X; "
+                          "coordinates are pixel centres")
+            if self._q_mode():
+                header.append(f"Wavelength: {self.spin_wavelength.value()!r} Angstrom; "
+                              "Qx = (2pi/lambda)(cos af - cos ai), Qz = (2pi/lambda)(sin af + sin ai)")
+        if asym:
+            header.append(f"Display blanks pixels with u+d < {norm.min_counts:g} raw counts; "
+                          "exported values are not blanked.")
+        if self._log_active():
+            header.append("Log colour scale is display-only; values are linear.")
+        if norm.warnings:
+            header.append("Warnings: " + " ".join(norm.warnings))
+        return header, columns, data
+
+    def export_data(self) -> Path | None:
+        """Save the map in the current display format as tab-delimited text."""
+        if not self.has_export_data():
+            QMessageBox.information(self, "No Data", "No off-specular map to export.")
+            return None
         try:
-            target = Path(path)
-            if not target.suffix:
-                target = target.with_suffix(".png")
-            if target.suffix.lower() != ".png":
-                raise ValueError("Choose a .png output file")
-            validate_output_path(target, [self.scan_data.file_path])
-            from pyqtgraph.exporters import ImageExporter
-            ImageExporter(self.plot.getPlotItem()).export(str(target))
-        except Exception as error:
-            QMessageBox.critical(self, "Export Failed", f"Failed to save image:\n{error}")
+            target = ask_output_path(self, "Export Off-Specular Map Data (tab-delimited)",
+                                     self._default_export_name("offspecular", ".txt"), TABLE_FILTERS,
+                                     self._source_paths())
+            if target is None:
+                return None
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            try:
+                count = write_table(target, *self.export_table(), self._source_paths())
+            finally:
+                QApplication.restoreOverrideCursor()
+        except Exception as error:  # noqa: BLE001 - shown to the user
+            QMessageBox.critical(self, "Export Failed", f"Failed to save map data:\n{error}")
+            return None
+        QMessageBox.information(self, "Export Succeeded", f"Exported {count:,} map cells to {target.name}.")
+        return target
 
     # ------------------------------------------------------------- α_i / α_f
     def _alpha_mode(self) -> bool:
@@ -1359,7 +1436,7 @@ class OffSpecularView(QWidget):
             else:
                 cal = cal.with_manual(deg_per_pixel=deg_per_pixel, x0=x0, sign=sign)
         except ValueError as error:
-            self.lbl_info.setText(f"Calibration not changed: {error}")
+            self._set_notice(f"Calibration not changed: {error}")
             return
         scan.angle_calibration = cal
         self._set_cal_status(cal.describe())
@@ -1372,7 +1449,7 @@ class OffSpecularView(QWidget):
         self._alpha_geom = None
 
     def _draw_alpha(self, display: np.ndarray) -> str | None:
-        """Draw each frame as its own α_i strip of exact pixel cells. Returns a banner note,
+        """Draw each frame as its own α_i strip of exact pixel cells. Returns a notice,
         or None (after showing why) when the α view cannot be drawn."""
         cal = getattr(self.scan_data, "angle_calibration", None)
         name = "Qx vs Qz" if self._q_mode() else "α_i vs α_f"
@@ -1436,11 +1513,7 @@ class OffSpecularView(QWidget):
         self.colorbar.setImageItem(items)
         self._colorbar_on_strips = True
         skipped = frames.size - rows.size
-        note = (f"Qx–Qz at λ = {self.spin_wavelength.value():g} Å" if self._q_mode() else "α_i vs α_f")
-        note += ": each point drawn as measured (no interpolation)"
-        if skipped:
-            note += f"; {skipped} unwritten/invalid frame(s) omitted"
-        return note
+        return f"{name}: {skipped} unwritten/invalid frame(s) omitted." if skipped else ""
 
     def _map_extent(self) -> tuple[float, float, float, float]:
         if self._alpha_mode() and self._alpha_geom is not None:

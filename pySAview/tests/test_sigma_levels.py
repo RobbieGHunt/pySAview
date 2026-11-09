@@ -3,7 +3,7 @@ import numpy as np
 import pytest
 from scipy.stats import norm, poisson
 from pySAview.core.normalization import confidence_from_sigma, normalize_signal, poisson_interval
-from pySAview.tests.test_processing_ui import scan
+from pySAview.tests.test_processing_ui import read_table, scan
 from pySAview.ui.scan_plot_view import ScanPlotView, QFileDialog, QMessageBox
 
 
@@ -48,14 +48,13 @@ def test_sigma_changes_exact_bounds_not_values_or_standard_uncertainties(qtbot, 
     np.testing.assert_array_equal(changed.y, original.y)
     np.testing.assert_array_equal(changed.y_err, original.y_err)
     assert np.all(changed.y_upper > original.y_upper)
-    assert "3 sigma equivalent" in view.lbl_processing.text()
-    target = tmp_path / "plot.csv"
-    monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *a: (str(target), "CSV"))
+    assert "3 sigma equivalent" in view.processing_status
+    target = tmp_path / "plot.txt"
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *a: (str(target), "Tab-delimited text (*.txt)"))
     monkeypatch.setattr(QMessageBox, "information", lambda *a: None)
-    view._export_csv()
-    with target.open(newline="",encoding="utf-8") as source:
-        rows = list(csv.DictReader(source))
-    assert "3 sigma equivalent" in rows[0]["UncertaintyMethod"]
+    view.export_data()
+    header, rows = read_table(target)
+    assert any("3 sigma equivalent" in line for line in header)
     assert float(rows[0]["UpperBound"]) == changed.y_upper[0]
     view.combo_uncertainty.setCurrentIndex(view.combo_uncertainty.findData("standard"))
     assert view.combo_sigma.isEnabled()

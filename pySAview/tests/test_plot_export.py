@@ -23,7 +23,8 @@ def test_export_plot_button_writes_image(qtbot, tmp_path, monkeypatch, extension
         assert target.read_bytes().startswith(b"\x89PNG")
     else:
         assert "<svg" in target.read_text(encoding="utf-8")
-    assert not view.plot_widget.scene().contextMenu
+    # Right-click export goes through the same guarded image export.
+    assert [a.text() for a in view.plot_widget.scene().contextMenu] == ["Export Image…"]
 
 
 def test_plot_export_cannot_overwrite_source(qtbot, tmp_path, monkeypatch):
@@ -35,6 +36,6 @@ def test_plot_export_cannot_overwrite_source(qtbot, tmp_path, monkeypatch):
     monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *a, **k: (str(source), "PNG"))
     errors = []
     monkeypatch.setattr(QMessageBox, "critical", lambda *a: errors.append(a))
-    view._export_plot()
+    view.export_image()
     assert errors
     assert source.read_bytes() == b"measurement"
