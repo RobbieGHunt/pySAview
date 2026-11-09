@@ -15,8 +15,10 @@ python -m venv .venv
 .venv\Scripts\python.exe -m pySAview
 ```
 
-After installation, launch with **`pySAview\run.bat`** or
-`.venv\Scripts\pysaview.exe`. To open a file directly:
+After installation, launch with **`pySAview\run.bat`** (no console window) or
+`.venv\Scripts\pysaview.exe`. If the application fails to start, run
+`pySAview\run_debug.bat`, which keeps a console open to show the error. To open
+a file directly:
 
 ```powershell
 .venv\Scripts\python.exe -m pySAview "C:\path\to\scan.nxs"
