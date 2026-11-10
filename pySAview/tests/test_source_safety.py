@@ -17,7 +17,7 @@ def test_export_cannot_overwrite_measurement(qtbot, tmp_path, monkeypatch):
     monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *a, **k: (str(source), "CSV"))
     monkeypatch.setattr(QMessageBox, "critical", lambda *a, **k: None)
     monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: None)
-    view._export_csv()
+    view.export_data()
     assert hashlib.sha256(source.read_bytes()).digest() == digest
 
 

@@ -41,6 +41,10 @@ LUCIDE_PATHS: dict[str, str] = {
     "grid": '<rect width="18" height="18" x="3" y="3" rx="2"/><path d="M3 9h18"/><path d="M3 15h18"/><path d="M9 3v18"/><path d="M15 3v18"/>',
     "crosshair": '<circle cx="12" cy="12" r="10"/><line x1="22" x2="18" y1="12" y2="12"/><line x1="6" x2="2" y1="12" y2="12"/><line x1="12" x2="12" y1="6" y2="2"/><line x1="12" x2="12" y1="22" y2="18"/>',
     "activity": '<path d="M22 12h-4l-3 9L9 3l-3 9H2"/>',
+    # Axis with logarithmically spaced ticks: log Y (vertical axis), log X (horizontal), log intensity.
+    "log_y": '<path d="M5 3v18h16"/><path d="M5 19h3"/><path d="M5 12h3"/><path d="M5 8h3"/><path d="M5 5.5h3"/><path d="M11 17c3-1 6-4 9-12"/>',
+    "log_x": '<path d="M3 3v18h18"/><path d="M5 21v-3"/><path d="M12 21v-3"/><path d="M16 21v-3"/><path d="M18.5 21v-3"/><path d="M7 15c4-1 8-4 13-10"/>',
+    "log_scale": '<rect width="18" height="18" x="3" y="3" rx="2"/><path d="M7 17c3-1 6-4 10-10"/><path d="M7 7v10h10"/>',
     "panel_bottom_close": '<rect width="18" height="18" x="3" y="3" rx="2"/><path d="M3 15h18"/><path d="m9 8 3 3 3-3"/>',
     "panel_bottom_open": '<rect width="18" height="18" x="3" y="3" rx="2"/><path d="M3 15h18"/><path d="m9 11 3-3 3 3"/>',
     "panel_left": '<rect width="18" height="18" x="3" y="3" rx="2"/><path d="M9 3v18"/>',
@@ -49,6 +53,36 @@ LUCIDE_PATHS: dict[str, str] = {
 }
 
 _ICON_CACHE: dict[tuple[str, str, int], QIcon] = {}
+
+
+def get_text_icon(text: str, is_dark: bool = False, size: int = 40) -> QIcon:
+    """A short symbol (e.g. θ, Q) drawn as an icon in the same colour as the vector icons.
+
+    Rendered as an icon rather than button text so button padding never clips it and
+    it follows the icon colour scheme in light and dark mode.
+    """
+    color = "#38bdf8" if is_dark else "#0284c7"
+    cache_key = ("text:" + text, color, size)
+    if cache_key in _ICON_CACHE:
+        return _ICON_CACHE[cache_key]
+    from PyQt6.QtCore import Qt
+    from PyQt6.QtGui import QFont
+
+    pixmap = QPixmap(size, size)
+    pixmap.fill(QColor(0, 0, 0, 0))
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+    font = QFont()
+    font.setPixelSize(int(size * 0.8))
+    font.setBold(True)
+    painter.setFont(font)
+    painter.setPen(QColor(color))
+    painter.drawText(pixmap.rect(), int(Qt.AlignmentFlag.AlignCenter), text)
+    painter.end()
+    icon = QIcon(pixmap)
+    _ICON_CACHE[cache_key] = icon
+    return icon
 
 
 def get_icon(name: str, color: str | None = None, is_dark: bool = False, size: int = 20) -> QIcon:

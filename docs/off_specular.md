@@ -67,7 +67,7 @@ geometry by less than 0.002°. No sample-curvature correction is applied.
   that visible frame.
 * The view requires a single spin state, because u and d frames share angles
   and would overlap. Frames whose detector chunk was never written (for
-  example an aborted scan) are omitted and counted in the banner.
+  example an aborted scan) are omitted and counted in a notice above the map.
 * **Show fit / reference lines** draws the fitted direct-beam line on the
   pixel map, and the lines α_f = α_i (specular) and α_f = −α_i (direct beam)
   on the α map. Data that follow these lines confirm the calibration.
@@ -130,6 +130,24 @@ the map and cuts only; the values themselves are unchanged. The colour scale
 is diverging and symmetric about zero. Log scaling does not apply. The direct
 beam, which does not interact with the sample, shows SA ≈ 0 and is a useful
 check.
+
+## Export
+
+**File ▸ Export ▸ Off-Specular Map Data** writes the map exactly as currently
+selected (axes, spin or asymmetry, Y rows, normalization) as tab-delimited text,
+one row per frame and displayed X pixel: `Frame` (0-based; asymmetry adds the
+paired d frame as `PartnerFrame`), `XPixel`, the view's coordinates (θ; α_i and
+α_f; or Qx and Qz in Å⁻¹, at pixel centres), `Value` and its first-order 1σ
+`StdUncertainty`. In the angle views only the drawn frames are written. The
+`#` header records the source file, Y rows, normalization, calibration and
+wavelength. Values are linear and unblanked: the log colour scale and the
+asymmetry low-count threshold are display only. **Off-Specular Map Image**
+(or the toolbar's export button, or right-click ▸ **Export Image…**) saves the
+map as shown as PNG or SVG.
+
+Only problems and caveats (a missing channel, omitted frames, raw-count
+asymmetry) appear in the notice line above the map; the controls already show
+what is plotted.
 
 ## Readout
 

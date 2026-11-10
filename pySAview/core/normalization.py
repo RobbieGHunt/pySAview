@@ -8,7 +8,9 @@ See docs/normalization.md for formulas and the limits of these assumptions.
 from math import erf, sqrt
 from dataclasses import dataclass
 import numpy as np
-from scipy.stats import beta, chi2
+
+# scipy.stats is imported inside the exact-interval functions: importing it
+# costs ~1.3 s, which would otherwise be paid on every application launch.
 
 def confidence_from_sigma(sigma_level):
     """Central Gaussian-equivalent coverage for an exact count interval."""
@@ -58,6 +60,8 @@ def poisson_interval(counts, confidence=CONFIDENCE):
         raise ValueError("Confidence must be between zero and one.")
     if np.any(~np.isfinite(n) | (n < 0) | (n != np.rint(n))):
         raise ValueError("Poisson intervals require finite, nonnegative integer counts.")
+    from scipy.stats import chi2
+
     alpha = 1 - confidence
     lower = np.zeros_like(n)
     positive = n > 0
@@ -79,6 +83,8 @@ def poisson_ratio_interval(counts, monitor, confidence=CONFIDENCE):
     if np.any(~np.isfinite(n) | ~np.isfinite(m) | (n < 0) | (m <= 0)
               | (n != np.rint(n)) | (m != np.rint(m))):
         raise ValueError("Ratio intervals require integer counts and a positive monitor.")
+    from scipy.stats import beta
+
     alpha = 1 - confidence
     lower = np.zeros_like(n)
     positive = n > 0

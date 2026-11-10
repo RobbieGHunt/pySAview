@@ -14,7 +14,7 @@ and dwell time `t` in seconds:
 | Raw | `N` | counts |
 | Time | `N / t` | counts/s |
 | Monitor | `N / M` | detector counts per monitor count |
-| Monitor ratio × fixed reference rate | `r_ref * N / M` | counts/s at the reference monitor rate |
+| Monitor norm. cps (monitor ratio × fixed reference rate) | `r_ref * N / M` | counts/s at the reference monitor rate |
 
 Monitor counts already integrate incident flux over the exposure. Dividing
 `N / M` by `t` again would double-normalize exposure and is not done.
@@ -53,7 +53,7 @@ These standard uncertainties are estimates and first-order propagation is
 an approximation; it is **not** an exact low-count confidence interval.
 At `N=0`, the plug-in Poisson standard uncertainty is zero, while the exact
 confidence interval has a nonzero upper bound. Both are identified separately
-in the table and CSV, so zero standard uncertainty cannot be mistaken for
+in the table and export, so zero standard uncertainty cannot be mistaken for
 proof that the underlying intensity is exactly zero.
 
 ## Exact counting confidence intervals
@@ -91,7 +91,7 @@ Thus uncertainty in the monitor is included; it is not treated as exact.
 
 Exact intervals apply only to finite, nonnegative integer, unweighted counts
 with an independent Poisson monitor. Explicit variance arrays use propagated
-standard uncertainty, and the banner says so even if the exact option is selected.
+standard uncertainty, and the processing description says so even if the exact option is selected.
 Background-subtracted data, detector/monitor covariance other than the identical
 Monitor1 channel, weighted pixels, dead time, and systematic calibration errors
 need additional models; no exact Poisson claim is made for them.
@@ -101,7 +101,8 @@ need additional models; no exact Poisson claim is made for them.
 - Missing channels, mismatched shapes, and incompatible overlay units skip the
   affected scan and explain why. No Detector1 or raw-count fallback is made.
 - Zero/negative/nonfinite denominators and invalid Poisson observations are
-  excluded, with reasons in the processing banner and CSV warning column.
+  excluded, with reasons in the warning line under the chart title and in
+  the export header.
 - Non-count channels can be plotted raw. They receive no invented Poisson
   uncertainty; supplied variances remain available.
 - SuperADAM files can omit the unit for `Count`, with both label and property
@@ -112,9 +113,15 @@ need additional models; no exact Poisson claim is made for them.
   remain in the table/export when scientifically valid. Nonpositive lower
   bounds are omitted from the log rendering, never replaced or clipped. Use
   a linear axis or the table to inspect the complete interval.
-- CSV exports values, standard uncertainties, lower/upper bounds, method,
-  units, wavelength (when applicable), reference rate, source path, original
-  step index, and processing warnings at full numerical precision.
+- The chart shows only warnings under its title. The full processing
+  description (formula, interval method and sigma level, excluded points,
+  waterfall settings) is written to the export header; the table's
+  *Uncertainty method* column shows each curve's method.
+- **File ▸ Export ▸ Reflectivity Data** writes tab-delimited values, standard
+  uncertainties and lower/upper bounds per point with the original step index,
+  and `#` header lines with method, units, wavelength (when applicable),
+  reference rate, source paths and processing warnings, at full numerical
+  precision (shortest round-trip representation).
 
 ## References
 

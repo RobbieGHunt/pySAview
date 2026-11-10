@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import os
+import zlib
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 import h5py
@@ -45,6 +48,59 @@ def decode_attr_str(val: Any) -> str:
     if isinstance(decoded, list):
         return ", ".join(str(x) for x in decoded)
     return str(decoded)
+
+
+def _roi_fast_path_supported(dataset: h5py.Dataset) -> bool:
+    """Integer frame-per-chunk deflate volumes, where per-frame sums are exact."""
+    from pySAview.core.off_specular import _supports_parallel_gzip
+
+    return dataset.dtype.kind in "iu" and _supports_parallel_gzip(dataset)
+
+
+def _integrate_roi_gzip_parallel(dataset: h5py.Dataset, bounds, cancelled) -> np.ndarray:
+    """Integrate one raw-pixel box per frame by inflating stored chunks on worker threads.
+
+    ``bounds[i]`` is ``(ix0, ix1, iy0, iy1)`` in raw (axis 1, axis 2) pixels.
+    Frames are row-major, so inflation stops after raw row ``ix1``: the rest of
+    the frame cannot contribute. zlib releases the GIL, so frames inflate in
+    parallel. Results equal ``np.sum(dataset[i, ix0:ix1, iy0:iy1])`` exactly:
+    integer sums, unwritten chunks read as the fill value, and a chunk whose
+    deflate filter was skipped is used as stored. Source data is only read.
+    """
+    n_frames, _, ny = dataset.shape
+    itemsize = dataset.dtype.itemsize
+    row_bytes = ny * itemsize
+    fill = int(dataset.fillvalue)
+    dsid = dataset.id
+
+    def integrate(i: int) -> float:
+        if cancelled():
+            raise InterruptedError("File loading cancelled")
+        ix0, ix1, iy0, iy1 = bounds[i]
+        if ix1 <= ix0 or iy1 <= iy0:
+            return 0.0
+        if dsid.get_chunk_info_by_coord((i, 0, 0)).byte_offset is None:
+            return float(fill * (ix1 - ix0) * (iy1 - iy0))
+        mask, raw = dsid.read_direct_chunk((i, 0, 0))
+        needed = ix1 * row_bytes
+        data = raw[:needed] if mask & 1 else zlib.decompressobj().decompress(raw, needed)
+        if len(data) != needed:
+            raise ValueError(f"Detector frame {i} has an unexpected stored size")
+        rows = np.frombuffer(data, dtype=dataset.dtype).reshape(ix1, ny)
+        return float(np.sum(rows[ix0:ix1, iy0:iy1]))
+
+    counts = np.empty(n_frames, dtype=float)
+    workers = max(1, min(8, os.cpu_count() or 2))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(integrate, i) for i in range(n_frames)]
+        try:
+            for i, future in enumerate(futures):
+                counts[i] = future.result()
+        except BaseException:
+            for future in futures:
+                future.cancel()
+            raise
+    return counts
 
 
 class NexusReader:
@@ -282,7 +338,9 @@ class NexusReader:
         except Exception:
             return None
 
-    def compute_full_scan_roi(self, roi: tuple[float, float, float, float]) -> np.ndarray | None:
+    def compute_full_scan_roi(
+        self, roi: tuple[float, float, float, float], *, parallel: bool = True
+    ) -> np.ndarray | None:
         """Compute integrated counts for each scan frame within ROI (x0, x1, y0, y1).
 
         Coordinates (x, y) are in the displayed frame orientation (where displayed_frame = raw_frame.T),
@@ -300,6 +358,9 @@ class NexusReader:
         if ix1 <= ix0 or iy1 <= iy0:
             return np.zeros(ds.shape[0], dtype=float)
 
+        if parallel and _roi_fast_path_supported(ds):
+            return _integrate_roi_gzip_parallel(ds, [(ix0, ix1, iy0, iy1)] * ds.shape[0], self._cancelled)
+
         counts = np.empty(ds.shape[0], dtype=float)
         bytes_per_frame = max(1, (ix1-ix0) * (iy1-iy0) * ds.dtype.itemsize)
         chunk_frames = max(1, min(16, (8 * 1024 * 1024) // bytes_per_frame))
@@ -312,7 +373,7 @@ class NexusReader:
         return counts
 
     def compute_per_frame_scan_roi(
-        self, rois: list[tuple[float, float, float, float]]
+        self, rois: list[tuple[float, float, float, float]], *, parallel: bool = True
     ) -> np.ndarray | None:
         """Compute integrated counts for each scan frame given per-frame ROIs [(x0, x1, y0, y1), ...]."""
         path = "entry0/data_scan/detector_data/data"
@@ -330,6 +391,8 @@ class NexusReader:
         if len(rois) != n_frames:
             raise ValueError("Tracked ROI must supply exactly one region per detector frame")
         bounds = [pixel_bounds(roi, nx, ny) for roi in rois]
+        if parallel and _roi_fast_path_supported(ds):
+            return _integrate_roi_gzip_parallel(ds, bounds, self._cancelled)
         for i, (ix0, ix1, iy0, iy1) in enumerate(bounds):
             if ix1 > ix0 and iy1 > iy0:
                 counts[i] = float(np.sum(ds[i, ix0:ix1, iy0:iy1]))

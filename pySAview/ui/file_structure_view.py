@@ -32,6 +32,7 @@ from PyQt6.QtWidgets import (
 from pySAview.core.models import DatasetPreview, NodeInfo
 from pySAview.core.nexus_reader import NexusReader
 from pySAview.ui import icons
+from pySAview.ui.plot_tools import install_context_export
 from pySAview.ui.theme import apply_plot_theme, get_safe_colormap
 
 
@@ -41,6 +42,7 @@ class FileStructureView(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.reader: NexusReader | None = None
+        self.session_source_paths = lambda: []  # every loaded file; set by the main window
         self.is_dark_mode: bool = False
         self._current_node: NodeInfo | None = None
         self.is_tree_minimized: bool = False
@@ -193,6 +195,10 @@ class FileStructureView(QWidget):
         self.plot_widget.showGrid(x=True, y=True, alpha=0.3)
         apply_plot_theme(self.plot_widget, self.is_dark_mode)
         vis_layout.addWidget(self.plot_widget, 1)
+        install_context_export(
+            self.plot_widget,
+            lambda: (self.reader.path.stem + "_preview.png") if self.reader is not None else "preview.png",
+            lambda: ([str(self.reader.path)] if self.reader is not None else []) + list(self.session_source_paths()))
 
         self.text_preview = QTextEdit()
         self.text_preview.setReadOnly(True)

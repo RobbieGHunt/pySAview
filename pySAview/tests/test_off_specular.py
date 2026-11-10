@@ -230,7 +230,7 @@ def test_missing_normalization_channel_has_no_raw_fallback(qtbot, window):
         view.combo_norm.setCurrentIndex(view.combo_norm.findData("monitor"))
         assert view._norm is None
         assert view.img_item.image is None
-        assert "Monitor1" in view.lbl_info.text()
+        assert "Monitor1" in view.lbl_notice.text()
     finally:
         scan.variables["Monitor1"] = monitor
     view.combo_norm.setCurrentIndex(view.combo_norm.findData("raw"))

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 import numpy as np
 import pyqtgraph as pg
@@ -18,6 +19,7 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QPushButton,
+    QSizePolicy,
     QSlider,
     QSpinBox,
     QSplitter,
@@ -31,6 +33,7 @@ from pySAview.core.nexus_reader import NexusReader
 from pySAview.core.scan_calculations import integrate_roi_2d
 from pySAview.core.roi import pixel_bounds
 from pySAview.ui import icons
+from pySAview.ui.plot_tools import export_plot_image, install_context_export, tool_button
 from pySAview.ui.theme import apply_plot_theme, get_safe_colormap
 
 
@@ -44,6 +47,7 @@ class DetectorView(QWidget):
         super().__init__(parent)
         self.reader: NexusReader | None = None
         self.scan_data: ScanData | None = None
+        self.session_source_paths = lambda: []  # every loaded file; set by the main window
         self.is_dark_mode: bool = False
         self._current_frame_idx: int = 0
         self._total_frames: int = 0
@@ -75,21 +79,18 @@ class DetectorView(QWidget):
         ctrl_bar = QHBoxLayout()
         ctrl_bar.setSpacing(8)
 
-        self.btn_play = QPushButton("Play")
+        self.btn_play = tool_button("Play / pause through the frames")
         self.btn_play.setIcon(icons.get_icon("play", is_dark=self.is_dark_mode))
-        self.btn_play.setFixedWidth(85)
         self.btn_play.clicked.connect(self._toggle_play)
         ctrl_bar.addWidget(self.btn_play)
 
-        self.btn_prev = QPushButton("Prev")
+        self.btn_prev = tool_button("Previous frame")
         self.btn_prev.setIcon(icons.get_icon("chevron_left", is_dark=self.is_dark_mode))
-        self.btn_prev.setFixedWidth(75)
         self.btn_prev.clicked.connect(self._step_backward)
         ctrl_bar.addWidget(self.btn_prev)
 
-        self.btn_next = QPushButton("Next")
+        self.btn_next = tool_button("Next frame")
         self.btn_next.setIcon(icons.get_icon("chevron_right", is_dark=self.is_dark_mode))
-        self.btn_next.setFixedWidth(75)
         self.btn_next.clicked.connect(self._step_forward)
         ctrl_bar.addWidget(self.btn_next)
 
@@ -132,13 +133,6 @@ class DetectorView(QWidget):
 
         main_layout.addLayout(ctrl_bar)
 
-        # Step details banner
-        self.lbl_step_info = QLabel("No detector data loaded.")
-        self.lbl_step_info.setStyleSheet(
-            "background-color: #0284c7; color: #ffffff; padding: 6px 14px; border-radius: 6px; font-weight: 600;"
-        )
-        main_layout.addWidget(self.lbl_step_info)
-
         # ---------------- Central Splitter: 2D Image + ROI Controls & 1D Profiles ----------------
         splitter = QSplitter(Qt.Orientation.Horizontal)
 
@@ -152,48 +146,33 @@ class DetectorView(QWidget):
         img_toolbar = QHBoxLayout()
         img_toolbar.setSpacing(6)
 
-        self.btn_img_pan = QPushButton("Pan")
-        self.btn_img_pan.setCheckable(True)
+        # Icon-only tools, matching the Scan Charts and Off-Specular toolbars.
+        self.btn_img_pan = tool_button("Pan: drag to move the detector image", checkable=True)
         self.btn_img_pan.setChecked(True)
-        self.btn_img_pan.setToolTip("Pan Mode: Drag with left mouse button to pan detector image")
         self.btn_img_pan.clicked.connect(self._set_img_mouse_mode_pan)
-        img_toolbar.addWidget(self.btn_img_pan)
-
-        self.btn_img_box_zoom = QPushButton("Box Zoom")
-        self.btn_img_box_zoom.setCheckable(True)
-        self.btn_img_box_zoom.setToolTip("Box Zoom Mode: Drag with left mouse button to draw a zoom rectangle")
+        self.btn_img_box_zoom = tool_button("Box zoom: drag a rectangle to zoom", checkable=True)
         self.btn_img_box_zoom.clicked.connect(self._set_img_mouse_mode_box_zoom)
-        img_toolbar.addWidget(self.btn_img_box_zoom)
-
         self.img_mouse_group = QButtonGroup(self)
         self.img_mouse_group.addButton(self.btn_img_pan)
         self.img_mouse_group.addButton(self.btn_img_box_zoom)
-
-        self.btn_img_zoom_in = QPushButton("Zoom In")
-        self.btn_img_zoom_in.setToolTip("Zoom in (+30%)")
+        self.btn_img_zoom_in = tool_button("Zoom in")
         self.btn_img_zoom_in.clicked.connect(self._img_zoom_in)
-        img_toolbar.addWidget(self.btn_img_zoom_in)
-
-        self.btn_img_zoom_out = QPushButton("Zoom Out")
-        self.btn_img_zoom_out.setToolTip("Zoom out (-30%)")
+        self.btn_img_zoom_out = tool_button("Zoom out")
         self.btn_img_zoom_out.clicked.connect(self._img_zoom_out)
-        img_toolbar.addWidget(self.btn_img_zoom_out)
-
-        self.btn_img_reset = QPushButton("Fit Frame")
-        self.btn_img_reset.setToolTip("Reset view to fit full 2D detector frame")
+        self.btn_img_reset = tool_button("Fit the whole frame")
         self.btn_img_reset.clicked.connect(self._img_reset_view)
-        img_toolbar.addWidget(self.btn_img_reset)
+        self.btn_img_export = tool_button("Export the frame as a PNG or SVG image")
+        self.btn_img_export.clicked.connect(self.export_image)
+        for btn in (self.btn_img_pan, self.btn_img_box_zoom, self.btn_img_zoom_in, self.btn_img_zoom_out,
+                    self.btn_img_reset, self.btn_img_export):
+            img_toolbar.addWidget(btn)
+        img_toolbar.addSpacing(8)
 
-        img_toolbar.addSpacing(10)
-
-        self.btn_img_log = QPushButton("Log Scale")
-        self.btn_img_log.setCheckable(True)
-        self.btn_img_log.setChecked(self.chk_log_img.isChecked())
-        self.btn_img_log.setToolTip("Toggle Logarithmic / Linear 2D intensity scaling")
-        self.btn_img_log.toggled.connect(self._on_img_log_toggled)
-        img_toolbar.addWidget(self.btn_img_log)
-
-        img_toolbar.addStretch(1)
+        # Per-frame angles, spin and counts (the step itself is in the controls above).
+        self.lbl_frame_info = QLabel("")
+        self.lbl_frame_info.setStyleSheet("color: #64748b; font-size: 11px;")
+        self.lbl_frame_info.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        img_toolbar.addWidget(self.lbl_frame_info, 1)
 
         self.lbl_img_coords = QLabel("Pixel: (X: ----, Y: ----)  |  Counts: --------")
         self.lbl_img_coords.setStyleSheet("color: #64748b; font-size: 11px;")
@@ -319,6 +298,9 @@ class DetectorView(QWidget):
         apply_plot_theme(self.plot_y_cut, self.is_dark_mode)
         sidebar_layout.addWidget(self.plot_y_cut)
 
+        for widget, kind in ((self.plot_2d, "frame"), (self.plot_x_cut, "xcut"), (self.plot_y_cut, "ycut")):
+            install_context_export(widget, (lambda k=kind: self._default_export_name(k)), self._source_paths)
+
         sidebar_layout.addStretch()
         splitter.addWidget(sidebar_container)
         splitter.setSizes([680, 360])
@@ -331,7 +313,7 @@ class DetectorView(QWidget):
         self.scan_data = scan_data
 
         if not scan_data.has_detector_2d or scan_data.detector_shape is None:
-            self.lbl_step_info.setText("No 2D detector data found in this NeXus file.")
+            self.lbl_frame_info.setText("No 2D detector data found in this NeXus file.")
             self.slider_step.setEnabled(False)
             self.spin_step.setEnabled(False)
             self.btn_play.setEnabled(False)
@@ -456,6 +438,22 @@ class DetectorView(QWidget):
         raw_idx = self._filtered_indices[self._current_filtered_pos]
         self._load_frame(raw_idx)
 
+    def _source_paths(self) -> list[str]:
+        own = [self.scan_data.file_path] if self.scan_data is not None and self.scan_data.file_path else []
+        return own + list(self.session_source_paths())
+
+    def _default_export_name(self, kind: str) -> str:
+        stem = Path(self.scan_data.file_path).stem if self.scan_data is not None and self.scan_data.file_path else "scan"
+        return f"{stem}_{kind}{self._current_frame_idx:04d}.png" if kind == "frame" else f"{stem}_{kind}.png"
+
+    def export_image(self) -> Path | None:
+        """Save the displayed frame (with ROI box) as PNG or SVG."""
+        if self._current_frame_data is None:
+            QMessageBox.information(self, "No Data", "No detector frame to export.")
+            return None
+        return export_plot_image(self, self.plot_2d.getPlotItem(), self._default_export_name("frame"),
+                                 self._source_paths(), "Export Detector Frame Image")
+
     def set_theme(self, is_dark: bool) -> None:
         """Update styling for dark / light mode."""
         self.is_dark_mode = is_dark
@@ -471,7 +469,7 @@ class DetectorView(QWidget):
         self.btn_img_zoom_in.setIcon(icons.get_icon("zoom_in", is_dark=is_dark))
         self.btn_img_zoom_out.setIcon(icons.get_icon("zoom_out", is_dark=is_dark))
         self.btn_img_reset.setIcon(icons.get_icon("maximize", is_dark=is_dark))
-        self.btn_img_log.setIcon(icons.get_icon("activity", is_dark=is_dark))
+        self.btn_img_export.setIcon(icons.get_icon("download", is_dark=is_dark))
 
         apply_plot_theme(self.plot_2d, is_dark)
         apply_plot_theme(self.plot_x_cut, is_dark)
@@ -495,9 +493,6 @@ class DetectorView(QWidget):
     def _img_reset_view(self) -> None:
         self.plot_2d.autoRange()
 
-    def _on_img_log_toggled(self, checked: bool) -> None:
-        self.chk_log_img.setChecked(checked)
-
     def _on_mouse_moved_2d(self, pos: Any) -> None:
         if self._current_frame_data is None:
             return
@@ -518,11 +513,9 @@ class DetectorView(QWidget):
     def _toggle_play(self) -> None:
         if self._play_timer.isActive():
             self._play_timer.stop()
-            self.btn_play.setText("Play")
             self.btn_play.setIcon(icons.get_icon("play", is_dark=self.is_dark_mode))
         else:
             self._play_timer.start()
-            self.btn_play.setText("Pause")
             self.btn_play.setIcon(icons.get_icon("pause", is_dark=self.is_dark_mode))
 
     def _step_forward(self) -> None:
@@ -562,9 +555,6 @@ class DetectorView(QWidget):
             self._roi_rect_item.setVisible(visible)
 
     def _refresh_current_frame(self) -> None:
-        self.btn_img_log.blockSignals(True)
-        self.btn_img_log.setChecked(self.chk_log_img.isChecked())
-        self.btn_img_log.blockSignals(False)
         self._load_frame(self._current_frame_idx)
 
     def _get_current_roi_bounds(self) -> tuple[float, float, float, float]:
@@ -879,16 +869,9 @@ class DetectorView(QWidget):
         flip_val = self.scan_data.variables["Flipper1"].data[frame_idx] if "Flipper1" in self.scan_data.variables else np.nan
         total_counts = float(np.sum(frame))
 
-        spin_str = {0: "d — Down (F=0 / OFF)", 1: "u — Up (F=1 / ON)"}.get(flip_val, "Unknown flipper state")
-        filt_count = len(self._filtered_indices) if self._filtered_indices else self._total_frames
-        step_pos = (self._current_filtered_pos + 1) if self._filtered_indices else (frame_idx + 1)
-        info_str = (
-            f"Step {step_pos} of {filt_count} (Frame #{frame_idx + 1})  |  "
-            f"θ = {th_val:.4f}°  |  2θ = {tth_val:.4f}°  |  "
-            f"Spin: {spin_str}  |  Frame Counts: {total_counts:,.0f}  |  "
-            f"90° CW + Mirrored"
-        )
-        self.lbl_step_info.setText(info_str)
+        spin_str = {0: "d (F=0)", 1: "u (F=1)"}.get(flip_val, "spin ?")
+        self.lbl_frame_info.setText(
+            f"Frame {frame_idx}   θ {th_val:.4f}°   2θ {tth_val:.4f}°   {spin_str}   {total_counts:,.0f} counts")
 
         # Prepare 2D Image
         img_display = frame
