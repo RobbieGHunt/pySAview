@@ -55,7 +55,7 @@ from pySAview.core.angle_calibration import (
     q_from_angles,
     specular_center,
 )
-from pySAview.core.reduction.background import bkg_roi_from_signal
+from pySAview.core.reduction.background import resolve_bkg_roi
 from pySAview.core.reduction.curvature import apply_curvature_by_spin
 from pySAview.core.reduction.kinematics import (
     constant_qx_alpha_f,
@@ -89,9 +89,10 @@ from pySAview.ui.flow_layout import (
     make_flow_group,
 )
 from pySAview.ui.plot_tools import (
-    TABLE_FILTERS, ask_output_path, export_plot_image, install_context_export, tool_button,
+    ScientificAxisItem, TABLE_FILTERS, ask_output_path, export_plot_image, install_context_export, tool_button,
 )
 from pySAview.ui.theme import apply_plot_theme, get_safe_colormap
+from pySAview.ui.wheel_guard import install_wheel_focus_guard
 
 DEFAULT_ROI = (354.0, 382.0, 285.0, 743.0)
 
@@ -116,6 +117,59 @@ def _fixed_width_text(label: QLabel) -> None:
     """Changing text must never resize the layout (the map would jump while hovering)."""
     label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
     label.setMinimumWidth(0)
+
+
+def _convolve1d_nan(arr: np.ndarray, kernel: np.ndarray, axis: int) -> np.ndarray:
+    """Normalized NaN-aware 1D convolution along ``axis`` (pure NumPy, display-only)."""
+    r = kernel.size // 2
+    finite = np.isfinite(arr)
+    filled = np.where(finite, arr, 0.0)
+    weights = finite.astype(float)
+    pad_width = [(0, 0), (0, 0)]
+    pad_width[axis] = (r, r)
+    f_pad = np.pad(filled, pad_width, mode="constant", constant_values=0.0)
+    w_pad = np.pad(weights, pad_width, mode="constant", constant_values=0.0)
+    num = np.zeros_like(filled)
+    den = np.zeros_like(weights)
+    n_axis = arr.shape[axis]
+    for i, w in enumerate(kernel):
+        if axis == 0:
+            num += w * f_pad[i : i + n_axis, :]
+            den += w * w_pad[i : i + n_axis, :]
+        else:
+            num += w * f_pad[:, i : i + n_axis]
+            den += w * w_pad[:, i : i + n_axis]
+    out = np.full_like(filled, np.nan)
+    ok = den > 1e-12
+    out[ok] = num[ok] / den[ok]
+    return out
+
+
+def _smooth_2d_display(
+    values: np.ndarray,
+    sigma: float,
+    *,
+    row_order: np.ndarray | None = None,
+    preserve_nans: bool = False,
+) -> np.ndarray:
+    """Apply separable NaN-safe 2D Gaussian smoothing for display only (never mutates data)."""
+    arr = np.asarray(values, dtype=float)
+    if arr.ndim != 2 or arr.size == 0 or sigma <= 0.0:
+        return arr
+    radius = max(1, int(np.ceil(3.0 * float(sigma))))
+    grid = np.arange(-radius, radius + 1, dtype=float)
+    kernel = np.exp(-0.5 * (grid / float(sigma)) ** 2)
+    kernel /= float(np.sum(kernel))
+
+    ordered = arr[row_order] if row_order is not None else arr
+    smoothed = _convolve1d_nan(_convolve1d_nan(ordered, kernel, axis=1), kernel, axis=0)
+    if preserve_nans:
+        smoothed = np.where(np.isfinite(ordered), smoothed, np.nan)
+    if row_order is not None:
+        restored = np.empty_like(smoothed)
+        restored[row_order] = smoothed
+        return restored
+    return smoothed
 
 
 _RDBU_R_POS = np.linspace(0.0, 1.0, 11)
@@ -613,6 +667,9 @@ class OffSpecularView(QWidget):
         self._applied_cmap_key: tuple[bool, str] | None = None
         self._colorbar_items_rebuilt = True
         self._last_tick_key = None
+        self._baseline_levels: dict[tuple, tuple[float, float]] = {}
+        self._last_level_key: tuple | None = None
+        self._preserve_levels = False
         self.session_source_paths = lambda: []  # every loaded file; set by the main window
         self._cut_values: np.ndarray | None = None  # what the map shows (asymmetry: low counts blanked)
         self._init_ui()
@@ -703,6 +760,28 @@ class OffSpecularView(QWidget):
         self.chk_show_roi.setChecked(True)
         self.chk_show_roi.toggled.connect(self._draw_roi_overlay)
         bar.addWidget(self.chk_show_roi)
+
+        self.chk_smooth_map = QCheckBox("Smooth")
+        self.chk_smooth_map.setChecked(False)
+        self.chk_smooth_map.setToolTip(
+            "Apply 2D Gaussian display smoothing on α_i vs α_f and Qx vs Qz maps "
+            "(display-only; cuts, cursor readout, and exports remain unsmoothed)."
+        )
+        self.chk_smooth_map.toggled.connect(self._on_smooth_changed)
+        self.spin_smooth_sigma = QDoubleSpinBox()
+        self.spin_smooth_sigma.setRange(0.5, 8.0)
+        self.spin_smooth_sigma.setDecimals(1)
+        self.spin_smooth_sigma.setSingleStep(0.5)
+        self.spin_smooth_sigma.setValue(1.5)
+        self.spin_smooth_sigma.setSuffix(" px")
+        self.spin_smooth_sigma.setFixedWidth(78)
+        self.spin_smooth_sigma.setKeyboardTracking(False)
+        self.spin_smooth_sigma.setEnabled(False)
+        self.spin_smooth_sigma.setToolTip("Gaussian smoothing radius σ in pixels (display-only).")
+        self.spin_smooth_sigma.valueChanged.connect(self._on_smooth_changed)
+        self._smooth_group = make_flow_group(self.chk_smooth_map, self.spin_smooth_sigma, spacing=4)
+        self._smooth_group.setVisible(self._alpha_mode())
+        bar.addWidget(self._smooth_group)
 
         self.combo_cmap = configure_compact_combo(QComboBox(), min_chars=7)
         self.combo_cmap.addItems(["turbo", "viridis", "inferno", "plasma", "cividis", "gray", "magma"])
@@ -855,14 +934,18 @@ class OffSpecularView(QWidget):
         self.lbl_row_cut = QLabel("Horizontal cut (selected point):")
         _fixed_width_text(self.lbl_row_cut)
         group_layout.addWidget(self.lbl_row_cut)
-        self.plot_row = _CompactPlotWidget()
+        self.plot_row = _CompactPlotWidget(
+            axisItems={"left": ScientificAxisItem(orientation="left", linear_scientific=False)}
+        )
         self.plot_row.setMinimumHeight(110)
         self.plot_row.setLabel("bottom", "Detector X pixel")
         group_layout.addWidget(self.plot_row, 1)
         self.lbl_col_cut = QLabel("Vertical cut (selected X pixel):")
         _fixed_width_text(self.lbl_col_cut)
         group_layout.addWidget(self.lbl_col_cut)
-        self.plot_col = _CompactPlotWidget()
+        self.plot_col = _CompactPlotWidget(
+            axisItems={"left": ScientificAxisItem(orientation="left", linear_scientific=False)}
+        )
         self.plot_col.setMinimumHeight(110)
         group_layout.addWidget(self.plot_col, 1)
         self.lbl_cut_hint = QLabel(CUT_HINT)
@@ -891,6 +974,7 @@ class OffSpecularView(QWidget):
         splitter.setStretchFactor(1, 1)
         splitter.setSizes([760, 340])
         main.addWidget(splitter, 1)
+        install_wheel_focus_guard(self)
 
     def _build_calibration_panel(self) -> QGroupBox:
         group = self.cal_group = QGroupBox("Angle calibration (α_i, α_f) — this scan")
@@ -1109,7 +1193,11 @@ class OffSpecularView(QWidget):
             return
         self.scan_data.reduction_params.curvature_rad = curv
         self._sync_curvature_controls()
-        self._redraw()
+        self._preserve_levels = True
+        try:
+            self._redraw()
+        finally:
+            self._preserve_levels = False
         self.curvature_changed.emit(self.scan_data.file_path)
 
     def _on_curvature_spin_changed(self, value: float) -> None:
@@ -1185,8 +1273,10 @@ class OffSpecularView(QWidget):
                        self.btn_mode_direct_beam, self.btn_mode_pysared,
                        self.spin_dpp, self.spin_distance_mm, self.spin_det_width_mm, self.spin_x0,
                        self.chk_af_increases, self.btn_fit_db, self.chk_show_db, self.spin_wavelength,
-                       self.spin_curvature, self.slider_curvature, self.btn_reset_curvature):
+                       self.spin_curvature, self.slider_curvature, self.btn_reset_curvature,
+                       self.chk_smooth_map):
             widget.setEnabled(enabled)
+        self.spin_smooth_sigma.setEnabled(enabled and self.chk_smooth_map.isChecked())
 
     # -------------------------------------------------------------- public API
     def set_data(self, scan_data: ScanData | None) -> None:
@@ -1195,6 +1285,7 @@ class OffSpecularView(QWidget):
         self.scan_data = scan_data
         self._map = None
         self._norm = None
+        self._last_level_key = None
         self._pending_key = None
         self._crosshair_placed = False
         self._set_cut_buttons(False, False)
@@ -1423,6 +1514,49 @@ class OffSpecularView(QWidget):
             job.deleteLater()
 
     # ------------------------------------------------------------- drawing
+    def _detector_ny_full(self) -> int:
+        if self.scan_data is not None and self.scan_data.detector_shape:
+            return int(self.scan_data.detector_shape[2])
+        if self._map is not None:
+            return max(1, int(self._map.y_bounds[1]))
+        return 1024
+
+    def _compute_norm_map(
+        self, counts: np.ndarray, mode: str, spin: str, flipper, exposure, monitor,
+    ):
+        kw = dict(
+            exposure=exposure,
+            monitor=None if monitor is None else np.asarray(monitor.data, dtype=float),
+            monitor_variance=None if monitor is None else monitor.variance,
+        )
+        if spin in ("asym", "sum"):
+            th, tth = self._variable("th"), self._variable("tth")
+            label_name = "Spin asymmetry" if spin == "asym" else "Sum of channels"
+            if flipper is None or th is None or tth is None:
+                return None, f"{label_name} needs Flipper1, θ and 2θ channels."
+            up, down = pair_spin_frames(th, tth, flipper, self._map.written)
+            if up.size == 0:
+                return None, f"{label_name}: no u/d frame pairs at matching θ and 2θ."
+            if spin == "asym":
+                return spin_asymmetry(counts, up, down, mode,
+                                      min_counts=self.spin_min_counts.value(), **kw), ""
+            return sum_spin_frames(counts, up, down, mode, **kw), ""
+        frames = select_frames(self._map.n_frames, flipper, spin)
+        return normalize_map(counts, frames, mode, **kw), ""
+
+    def _levels_from_norm(self, norm) -> tuple[float, float]:
+        if isinstance(norm, AsymmetryMap):
+            disp = np.where(norm.low_count_mask, np.nan, norm.values)
+            finite = np.abs(disp[np.isfinite(disp)])
+            half = float(np.percentile(finite, 99)) if finite.size else 1.0
+            return -(half or 1.0), (half or 1.0)
+        disp = log_display(norm.values) if self._log_active() else norm.values
+        finite = disp[np.isfinite(disp)]
+        lo, hi = (float(finite.min()), float(finite.max())) if finite.size else (0.0, 1.0)
+        if hi <= lo:
+            hi = lo + 1.0
+        return lo, hi
+
     def _redraw(self) -> None:
         if self._map is None or self.scan_data is None:
             return
@@ -1433,22 +1567,25 @@ class OffSpecularView(QWidget):
         count = self.scan_data.variables.get("Count")
         monitor = self.scan_data.variables.get("Monitor1")
 
-        # Non-destructive per-spin sample curvature shear inside Signal (and BKG) ROI
+        # Non-destructive per-spin sample curvature shear inside Signal (and disjoint BKG) ROI
         effective_counts = self._map.counts
         curv_warning = ""
         params = self.scan_data.reduction_params
-        if abs(params.curvature_rad) > 0.0:
+        curv_active = abs(params.curvature_rad) > 0.0
+        if curv_active:
             bounds = self._scan_roi_bounds()
             if len(bounds) > 1:
                 curv_warning = "Sample curvature skipped: requires a fixed ROI (tracked ROI active)."
             else:
-                sx0, sx1, _, _ = pixel_bounds(bounds[0], self._map.nx, max(1, self._map.y_bounds[1]))
+                ny_full = self._detector_ny_full()
+                sx0, sx1, _, _ = pixel_bounds(bounds[0], self._map.nx, ny_full)
                 bkg_win = None
                 if params.subtract_background:
-                    bx0, bx1, _, _ = bkg_roi_from_signal(
-                        bounds[0], params.bkg_x_bounds, self._map.nx, max(1, self._map.y_bounds[1])
+                    bx0, bx1, _, _ = resolve_bkg_roi(
+                        bounds[0], params.bkg_roi_bounds, params.bkg_x_bounds, self._map.nx, ny_full
                     )
-                    bkg_win = (bx0, bx1)
+                    if bx1 <= sx0 or sx1 <= bx0:
+                        bkg_win = (bx0, bx1)
                 try:
                     effective_counts = apply_curvature_by_spin(
                         self._map.counts,
@@ -1467,27 +1604,10 @@ class OffSpecularView(QWidget):
                 if count is None or count.unit != "s":
                     raise ValueError("Counts / s needs a Count exposure channel in seconds")
                 exposure = np.asarray(count.data, dtype=float)
-            kw = dict(exposure=exposure,
-                      monitor=None if monitor is None else np.asarray(monitor.data, dtype=float),
-                      monitor_variance=None if monitor is None else monitor.variance)
-            if spin in ("asym", "sum"):
-                th, tth = self._variable("th"), self._variable("tth")
-                label_name = "Spin asymmetry" if spin == "asym" else "Sum of channels"
-                if flipper is None or th is None or tth is None:
-                    self._show_unavailable(f"{label_name} needs Flipper1, θ and 2θ channels.")
-                    return
-                up, down = pair_spin_frames(th, tth, flipper, self._map.written)
-                if up.size == 0:
-                    self._show_unavailable(f"{label_name}: no u/d frame pairs at matching θ and 2θ.")
-                    return
-                if spin == "asym":
-                    norm = spin_asymmetry(effective_counts, up, down, mode,
-                                          min_counts=self.spin_min_counts.value(), **kw)
-                else:
-                    norm = sum_spin_frames(effective_counts, up, down, mode, **kw)
-            else:
-                frames = select_frames(self._map.n_frames, flipper, spin)
-                norm = normalize_map(effective_counts, frames, mode, **kw)
+            norm, unavailable = self._compute_norm_map(effective_counts, mode, spin, flipper, exposure, monitor)
+            if unavailable:
+                self._show_unavailable(unavailable)
+                return
         except ValueError as error:
             self._show_unavailable(f"{error}. Choose another normalization.")
             return
@@ -1500,19 +1620,69 @@ class OffSpecularView(QWidget):
         self._ensure_calibration()
         self._sync_cal_controls()
         asym = isinstance(norm, AsymmetryMap)
+        level_key = (
+            self.scan_data.file_path,
+            self._map.y_bounds,
+            spin,
+            mode,
+            self._log_active(),
+            asym,
+            self.spin_min_counts.value() if asym else 0,
+        )
+
+        # Anchor automatic colour-bar levels to the uncurved (gamma = 0), unsmoothed baseline so
+        # fractional counts from curvature shearing or display smoothing never destabilize the palette.
+        if not curv_active:
+            base_lo, base_hi = self._levels_from_norm(norm)
+            self._baseline_levels[level_key] = (base_lo, base_hi)
+        elif level_key in self._baseline_levels:
+            base_lo, base_hi = self._baseline_levels[level_key]
+        else:
+            try:
+                base_norm, _ = self._compute_norm_map(self._map.counts, mode, spin, flipper, exposure, monitor)
+                base_lo, base_hi = self._levels_from_norm(base_norm) if base_norm is not None else self._levels_from_norm(norm)
+            except ValueError:
+                base_lo, base_hi = self._levels_from_norm(norm)
+            self._baseline_levels[level_key] = (base_lo, base_hi)
+
+        if self._preserve_levels and self._last_level_key == level_key:
+            levels_attr = getattr(self.colorbar, "levels", None)
+            cur_levels = levels_attr() if callable(levels_attr) else levels_attr
+            if (cur_levels is not None and len(cur_levels) == 2
+                    and np.isfinite(cur_levels[0]) and np.isfinite(cur_levels[1])
+                    and float(cur_levels[1]) > float(cur_levels[0])):
+                lo, hi = float(cur_levels[0]), float(cur_levels[1])
+            else:
+                lo, hi = base_lo, base_hi
+        else:
+            lo, hi = base_lo, base_hi
+        self._last_level_key = level_key
+
         if asym:
             # Display only: low-count pixels blanked; colour range symmetric about zero.
-            display = np.where(norm.low_count_mask, np.nan, norm.values)
-            finite = np.abs(display[np.isfinite(display)])
-            half = float(np.percentile(finite, 99)) if finite.size else 1.0
-            lo, hi = -(half or 1.0), (half or 1.0)
+            unsmoothed_linear = np.where(norm.low_count_mask, np.nan, norm.values)
+            self._cut_values = unsmoothed_linear
         else:
-            display = log_display(norm.values) if self._log_active() else norm.values
-            finite = display[np.isfinite(display)]
-            lo, hi = (float(finite.min()), float(finite.max())) if finite.size else (0.0, 1.0)
-            if hi <= lo:
-                hi = lo + 1.0
-        self._cut_values = display if asym else norm.values
+            unsmoothed_linear = norm.values
+            self._cut_values = norm.values
+
+        # Optional 2D Gaussian display smoothing on α_i vs α_f and Qx vs Qz maps only (never alters cuts/exports)
+        render_linear = unsmoothed_linear
+        if self._alpha_mode() and self.chk_smooth_map.isChecked():
+            th_arr = self._variable("th")
+            row_order = None
+            if th_arr is not None and frames.size > 1 and int(frames.max()) < th_arr.size:
+                th_sel = th_arr[frames]
+                if np.all(np.isfinite(th_sel)):
+                    row_order = np.argsort(th_sel, kind="stable")
+            render_linear = _smooth_2d_display(
+                unsmoothed_linear,
+                self.spin_smooth_sigma.value(),
+                row_order=row_order,
+                preserve_nans=asym,
+            )
+
+        display = render_linear if asym else (log_display(render_linear) if self._log_active() else render_linear)
         alpha_note = ""
         if self._alpha_mode():
             alpha_note = self._draw_alpha(display)
@@ -1717,8 +1887,8 @@ class OffSpecularView(QWidget):
         # Dashed cyan Background ROI boundaries when BKG subtraction is active (pySAred 1.5.3)
         params = self.scan_data.reduction_params
         if params.subtract_background:
-            bx0, bx1, _, _ = bkg_roi_from_signal(
-                bounds[0], params.bkg_x_bounds, self._map.nx, max(1, self._map.y_bounds[1])
+            bx0, bx1, _, _ = resolve_bkg_roi(
+                bounds[0], params.bkg_roi_bounds, params.bkg_x_bounds, self._map.nx, self._detector_ny_full()
             )
             for xb in (float(bx0), float(bx1)):
                 self._add_overlay([xb, xb], [0.0, float(frames.size)], "#06b6d4")
@@ -1755,8 +1925,8 @@ class OffSpecularView(QWidget):
                 self._add_overlay(np.repeat(xb, 2), ys, "#facc15")
         params = self.scan_data.reduction_params
         if params.subtract_background:
-            bx0, bx1, _, _ = bkg_roi_from_signal(
-                bounds[0], params.bkg_x_bounds, self._map.nx, max(1, self._map.y_bounds[1])
+            bx0, bx1, _, _ = resolve_bkg_roi(
+                bounds[0], params.bkg_roi_bounds, params.bkg_x_bounds, self._map.nx, self._detector_ny_full()
             )
             for xb in (float(bx0), float(bx1)):
                 self._add_overlay([xb, xb], [y0, y1], "#06b6d4")
@@ -1963,6 +2133,11 @@ class OffSpecularView(QWidget):
         lo, hi = (float(shown.min()), float(shown.max())) if shown.size else (0.0, 1.0)
         if log:
             lo, hi = float(np.log10(lo)), float(np.log10(hi))
+            if self._last_level_key in self._baseline_levels:
+                base_lo, _ = self._baseline_levels[self._last_level_key]
+                lo = max(lo, float(base_lo))
+                if hi <= lo:
+                    hi = lo + 1.0
         pad = 0.05 * (hi - lo) if hi > lo else 0.5
         if self._alpha_mode():
             x0, x1, y0, y1 = self._map_extent()
@@ -2257,6 +2432,11 @@ class OffSpecularView(QWidget):
             header.append(f"Sample curvature correction (pySAred 1.5.3): gamma = {curv!r} rad (applied inside ROI per spin state).")
         if self._log_active():
             header.append("Log colour scale is display-only; values are linear.")
+        if self._alpha_mode() and self.chk_smooth_map.isChecked():
+            header.append(
+                f"Map smoothing (Gaussian sigma = {self.spin_smooth_sigma.value():g} px) "
+                "is display-only; exported values are unsmoothed."
+            )
         if norm.warnings:
             header.append("Warnings: " + " ".join(norm.warnings))
         return header, columns, data
@@ -2365,7 +2545,17 @@ class OffSpecularView(QWidget):
             self.lbl_col_cut.setText("Vertical cut at constant Qx (toggle Vertical above):")
         self.lbl_cut_hint.setText("Drag the cut lines or crosshair on the map to move cuts; click to jump.")
 
+    def _on_smooth_changed(self, *_args) -> None:
+        self.spin_smooth_sigma.setEnabled(self.chk_smooth_map.isEnabled() and self.chk_smooth_map.isChecked())
+        if self._alpha_mode():
+            self._preserve_levels = True
+            try:
+                self._redraw()
+            finally:
+                self._preserve_levels = False
+
     def _on_axes_changed(self) -> None:
+        self._smooth_group.setVisible(self._alpha_mode())
         self._redraw()
         if self._map_ready():
             self.plot.autoRange()
@@ -2939,8 +3129,8 @@ class OffSpecularView(QWidget):
             self._add_overlay(vx, vy, "#facc15", connect="pairs")
         params = self.scan_data.reduction_params
         if params.subtract_background:
-            bx0, bx1, _, _ = bkg_roi_from_signal(
-                bounds[0], params.bkg_x_bounds, self._map.nx, max(1, self._map.y_bounds[1])
+            bx0, bx1, _, _ = resolve_bkg_roi(
+                bounds[0], params.bkg_roi_bounds, params.bkg_x_bounds, self._map.nx, self._detector_ny_full()
             )
             for xb_val in (float(bx0), float(bx1)):
                 xb_arr = np.full(frames.size, xb_val, dtype=float)

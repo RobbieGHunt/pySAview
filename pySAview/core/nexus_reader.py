@@ -754,7 +754,9 @@ class NexusReader:
 
         red_params = ReductionParams()
         if has_det and roi and det_shape is not None:
-            red_params.bkg_x_bounds = default_bkg_x_bounds(roi[0], roi[1], nx=int(det_shape[1]))
+            bx0, bx1 = default_bkg_x_bounds(roi[0], roi[1], nx=int(det_shape[1]))
+            red_params.bkg_x_bounds = (bx0, bx1)
+            red_params.bkg_roi_bounds = (bx0, bx1, float(roi[2]), float(roi[3]))
 
         return ScanData(
             file_path=str(self.path),

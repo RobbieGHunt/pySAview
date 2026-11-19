@@ -31,7 +31,12 @@ from PyQt6.QtWidgets import (
 
 from pySAview.core.models import ScanData
 from pySAview.core.off_specular import _written_frames, pair_spin_frames
-from pySAview.core.reduction.background import bkg_roi_from_signal, default_bkg_x_bounds, rois_overlap_x
+from pySAview.core.reduction.background import (
+    default_bkg_x_bounds,
+    resolve_bkg_roi,
+    roi_area_ratio,
+    rois_overlap_2d,
+)
 from pySAview.core.roi_record import ROIRecord, save_roi, load_roi
 from pySAview.core.nexus_reader import NexusReader
 from pySAview.core.scan_calculations import integrate_roi_2d
@@ -46,6 +51,7 @@ from pySAview.ui.flow_layout import (
 )
 from pySAview.ui.plot_tools import export_plot_image, install_context_export, tool_button
 from pySAview.ui.theme import apply_plot_theme, get_safe_colormap
+from pySAview.ui.wheel_guard import install_wheel_focus_guard
 
 
 class _CompactPlotWidget(pg.PlotWidget):
@@ -337,7 +343,7 @@ class DetectorView(QWidget):
 
         sidebar_layout.addWidget(roi_ctrl_group)
 
-        # 1b. Background ROI Card (pySAred 1.5.3: same Y & same width as Signal ROI)
+        # 1b. Background ROI Card (freely resizable; area-scaled k = A_sig / A_bkg when size differs)
         bkg_ctrl_group = QGroupBox("Background ROI (pySAred 1.5.3)")
         bkg_ctrl_group.setMinimumSize(0, 0)
         bkg_layout = QVBoxLayout(bkg_ctrl_group)
@@ -345,37 +351,56 @@ class DetectorView(QWidget):
 
         self.chk_enable_bkg = QCheckBox("Enable background ROI subtraction")
         self.chk_enable_bkg.setToolTip(
-            "Use a second ROI of equal width and same Y rows to subtract background counts (pySAred 1.5.3)."
+            "Use a second freely resizable ROI to subtract background counts. "
+            "Counts are scaled by exact pixel area ratio k = A_sig / A_bkg (k = 1 matches pySAred 1.5.3 identically)."
         )
         self.chk_enable_bkg.toggled.connect(self._on_bkg_toggled)
         bkg_layout.addWidget(self.chk_enable_bkg)
 
-        bkg_row = QHBoxLayout()
-        bkg_row.setSpacing(6)
-        bkg_row.addWidget(QLabel("BKG X0:"))
-        self.spin_bkg_x0 = QSpinBox()
-        self.spin_bkg_x0.setMinimumWidth(50)
-        self.spin_bkg_x0.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
-        self.spin_bkg_x0.setRange(0, 1024)
-        self.spin_bkg_x0.setReadOnly(True)
-        self.spin_bkg_x0.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
-        self.spin_bkg_x0.setToolTip("Background X Min (locked to BKG X1 minus signal ROI width, as in pySAred 1.5.3).")
-        bkg_row.addWidget(self.spin_bkg_x0, 1)
+        bkg_grid = QHBoxLayout()
+        bkg_grid.setSpacing(6)
 
-        bkg_row.addWidget(QLabel("X1:"))
+        bkg_vx = QVBoxLayout()
+        bkg_vx.addWidget(QLabel("BKG X Min:"))
+        self.spin_bkg_x0 = QSpinBox()
+        self.spin_bkg_x0.setMinimumWidth(55)
+        self.spin_bkg_x0.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        self.spin_bkg_x0.setRange(0, 1023)
+        self.spin_bkg_x0.valueChanged.connect(self._on_bkg_spin_changed)
+        bkg_vx.addWidget(self.spin_bkg_x0)
+
+        bkg_vx.addWidget(QLabel("BKG X Max:"))
         self.spin_bkg_x1 = QSpinBox()
         self.spin_bkg_x1.setMinimumWidth(55)
         self.spin_bkg_x1.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         self.spin_bkg_x1.setRange(1, 1024)
-        self.spin_bkg_x1.setToolTip("Background X Max (slides the cyan BKG box horizontally while keeping width locked).")
         self.spin_bkg_x1.valueChanged.connect(self._on_bkg_spin_changed)
-        bkg_row.addWidget(self.spin_bkg_x1, 1)
+        bkg_vx.addWidget(self.spin_bkg_x1)
+        bkg_grid.addLayout(bkg_vx)
 
-        self.btn_bkg_auto = QPushButton("Auto")
-        self.btn_bkg_auto.setToolTip("Place BKG ROI at pySAred default [x0 - 2w, x0 - w]")
+        bkg_vy = QVBoxLayout()
+        bkg_vy.addWidget(QLabel("BKG Y Min:"))
+        self.spin_bkg_y0 = QSpinBox()
+        self.spin_bkg_y0.setMinimumWidth(55)
+        self.spin_bkg_y0.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        self.spin_bkg_y0.setRange(0, 1023)
+        self.spin_bkg_y0.valueChanged.connect(self._on_bkg_spin_changed)
+        bkg_vy.addWidget(self.spin_bkg_y0)
+
+        bkg_vy.addWidget(QLabel("BKG Y Max:"))
+        self.spin_bkg_y1 = QSpinBox()
+        self.spin_bkg_y1.setMinimumWidth(55)
+        self.spin_bkg_y1.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        self.spin_bkg_y1.setRange(1, 1024)
+        self.spin_bkg_y1.valueChanged.connect(self._on_bkg_spin_changed)
+        bkg_vy.addWidget(self.spin_bkg_y1)
+        bkg_grid.addLayout(bkg_vy)
+        bkg_layout.addLayout(bkg_grid)
+
+        self.btn_bkg_auto = QPushButton("Reset BKG to Default (Match Signal Size)")
+        self.btn_bkg_auto.setToolTip("Place BKG ROI at pySAred default [x0 - 2w, x0 - w] matching Signal ROI width & Y (k = 1)")
         self.btn_bkg_auto.clicked.connect(self._reset_bkg_to_default)
-        bkg_row.addWidget(self.btn_bkg_auto)
-        bkg_layout.addLayout(bkg_row)
+        bkg_layout.addWidget(self.btn_bkg_auto)
 
         self.lbl_bkg_metrics = QLabel("BKG ROI inactive (enable to subtract background in Scan Charts).")
         self.lbl_bkg_metrics.setWordWrap(True)
@@ -426,6 +451,7 @@ class DetectorView(QWidget):
         splitter.setSizes([680, 360])
 
         main_layout.addWidget(splitter, 1)
+        install_wheel_focus_guard(self)
 
     @property
     def _current_frame_data(self) -> np.ndarray | None:
@@ -468,7 +494,8 @@ class DetectorView(QWidget):
             self.btn_apply_roi.setEnabled(False)
             self.combo_spin_filter.setEnabled(False)
             self.chk_enable_bkg.setEnabled(False)
-            self.spin_bkg_x1.setEnabled(False)
+            for sp in (self.spin_bkg_x0, self.spin_bkg_x1, self.spin_bkg_y0, self.spin_bkg_y1):
+                sp.setEnabled(False)
             self.btn_bkg_auto.setEnabled(False)
             if self._bkg_roi_rect_item is not None:
                 self.plot_2d.removeItem(self._bkg_roi_rect_item)
@@ -527,36 +554,57 @@ class DetectorView(QWidget):
         self.plot_2d.addItem(self._roi_rect_item)
         self._roi_rect_item.setVisible(self.chk_show_roi.isChecked())
 
-        # Setup 2nd Background RectROI (cyan dashed, width & Y locked to Signal ROI)
+        # Setup 2nd Background RectROI (cyan dashed, freely resizable like Signal ROI)
         if self._bkg_roi_rect_item is not None:
             self.plot_2d.removeItem(self._bkg_roi_rect_item)
             self._bkg_roi_rect_item = None
 
         nx = int(scan_data.detector_shape[1])
+        ny = int(scan_data.detector_shape[2])
         params = scan_data.reduction_params
-        if params.bkg_x_bounds is None:
-            params.bkg_x_bounds = default_bkg_x_bounds(pos_x, pos_x + size_x, nx=nx)
-        bx0, bx1 = params.bkg_x_bounds
-        bx_min = min(float(bx0), float(bx1))
+        if params.bkg_roi_bounds is None:
+            if params.bkg_x_bounds is None:
+                bx0, bx1 = default_bkg_x_bounds(pos_x, pos_x + size_x, nx=nx)
+            else:
+                bx0, bx1 = params.bkg_x_bounds
+            params.bkg_roi_bounds = (float(bx0), float(bx1), float(pos_y), float(pos_y + size_y))
+        bx0, bx1, by0, by1 = params.bkg_roi_bounds
+        bx_min, bx_max = min(float(bx0), float(bx1)), max(float(bx0), float(bx1))
+        by_min, by_max = min(float(by0), float(by1)), max(float(by0), float(by1))
+        b_sx = max(1.0, bx_max - bx_min)
+        b_sy = max(1.0, by_max - by_min)
+        params.bkg_x_bounds = (bx_min, bx_min + b_sx)
+        params.bkg_roi_bounds = (bx_min, bx_min + b_sx, by_min, by_min + b_sy)
 
         self._bkg_roi_rect_item = pg.RectROI(
-            pos=[bx_min, pos_y],
-            size=[size_x, size_y],
+            pos=[bx_min, by_min],
+            size=[b_sx, b_sy],
             pen=pg.mkPen("#06b6d4", width=2, style=Qt.PenStyle.DashLine),
             movable=True,
-            resizable=False,
+            resizable=True,
         )
+        self._bkg_roi_rect_item.addScaleHandle([1, 1], [0, 0])
+        self._bkg_roi_rect_item.addScaleHandle([0, 0], [1, 1])
+        self._bkg_roi_rect_item.addScaleHandle([1, 0], [0, 1])
+        self._bkg_roi_rect_item.addScaleHandle([0, 1], [1, 0])
         self._bkg_roi_rect_item.sigRegionChanged.connect(self._on_bkg_roi_dragged)
         self.plot_2d.addItem(self._bkg_roi_rect_item)
         self._bkg_roi_rect_item.setVisible(self.chk_show_roi.isChecked() and params.subtract_background)
 
         self.chk_enable_bkg.setEnabled(True)
-        self.spin_bkg_x1.setEnabled(True)
+        for sp in (self.spin_bkg_x0, self.spin_bkg_x1, self.spin_bkg_y0, self.spin_bkg_y1):
+            sp.setEnabled(True)
         self.btn_bkg_auto.setEnabled(True)
         self._updating_bkg_internally = True
         self.chk_enable_bkg.setChecked(bool(params.subtract_background))
-        self.spin_bkg_x0.setValue(max(0, min(nx, int(round(bx_min)))))
-        self.spin_bkg_x1.setValue(max(1, min(nx, int(round(bx_min + size_x)))))
+        self.spin_bkg_x0.setRange(0, max(0, nx - 1))
+        self.spin_bkg_x1.setRange(1, max(1, nx))
+        self.spin_bkg_y0.setRange(0, max(0, ny - 1))
+        self.spin_bkg_y1.setRange(1, max(1, ny))
+        self.spin_bkg_x0.setValue(max(0, min(nx - 1, int(round(bx_min)))))
+        self.spin_bkg_x1.setValue(max(1, min(nx, int(round(bx_min + b_sx)))))
+        self.spin_bkg_y0.setValue(max(0, min(ny - 1, int(round(by_min)))))
+        self.spin_bkg_y1.setValue(max(1, min(ny, int(round(by_min + b_sy)))))
         self._updating_bkg_internally = False
 
         self._sync_spinboxes_from_bounds(pos_x, pos_x + size_x, pos_y, pos_y + size_y)
@@ -887,38 +935,67 @@ class DetectorView(QWidget):
         self.lbl_roi_status.setText("Reset to default file ROI.")
         self.lbl_roi_status.setStyleSheet("color: #64748b; font-size: 11px;")
 
-    # ------------------------------------------------------------------ Background ROI (pySAred 1.5.3)
+    # ------------------------------------------------------------------ Background ROI (freely resizable)
     def _detector_nx(self) -> int:
         if self.scan_data is not None and self.scan_data.detector_shape is not None:
             return int(self.scan_data.detector_shape[1])
         return 1024
 
+    def _detector_ny(self) -> int:
+        if self.scan_data is not None and self.scan_data.detector_shape is not None:
+            return int(self.scan_data.detector_shape[2])
+        return 1024
+
+    def _get_current_bkg_bounds(self) -> tuple[float, float, float, float]:
+        if self._bkg_roi_rect_item is None:
+            sx0, sx1, sy0, sy1 = self._get_current_roi_bounds()
+            bx0, bx1 = default_bkg_x_bounds(sx0, sx1, nx=self._detector_nx())
+            return (bx0, bx1, sy0, sy1)
+        pos = self._bkg_roi_rect_item.pos()
+        size = self._bkg_roi_rect_item.size()
+        x0, x1 = float(pos.x()), float(pos.x() + size.x())
+        y0, y1 = float(pos.y()), float(pos.y() + size.y())
+        return (min(x0, x1), max(x0, x1), min(y0, y1), max(y0, y1))
+
+    def _sync_bkg_spinboxes(self, bx0: float, bx1: float, by0: float, by1: float) -> None:
+        nx, ny = self._detector_nx(), self._detector_ny()
+        self._updating_bkg_internally = True
+        self.spin_bkg_x0.setValue(max(0, min(nx - 1, int(round(min(bx0, bx1))))))
+        self.spin_bkg_x1.setValue(max(1, min(nx, int(round(max(bx0, bx1))))))
+        self.spin_bkg_y0.setValue(max(0, min(ny - 1, int(round(min(by0, by1))))))
+        self.spin_bkg_y1.setValue(max(1, min(ny, int(round(max(by0, by1))))))
+        self._updating_bkg_internally = False
+
     def _sync_bkg_geometry_to_signal(self, sx0: float, sx1: float, sy0: float, sy1: float) -> None:
-        """Keep the Background ROI width and Y range locked to the Signal ROI (pySAred 1.5.3)."""
+        """Initialize BKG ROI from Signal ROI only if unset; preserve user-resized BKG ROI."""
         if self.scan_data is None or self._bkg_roi_rect_item is None:
             return
-        nx = self._detector_nx()
-        w = max(1.0, abs(sx1 - sx0))
-        y_min = min(sy0, sy1)
-        h = max(1.0, abs(sy1 - sy0))
-
+        nx, ny = self._detector_nx(), self._detector_ny()
         params = self.scan_data.reduction_params
-        if params.bkg_x_bounds is None:
-            bx0, bx1 = default_bkg_x_bounds(sx0, sx1, nx=nx)
+        if params.bkg_roi_bounds is None:
+            if params.bkg_x_bounds is None:
+                bx0, bx1 = default_bkg_x_bounds(sx0, sx1, nx=nx)
+            else:
+                bx0, bx1 = params.bkg_x_bounds
+            by0, by1 = min(sy0, sy1), max(sy0, sy1)
+            params.bkg_roi_bounds = (float(bx0), float(bx1), float(by0), float(by1))
+            params.bkg_x_bounds = (float(bx0), float(bx1))
         else:
-            _, prev_x1 = params.bkg_x_bounds
-            bx1 = max(w, min(float(nx), float(prev_x1)))
-            bx0 = max(0.0, bx1 - w)
-            bx1 = bx0 + w
-        params.bkg_x_bounds = (bx0, bx1)
-        self.scan_data.working_bkg_counts = None
+            bx0, bx1, by0, by1 = params.bkg_roi_bounds
+            bx0, bx1 = max(0.0, min(float(nx), float(bx0))), max(0.0, min(float(nx), float(bx1)))
+            by0, by1 = max(0.0, min(float(ny), float(by0))), max(0.0, min(float(ny), float(by1)))
+            if bx1 <= bx0:
+                bx1 = min(float(nx), bx0 + 1.0)
+            if by1 <= by0:
+                by1 = min(float(ny), by0 + 1.0)
+            params.bkg_roi_bounds = (bx0, bx1, by0, by1)
+            params.bkg_x_bounds = (bx0, bx1)
 
         self._updating_bkg_internally = True
-        self._bkg_roi_rect_item.setPos([bx0, y_min])
-        self._bkg_roi_rect_item.setSize([w, h])
-        self.spin_bkg_x0.setValue(max(0, min(nx, int(round(bx0)))))
-        self.spin_bkg_x1.setValue(max(1, min(nx, int(round(bx1)))))
+        self._bkg_roi_rect_item.setPos([bx0, by0])
+        self._bkg_roi_rect_item.setSize([max(1.0, bx1 - bx0), max(1.0, by1 - by0)])
         self._updating_bkg_internally = False
+        self._sync_bkg_spinboxes(bx0, bx1, by0, by1)
 
     def _on_bkg_toggled(self, checked: bool) -> None:
         if self._updating_bkg_internally or self.scan_data is None:
@@ -935,25 +1012,19 @@ class DetectorView(QWidget):
         self.bkg_roi_changed.emit(self.scan_data.file_path)
 
     def _on_bkg_roi_dragged(self) -> None:
-        """Horizontal drag of cyan BKG ROI: lock Y and width to Signal ROI."""
+        """Free drag or resize of the cyan BKG ROI (same behavior as the yellow Signal ROI)."""
         if self._updating_bkg_internally or self.scan_data is None or self._bkg_roi_rect_item is None:
             return
         sx0, sx1, sy0, sy1 = self._get_current_roi_bounds()
-        nx = self._detector_nx()
-        w = max(1.0, abs(sx1 - sx0))
-        y_min = min(sy0, sy1)
-        h = max(1.0, abs(sy1 - sy0))
+        nx, ny = float(self._detector_nx()), float(self._detector_ny())
+        bx0, bx1, by0, by1 = self._get_current_bkg_bounds()
+        bx0 = max(0.0, min(nx - 1.0, bx0))
+        bx1 = max(bx0 + 1.0, min(nx, bx1))
+        by0 = max(0.0, min(ny - 1.0, by0))
+        by1 = max(by0 + 1.0, min(ny, by1))
 
-        bx0 = max(0.0, min(float(nx) - w, float(self._bkg_roi_rect_item.pos().x())))
-        bx1 = bx0 + w
-
-        self._updating_bkg_internally = True
-        self._bkg_roi_rect_item.setPos([bx0, y_min])
-        self._bkg_roi_rect_item.setSize([w, h])
-        self.spin_bkg_x0.setValue(max(0, min(nx, int(round(bx0)))))
-        self.spin_bkg_x1.setValue(max(1, min(nx, int(round(bx1)))))
-        self._updating_bkg_internally = False
-
+        self._sync_bkg_spinboxes(bx0, bx1, by0, by1)
+        self.scan_data.reduction_params.bkg_roi_bounds = (bx0, bx1, by0, by1)
         self.scan_data.reduction_params.bkg_x_bounds = (bx0, bx1)
         self.scan_data.working_bkg_counts = None
         if self._frame_data is not None:
@@ -962,23 +1033,27 @@ class DetectorView(QWidget):
             self._refresh_bkg_metrics(sx0, sx1, sy0, sy1)
         self.bkg_roi_changed.emit(self.scan_data.file_path)
 
-    def _on_bkg_spin_changed(self, value: int) -> None:
+    def _on_bkg_spin_changed(self, _value: int = 0) -> None:
         if self._updating_bkg_internally or self.scan_data is None or self._bkg_roi_rect_item is None:
             return
         sx0, sx1, sy0, sy1 = self._get_current_roi_bounds()
-        nx = self._detector_nx()
-        w = max(1.0, abs(sx1 - sx0))
-        bx1 = max(w, min(float(nx), float(value)))
-        bx0 = max(0.0, bx1 - w)
-        bx1 = bx0 + w
+        x0 = float(self.spin_bkg_x0.value())
+        x1 = float(self.spin_bkg_x1.value())
+        y0 = float(self.spin_bkg_y0.value())
+        y1 = float(self.spin_bkg_y1.value())
+        bx0, bx1 = min(x0, x1), max(x0, x1)
+        by0, by1 = min(y0, y1), max(y0, y1)
+        size_x = max(1.0, bx1 - bx0)
+        size_y = max(1.0, by1 - by0)
+        bx1 = bx0 + size_x
+        by1 = by0 + size_y
 
         self._updating_bkg_internally = True
-        self._bkg_roi_rect_item.setPos([bx0, min(sy0, sy1)])
-        self._bkg_roi_rect_item.setSize([w, max(1.0, abs(sy1 - sy0))])
-        self.spin_bkg_x0.setValue(max(0, min(nx, int(round(bx0)))))
-        self.spin_bkg_x1.setValue(max(1, min(nx, int(round(bx1)))))
+        self._bkg_roi_rect_item.setPos([bx0, by0])
+        self._bkg_roi_rect_item.setSize([size_x, size_y])
         self._updating_bkg_internally = False
 
+        self.scan_data.reduction_params.bkg_roi_bounds = (bx0, bx1, by0, by1)
         self.scan_data.reduction_params.bkg_x_bounds = (bx0, bx1)
         self.scan_data.working_bkg_counts = None
         if self._frame_data is not None:
@@ -993,7 +1068,9 @@ class DetectorView(QWidget):
         sx0, sx1, sy0, sy1 = self._get_current_roi_bounds()
         nx = self._detector_nx()
         bx0, bx1 = default_bkg_x_bounds(sx0, sx1, nx=nx)
+        by0, by1 = min(sy0, sy1), max(sy0, sy1)
         self.scan_data.reduction_params.bkg_x_bounds = (bx0, bx1)
+        self.scan_data.reduction_params.bkg_roi_bounds = (bx0, bx1, by0, by1)
         self.scan_data.working_bkg_counts = None
         self._sync_bkg_geometry_to_signal(sx0, sx1, sy0, sy1)
         if self._frame_data is not None:
@@ -1026,16 +1103,23 @@ class DetectorView(QWidget):
             self.lbl_bkg_metrics.setText("BKG ROI inactive (enable to subtract background in Scan Charts).")
             self.lbl_bkg_metrics.setStyleSheet("color: #64748b; font-size: 11px;")
             return
-        nx = self._detector_nx()
-        bx_bounds = params.bkg_x_bounds or default_bkg_x_bounds(sx0, sx1, nx=nx)
-        overlap = rois_overlap_x((sx0, sx1), bx_bounds, nx=nx)
+        nx, ny = self._detector_nx(), self._detector_ny()
+        sig_roi = (sx0, sx1, sy0, sy1)
+        bx0, bx1, by0, by1 = resolve_bkg_roi(sig_roi, params.bkg_roi_bounds, params.bkg_x_bounds, nx, ny)
+        bkg_roi = (float(bx0), float(bx1), float(by0), float(by1))
+        overlap = rois_overlap_2d(sig_roi, bkg_roi, nx=nx, ny=ny)
+        try:
+            area_k = roi_area_ratio(sig_roi, bkg_roi, nx, ny)
+            k_txt = f" | area scale k={area_k:.3g}" if abs(area_k - 1.0) > 1e-4 else " | k=1"
+        except ValueError:
+            k_txt = " | empty BKG"
+        _, _, isy0, isy1 = pixel_bounds(sig_roi, nx, ny)
+        y_note = " (Y differs from signal)" if (by0, by1) != (isy0, isy1) else ""
         if self._frame_data is not None:
-            ny_f, nx_f = self._frame_data.shape
-            bx0, bx1, by0, by1 = bkg_roi_from_signal((sx0, sx1, sy0, sy1), bx_bounds, nx_f, ny_f)
-            bkg_cnt, _, _ = integrate_roi_2d(self._frame_data, (float(bx0), float(bx1), float(by0), float(by1)))
-            count_txt = f"BKG Frame Counts: <b>{bkg_cnt:,.0f}</b> (X [{bx0}..{bx1}], Y [{by0}..{by1}])"
+            bkg_cnt, _, _ = integrate_roi_2d(self._frame_data, bkg_roi)
+            count_txt = f"BKG Frame Counts: <b>{bkg_cnt:,.0f}</b> (X [{bx0}..{bx1}], Y [{by0}..{by1}]{k_txt}){y_note}"
         else:
-            count_txt = f"BKG X [{bx_bounds[0]:.0f}..{bx_bounds[1]:.0f}] (width- & Y-locked)"
+            count_txt = f"BKG X [{bx0}..{bx1}], Y [{by0}..{by1}]{k_txt}{y_note}"
         if overlap:
             self.lbl_bkg_metrics.setText(f"⚠ BKG ROI overlaps Signal ROI! {count_txt}")
             self.lbl_bkg_metrics.setStyleSheet("color: #d97706; font-weight: 600; font-size: 11px;")
@@ -1227,8 +1311,9 @@ class DetectorView(QWidget):
         ix0, ix1, iy0, iy1 = pixel_bounds((x0, x1, y0, y1), frame.shape[1], frame.shape[0])
         bkg_on = bool(self.scan_data is not None and self.scan_data.reduction_params.subtract_background)
         if bkg_on and iy1 > iy0:
-            bx0, bx1, _, _ = bkg_roi_from_signal(
+            bx0, bx1, _, _ = resolve_bkg_roi(
                 (x0, x1, y0, y1),
+                self.scan_data.reduction_params.bkg_roi_bounds,
                 self.scan_data.reduction_params.bkg_x_bounds,
                 frame.shape[1],
                 frame.shape[0],

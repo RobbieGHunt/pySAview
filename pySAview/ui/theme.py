@@ -8,9 +8,11 @@ import pyqtgraph as pg
 from PyQt6.QtGui import QColor
 
 RESOURCES_DIR = Path(__file__).resolve().parent.parent / "resources"
+CHEVRON_LEFT_LIGHT = (RESOURCES_DIR / "chevron_left.svg").as_posix()
 CHEVRON_RIGHT_LIGHT = (RESOURCES_DIR / "chevron_right.svg").as_posix()
 CHEVRON_DOWN_LIGHT = (RESOURCES_DIR / "chevron_down.svg").as_posix()
 CHEVRON_UP_LIGHT = (RESOURCES_DIR / "chevron_up.svg").as_posix()
+CHEVRON_LEFT_DARK = (RESOURCES_DIR / "chevron_left_dark.svg").as_posix()
 CHEVRON_RIGHT_DARK = (RESOURCES_DIR / "chevron_right_dark.svg").as_posix()
 CHEVRON_DOWN_DARK = (RESOURCES_DIR / "chevron_down_dark.svg").as_posix()
 CHEVRON_UP_DARK = (RESOURCES_DIR / "chevron_up_dark.svg").as_posix()
@@ -54,6 +56,44 @@ QTabBar::tab:selected {{
 QTabBar::tab:hover:!selected {{
     background: #f1f5f9;
     color: #0f172a;
+}}
+
+QTabBar::scroller {{
+    width: 44px;
+}}
+
+QTabBar QToolButton {{
+    background-color: #f1f5f9;
+    border: 1px solid #cbd5e1;
+    border-radius: 5px;
+    margin: 2px 1px;
+    padding: 0px;
+}}
+
+QTabBar QToolButton:hover {{
+    background-color: #e2e8f0;
+    border-color: #94a3b8;
+}}
+
+QTabBar QToolButton:pressed {{
+    background-color: #cbd5e1;
+}}
+
+QTabBar QToolButton:disabled {{
+    background-color: #f8fafc;
+    border-color: #e2e8f0;
+}}
+
+QTabBar QToolButton::left-arrow {{
+    image: url("{CHEVRON_LEFT_LIGHT}");
+    width: 12px;
+    height: 12px;
+}}
+
+QTabBar QToolButton::right-arrow {{
+    image: url("{CHEVRON_RIGHT_LIGHT}");
+    width: 12px;
+    height: 12px;
 }}
 
 QHeaderView::section {{
@@ -438,6 +478,44 @@ QTabBar::tab:selected {{
 QTabBar::tab:hover:!selected {{
     background: #1e293b;
     color: #f1f5f9;
+}}
+
+QTabBar::scroller {{
+    width: 44px;
+}}
+
+QTabBar QToolButton {{
+    background-color: #0f172a;
+    border: 1px solid #334155;
+    border-radius: 5px;
+    margin: 2px 1px;
+    padding: 0px;
+}}
+
+QTabBar QToolButton:hover {{
+    background-color: #1e293b;
+    border-color: #475569;
+}}
+
+QTabBar QToolButton:pressed {{
+    background-color: #334155;
+}}
+
+QTabBar QToolButton:disabled {{
+    background-color: #0b1120;
+    border-color: #1e293b;
+}}
+
+QTabBar QToolButton::left-arrow {{
+    image: url("{CHEVRON_LEFT_DARK}");
+    width: 12px;
+    height: 12px;
+}}
+
+QTabBar QToolButton::right-arrow {{
+    image: url("{CHEVRON_RIGHT_DARK}");
+    width: 12px;
+    height: 12px;
 }}
 
 QHeaderView::section {{

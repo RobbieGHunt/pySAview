@@ -60,9 +60,10 @@ class ReductionParams:
     distance_s1_mm: float = DEFAULT_DISTANCE_S1_TO_SAMPLE_MM
     distance_s2_mm: float = DEFAULT_DISTANCE_S2_TO_SAMPLE_MM
 
-    # Background subtraction from 2nd ROI (same Y bounds as signal ROI)
+    # Background subtraction from 2nd ROI (freely resizable; area-scaled if A_bkg != A_sig)
     subtract_background: bool = False
     bkg_x_bounds: tuple[float, float] | None = None
+    bkg_roi_bounds: tuple[float, float, float, float] | None = None
     bkg_skip_qz: float = 0.0
 
     # Sample curvature correction (shear angle in radians inside ROI X window)
@@ -91,6 +92,11 @@ class ReductionParams:
         return replace(
             self,
             bkg_x_bounds=None if self.bkg_x_bounds is None else (float(self.bkg_x_bounds[0]), float(self.bkg_x_bounds[1])),
+            bkg_roi_bounds=(
+                None
+                if self.bkg_roi_bounds is None
+                else tuple(float(v) for v in self.bkg_roi_bounds)
+            ),
         )
 
     def has_active_reductions(self) -> bool:
@@ -114,7 +120,15 @@ class ReductionParams:
         if abs(self.curvature_rad) > 0.0:
             parts.append(f"curvature={self.curvature_rad:g} rad")
         if self.subtract_background:
-            bx = f" X=[{self.bkg_x_bounds[0]:.0f}..{self.bkg_x_bounds[1]:.0f}]" if self.bkg_x_bounds else ""
+            if self.bkg_roi_bounds is not None:
+                bx = (
+                    f" X=[{self.bkg_roi_bounds[0]:.0f}..{self.bkg_roi_bounds[1]:.0f}],"
+                    f" Y=[{self.bkg_roi_bounds[2]:.0f}..{self.bkg_roi_bounds[3]:.0f}]"
+                )
+            elif self.bkg_x_bounds is not None:
+                bx = f" X=[{self.bkg_x_bounds[0]:.0f}..{self.bkg_x_bounds[1]:.0f}]"
+            else:
+                bx = ""
             skip = f", skip Qz<{self.bkg_skip_qz:g}" if self.bkg_skip_qz > 0 else ""
             parts.append(f"BKG sub{bx}{skip}")
         if self.overillumination:
@@ -177,6 +191,7 @@ def reduce_counts_pysared(
     s1_mm=None,
     s2_mm=None,
     bkg_counts=None,
+    bkg_area_ratio: float = 1.0,
     params: ReductionParams | None = None,
     resolution_angle_unit: Literal["Qz", "Degrees", "Radians"] = "Qz",
 ) -> ReductionResult:
@@ -294,7 +309,11 @@ def reduce_counts_pysared(
             safe_e = np.where(np.isfinite(err), err, 0.0)
             safe_b = np.where(np.isfinite(bkg_arr) & (bkg_arr >= 0.0), bkg_arr, 0.0)
             safe_q = np.where(np.isfinite(qz), qz, -np.inf)
-            intens, err = subtract_background_pysared(safe_i, safe_e, safe_b, safe_q, bkg_skip_qz=p.bkg_skip_qz)
+            intens, err = subtract_background_pysared(
+                safe_i, safe_e, safe_b, safe_q,
+                bkg_skip_qz=p.bkg_skip_qz,
+                area_ratio=bkg_area_ratio,
+            )
 
     # Step 3: Monitor / Dwell-time normalization (pySAred 1.5.3 convention)
     valid = reasons == ""

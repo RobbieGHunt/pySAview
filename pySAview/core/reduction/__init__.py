@@ -38,6 +38,9 @@ NumPy/SciPy (with zero ``PyQt6``, ``pyqtgraph``, or ``h5py`` dependencies):
 10. :mod:`~pySAview.core.reduction.pysared`
     Per-scan ``ReductionParams``, the pySAred 1.5.3 reduction/error pipeline,
     and per-curve point trimming.
+11. :mod:`~pySAview.core.reduction.plateau`
+    Automated pre-critical-edge (total reflection plateau -> 1) scale-factor
+    estimation robust to imperfect overillumination and direct-beam spillover.
 """
 
 from pySAview.core.reduction.angle_calibration import (
@@ -62,6 +65,10 @@ from pySAview.core.reduction.angle_calibration import (
 from pySAview.core.reduction.background import (
     bkg_roi_from_signal,
     default_bkg_x_bounds,
+    resolve_bkg_roi,
+    roi_area_pixels,
+    roi_area_ratio,
+    rois_overlap_2d,
     rois_overlap_x,
     subtract_background_pysared,
 )
@@ -98,6 +105,11 @@ from pySAview.core.reduction.overillumination import (
     compute_overillumination_series,
     extract_slit_widths,
     overillumination_coeff,
+)
+from pySAview.core.reduction.plateau import (
+    PlateauEstimate,
+    estimate_multi_curve_plateau_scale,
+    estimate_plateau_scale,
 )
 from pySAview.core.reduction.polarization import (
     AsymmetryMap,
@@ -199,8 +211,16 @@ __all__ = [
     # background
     "bkg_roi_from_signal",
     "default_bkg_x_bounds",
+    "resolve_bkg_roi",
+    "roi_area_pixels",
+    "roi_area_ratio",
+    "rois_overlap_2d",
     "rois_overlap_x",
     "subtract_background_pysared",
+    # plateau
+    "PlateauEstimate",
+    "estimate_multi_curve_plateau_scale",
+    "estimate_plateau_scale",
     # resolution
     "DEFAULT_WAVELENGTH_RESOLUTION",
     "FWHM_TO_SIGMA",

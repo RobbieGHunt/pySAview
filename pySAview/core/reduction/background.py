@@ -1,17 +1,20 @@
 """Background ROI geometry and subtraction following pySAred 1.5.3.
 
-Implements the single background ROI convention from ``pySAred_V1.5.3.py``:
+Implements the background ROI convention from ``pySAred_V1.5.3.py`` and extends
+it cleanly to freely resizable background ROIs via exact pixel-area scaling:
 
-* The background ROI shares the signal ROI's vertical ``[y0, y1)`` bounds and
-  horizontal pixel width ``w = x1 - x0``.
-* By default it sits one ROI-width to the left of the signal ROI:
-  ``[x0 - 2*w, x0 - w]`` (leaving a gap of width ``w`` between signal and
-  background so specular tails do not leak into the background estimate).
-* For every point with ``Qz > bkg_skip_qz`` and ``bkg_counts > 0``:
+* By default the background ROI shares the signal ROI's vertical ``[y0, y1)``
+  bounds and horizontal pixel width ``w = x1 - x0``, sitting one ROI-width to
+  the left: ``[x0 - 2*w, x0 - w]``.
+* If the background ROI is resized independently (area ``A_bkg != A_sig``),
+  the exact area ratio ``k = A_sig / A_bkg`` scales the background counts and
+  propagates Poisson variance rigorously:
 
-      IntensErr = sqrt(Intens + Intens_bkg)
-      Intens    = Intens - Intens_bkg
+      I_net = I_sig - k * I_bkg
+      dI    = sqrt(max(I_sig, 0) + k^2 * I_bkg)
 
+  When ``A_bkg == A_sig`` (``k == 1``), this reduces identically to pySAred
+  1.5.3's ``Intens - Intens_bkg`` and ``sqrt(Intens + Intens_bkg)``.
   Points with ``Qz <= bkg_skip_qz`` or ``bkg_counts <= 0`` are left unchanged.
 """
 
@@ -24,6 +27,10 @@ from pySAview.core.reduction.roi_extraction import pixel_bounds
 __all__ = [
     "bkg_roi_from_signal",
     "default_bkg_x_bounds",
+    "resolve_bkg_roi",
+    "roi_area_pixels",
+    "roi_area_ratio",
+    "rois_overlap_2d",
     "rois_overlap_x",
     "subtract_background_pysared",
 ]
@@ -76,6 +83,61 @@ def bkg_roi_from_signal(
     return bx0, bx1, sy0, sy1
 
 
+def resolve_bkg_roi(
+    signal_roi: tuple[float, float, float, float],
+    bkg_roi_bounds: tuple[float, float, float, float] | None,
+    bkg_x_bounds: tuple[float, float] | None,
+    nx: int,
+    ny: int,
+) -> tuple[int, int, int, int]:
+    """Resolve integer half-open ``(bx0, bx1, by0, by1)`` for a free or X-only BKG ROI.
+
+    Prefers the full 4-tuple ``bkg_roi_bounds`` when present; otherwise falls
+    back to ``bkg_x_bounds`` sharing the signal ROI's Y range (pySAred 1.5.3).
+    """
+    if bkg_roi_bounds is not None:
+        return pixel_bounds(bkg_roi_bounds, nx, ny)
+    return bkg_roi_from_signal(signal_roi, bkg_x_bounds, nx, ny)
+
+
+def roi_area_pixels(
+    roi: tuple[float, float, float, float],
+    nx: int,
+    ny: int,
+) -> int:
+    """Exact integer pixel area ``(x1 - x0) * (y1 - y0)`` of an ROI."""
+    x0, x1, y0, y1 = pixel_bounds(roi, nx, ny)
+    return max(0, x1 - x0) * max(0, y1 - y0)
+
+
+def roi_area_ratio(
+    signal_roi: tuple[float, float, float, float],
+    bkg_roi: tuple[float, float, float, float],
+    nx: int,
+    ny: int,
+) -> float:
+    """Exact area scale ``A_sig / A_bkg`` (raises ``ValueError`` if ``A_bkg == 0``)."""
+    a_sig = roi_area_pixels(signal_roi, nx, ny)
+    a_bkg = roi_area_pixels(bkg_roi, nx, ny)
+    if a_bkg <= 0:
+        raise ValueError("Background ROI has zero pixel area.")
+    return float(a_sig) / float(a_bkg)
+
+
+def rois_overlap_2d(
+    signal_roi: tuple[float, float, float, float],
+    bkg_roi: tuple[float, float, float, float],
+    nx: int = 1024,
+    ny: int = 1024,
+) -> bool:
+    """True when the pixel-rounded 2D signal and background rectangles intersect."""
+    sx0, sx1, sy0, sy1 = pixel_bounds(signal_roi, nx, ny)
+    bx0, bx1, by0, by1 = pixel_bounds(bkg_roi, nx, ny)
+    x_hit = sx1 > sx0 and bx1 > bx0 and not (bx1 <= sx0 or sx1 <= bx0)
+    y_hit = sy1 > sy0 and by1 > by0 and not (by1 <= sy0 or sy1 <= by0)
+    return x_hit and y_hit
+
+
 def rois_overlap_x(
     signal_x: tuple[float, float],
     bkg_x: tuple[float, float],
@@ -93,17 +155,24 @@ def subtract_background_pysared(
     bkg_intensity: np.ndarray,
     qz: np.ndarray,
     bkg_skip_qz: float = 0.0,
+    area_ratio: float = 1.0,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Subtract background ROI counts using pySAred 1.5.3's exact rule.
+    """Subtract background ROI counts using pySAred 1.5.3's rule with optional area scaling.
 
     Only points with finite ``qz > bkg_skip_qz`` and finite ``bkg_intensity > 0``
-    are subtracted, with ``err = sqrt(max(intensity, 0) + bkg_intensity)`` and
-    ``net = intensity - bkg_intensity``.
+    are subtracted, with:
+
+        net = intensity - area_ratio * bkg_intensity
+        err = sqrt(max(intensity, 0) + (area_ratio ** 2) * bkg_intensity)
+
+    When ``area_ratio == 1.0`` (equal-area signal and background ROIs), this is
+    identical to pySAred 1.5.3.
     """
     intens = np.asarray(intensity, dtype=float)
     err = np.asarray(intensity_err, dtype=float)
     bkg = np.asarray(bkg_intensity, dtype=float)
     q = np.asarray(qz, dtype=float)
+    k = float(area_ratio)
 
     if not (intens.ndim == err.ndim == bkg.ndim == q.ndim == 1):
         raise ValueError("Background subtraction inputs must be 1D arrays.")
@@ -111,12 +180,14 @@ def subtract_background_pysared(
         raise ValueError("Background subtraction arrays must have matching lengths.")
     if not np.isfinite(bkg_skip_qz):
         raise ValueError("Background Qz skip threshold must be finite.")
+    if not np.isfinite(k) or k <= 0.0:
+        raise ValueError("Background area ratio must be finite and strictly positive.")
 
     out_i = intens.copy()
     out_err = err.copy()
 
     apply = np.isfinite(intens) & np.isfinite(bkg) & np.isfinite(q) & (q > float(bkg_skip_qz)) & (bkg > 0.0)
-    out_err[apply] = np.sqrt(np.maximum(intens[apply], 0.0) + bkg[apply])
-    out_i[apply] = intens[apply] - bkg[apply]
+    out_err[apply] = np.sqrt(np.maximum(intens[apply], 0.0) + (k * k) * bkg[apply])
+    out_i[apply] = intens[apply] - k * bkg[apply]
 
     return out_i, out_err

@@ -41,9 +41,10 @@ from pySAview.ui.colormap_range import ColormapRange
 from pySAview.core.waterfall import waterfall_order, display_values
 from pySAview.core.export_tables import reflectivity_table, write_pysared_dat, write_table
 from pySAview.core.models import ScanData
-from pySAview.core.reduction.background import bkg_roi_from_signal, default_bkg_x_bounds
+from pySAview.core.reduction.background import default_bkg_x_bounds, resolve_bkg_roi, roi_area_ratio
 from pySAview.core.reduction.curvature import apply_curvature_by_spin
 from pySAview.core.reduction.overillumination import extract_slit_widths
+from pySAview.core.reduction.plateau import estimate_multi_curve_plateau_scale
 from pySAview.core.reduction.pysared import reduce_counts_pysared, trim_curve_mask
 from pySAview.core.reduction.roi_extraction import pixel_bounds
 from pySAview.core.scan_calculations import (
@@ -57,9 +58,10 @@ from pySAview.core.normalization import (
 from pySAview.ui import icons
 from pySAview.ui.flow_layout import FlowContainer, configure_compact_combo, fit_combo_popup
 from pySAview.ui.plot_tools import (
-    TABLE_FILTERS, ask_output_path, export_plot_image, install_context_export, tool_button,
+    ScientificAxisItem, TABLE_FILTERS, ask_output_path, export_plot_image, install_context_export, tool_button,
 )
 from pySAview.ui.theme import apply_plot_theme
+from pySAview.ui.wheel_guard import install_wheel_focus_guard
 
 
 OVERFLOW_NOTE = ("Offset exceeds display range; reduce spacing. Overflowing points are hidden; "
@@ -84,6 +86,7 @@ class ScanPlotView(QWidget):
         self._overlay_keys: list[str] = []
         self._has_explicit_overlay_keys: bool = False
         self._syncing_reduction_ui: bool = False
+        self._last_synced_scan_path: str | None = None
 
         # Compatibility list widget and buttons kept for test backwards-compatibility
         self.list_datasets = QListWidget()
@@ -427,8 +430,8 @@ class ScanPlotView(QWidget):
         toolbar_row.addWidget(self.lbl_coords)
         right_layout.addWidget(toolbar_row)
 
-        # pyqtgraph Plot
-        self.plot_widget = pg.PlotWidget()
+        # pyqtgraph Plot (consistent 10ⁿ scientific Y-axis ticks across all decades)
+        self.plot_widget = pg.PlotWidget(axisItems={"left": ScientificAxisItem(orientation="left")})
         self.plot_widget.setMinimumSize(0, 0)
         self.plot_widget.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
         install_context_export(self.plot_widget, self._default_export_name("reflectivity", ".png"), self._source_paths)
@@ -479,6 +482,7 @@ class ScanPlotView(QWidget):
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 3)
         splitter.setSizes([320, 760])
+        install_wheel_focus_guard(self)
 
     # --------------------------------------------------------- Reduction Tab (pySAred 1.5.3)
     def _build_reduction_tab(self) -> QWidget:
@@ -604,6 +608,20 @@ class ScanPlotView(QWidget):
         self.spin_scale_factor.setEnabled(False)
         scale_form.addRow("Scale factor:", self.spin_scale_factor)
         scale_layout.addLayout(scale_form)
+        self.btn_auto_scale = QPushButton("Auto (Plateau → 1)")
+        self.btn_auto_scale.setToolTip(
+            "Estimate the pre-critical-edge total-reflection plateau (R = 1) after active "
+            "background, curvature, normalization, and overillumination corrections."
+        )
+        self.btn_auto_scale.clicked.connect(self._on_auto_plateau_scale)
+        scale_layout.addWidget(self.btn_auto_scale)
+        self.lbl_plateau_info = QLabel("")
+        self.lbl_plateau_info.setWordWrap(True)
+        self.lbl_plateau_info.setMinimumWidth(0)
+        self.lbl_plateau_info.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.lbl_plateau_info.setStyleSheet("color: #64748b; font-size: 11px;")
+        self.lbl_plateau_info.setVisible(False)
+        scale_layout.addWidget(self.lbl_plateau_info)
         layout.addWidget(grp_scale)
 
         # 5. Angle Offset, Instrument Geometry & Resolution
@@ -714,8 +732,9 @@ class ScanPlotView(QWidget):
         for w in (self.btn_copy_reduction, self.chk_overillumination, self.spin_sample_length,
                   self.chk_show_overill_curve, self.chk_subtract_bkg, self.spin_bkg_skip_qz,
                   self.btn_jump_detector, self.spin_red_curvature, self.btn_jump_offspec,
-                  self.chk_scale_factor, self.spin_theta_offset, self.spin_wavelength_res,
-                  self.spin_d1, self.spin_d2, self.combo_resolution_mode, self.chk_include_resolution,
+                  self.chk_scale_factor, self.btn_auto_scale, self.spin_theta_offset,
+                  self.spin_wavelength_res, self.spin_d1, self.spin_d2,
+                  self.combo_resolution_mode, self.chk_include_resolution,
                   self.spin_skip_left, self.spin_skip_right, self.chk_remove_zeros,
                   self.combo_dat_angle, self.btn_export_dat):
             w.setEnabled(enabled)
@@ -734,11 +753,19 @@ class ScanPlotView(QWidget):
     def _sync_reduction_controls(self) -> None:
         scan = self.scan_data
         if scan is None:
+            self._last_synced_scan_path = None
             self.lbl_red_scan.setText("No active scan")
             self.lbl_red_slits.setText("Slits: --")
-            self.lbl_red_bkg_bounds.setText("BKG X: --")
+            self.lbl_red_bkg_bounds.setText("BKG ROI: --")
+            self.lbl_plateau_info.setText("")
+            self.lbl_plateau_info.setVisible(False)
             self._set_reduction_controls_enabled(False)
             return
+
+        if scan.file_path != self._last_synced_scan_path:
+            self._last_synced_scan_path = scan.file_path
+            self.lbl_plateau_info.setText("")
+            self.lbl_plateau_info.setVisible(False)
 
         p = scan.reduction_params
         self._syncing_reduction_ui = True
@@ -759,7 +786,19 @@ class ScanPlotView(QWidget):
             else:
                 self.lbl_red_slits.setText("Slits: unavailable (s1h/s2h missing)")
 
-            if p.bkg_x_bounds is not None:
+            sig_roi = scan.working_detector_roi or scan.detector_roi
+            if scan.has_detector_2d and scan.detector_shape and sig_roi is not None:
+                _, nx, ny = scan.detector_shape
+                sx0, sx1, sy0, sy1 = pixel_bounds(sig_roi, nx, ny)
+                bx0, bx1, by0, by1 = resolve_bkg_roi(sig_roi, p.bkg_roi_bounds, p.bkg_x_bounds, nx, ny)
+                area_k = roi_area_ratio(sig_roi, (bx0, bx1, by0, by1), nx, ny)
+                if abs(area_k - 1.0) > 1e-6 or (by0, by1) != (sy0, sy1):
+                    self.lbl_red_bkg_bounds.setText(
+                        f"BKG: X [{bx0}..{bx1}], Y [{by0}..{by1}] (k={area_k:.3g})"
+                    )
+                else:
+                    self.lbl_red_bkg_bounds.setText(f"BKG X: [{bx0} .. {bx1}] px")
+            elif p.bkg_x_bounds is not None:
                 self.lbl_red_bkg_bounds.setText(f"BKG X: [{p.bkg_x_bounds[0]:.0f} .. {p.bkg_x_bounds[1]:.0f}] px")
             else:
                 self.lbl_red_bkg_bounds.setText("BKG X: auto [x0 − 2w, x0 − w]")
@@ -822,13 +861,123 @@ class ScanPlotView(QWidget):
             return
         p = self.scan_data.reduction_params
         p.subtract_background = bool(checked)
-        if checked and p.bkg_x_bounds is None and self.scan_data.has_detector_2d and self.scan_data.detector_shape:
+        if checked and self.scan_data.has_detector_2d and self.scan_data.detector_shape:
             roi = self.scan_data.working_detector_roi or self.scan_data.detector_roi
             if roi is not None:
-                p.bkg_x_bounds = default_bkg_x_bounds(roi[0], roi[1], nx=int(self.scan_data.detector_shape[1]))
+                _, nx, ny = self.scan_data.detector_shape
+                if p.bkg_x_bounds is None:
+                    p.bkg_x_bounds = default_bkg_x_bounds(roi[0], roi[1], nx=int(nx))
+                if p.bkg_roi_bounds is None:
+                    bx0, bx1, by0, by1 = resolve_bkg_roi(roi, None, p.bkg_x_bounds, nx, ny)
+                    p.bkg_roi_bounds = (float(bx0), float(bx1), float(by0), float(by1))
         self.scan_data.working_bkg_counts = None
         self._sync_reduction_controls()
         self.background_toggled.emit(self.scan_data.file_path)
+        self._update_plot()
+
+    def _on_auto_plateau_scale(self) -> None:
+        """Automatically estimate the pre-critical-edge plateau scale factor (R -> 1)."""
+        scan = self.scan_data
+        if scan is None:
+            return
+        p = scan.reduction_params
+        y_key = self.combo_y.currentData()
+        if not y_key or y_key not in scan.variables:
+            y_key = "ROI_Counts" if "ROI_Counts" in scan.variables else next(iter(scan.variables), None)
+        if not y_key:
+            return
+
+        th_var = scan.variables.get("th")
+        if th_var is None:
+            self.lbl_plateau_info.setStyleSheet("color: #d97706; font-size: 11px;")
+            self.lbl_plateau_info.setText("Auto plateau needs an incident-angle (th) channel.")
+            self.lbl_plateau_info.setVisible(True)
+            return
+
+        y_var = scan.variables[y_key]
+        raw_y, bkg_counts, bkg_area_ratio, _ = self._effective_roi_and_bkg_counts(scan, y_key)
+        th_raw = np.asarray(th_var.data, dtype=float)
+        if th_raw.shape != raw_y.shape:
+            self.lbl_plateau_info.setStyleSheet("color: #d97706; font-size: 11px;")
+            self.lbl_plateau_info.setText("Auto plateau skipped: th length differs from Y channel.")
+            self.lbl_plateau_info.setVisible(True)
+            return
+
+        norm_mode = self.combo_norm.currentData() or "raw"
+        mon_var = scan.variables.get("Monitor1")
+        time_var = scan.variables.get("Count", scan.variables.get("Time"))
+        s1_mm, s2_mm, _ = extract_slit_widths(scan, len(raw_y))
+
+        p_eval = p.clone()
+        p_eval.use_scale_factor = False
+        p_eval.scale_factor = 1.0
+
+        try:
+            result = reduce_counts_pysared(
+                raw_y, norm_mode,
+                monitor=mon_var.data if mon_var is not None else None,
+                time=time_var.data if time_var is not None else None,
+                count_data=is_count_channel(y_var.name, y_var.unit),
+                variance=y_var.variance,
+                monitor_variance=mon_var.variance if mon_var is not None else None,
+                sigma_level=self.combo_sigma.currentData() or 1,
+                reference_monitor_rate=self.spin_reference_rate.value(),
+                numerator_is_monitor=y_key == "Monitor1",
+                input_units=y_var.unit,
+                theta_deg=th_raw,
+                wavelength_angstrom=self.spin_wavelength.value(),
+                s1_mm=s1_mm,
+                s2_mm=s2_mm,
+                bkg_counts=bkg_counts,
+                bkg_area_ratio=bkg_area_ratio,
+                params=p_eval,
+            )
+        except ValueError as err:
+            self.lbl_plateau_info.setStyleSheet("color: #d97706; font-size: 11px;")
+            self.lbl_plateau_info.setText(f"Auto plateau failed: {err}")
+            self.lbl_plateau_info.setVisible(True)
+            return
+
+        th_corr = th_raw - float(p.theta_offset_deg)
+        q_vals = compute_q(th_corr, self.spin_wavelength.value())
+        valid = result.valid & np.isfinite(q_vals) & np.isfinite(result.values) & (result.values > 0.0)
+        spin_mode = self.combo_spin.currentData() or "split"
+        f_var = scan.variables.get("Flipper1")
+        curves: list[tuple[np.ndarray, np.ndarray]] = []
+        if f_var is not None and len(f_var.data) == len(raw_y) and spin_mode != "all":
+            f_data = np.asarray(f_var.data, dtype=float)
+            states = (0, 1) if spin_mode == "split" else ((0,) if spin_mode == "flipper0" else (1,))
+            for st in states:
+                m = valid & (f_data == st)
+                if np.any(m):
+                    cq, cy = q_vals[m], result.values[m]
+                    keep = trim_curve_mask(len(cq), cy, skip_left=p.skip_left, skip_right=p.skip_right, remove_zeros=True)
+                    if np.any(keep):
+                        curves.append((cq[keep], cy[keep]))
+        elif np.any(valid):
+            cq, cy = q_vals[valid], result.values[valid]
+            keep = trim_curve_mask(len(cq), cy, skip_left=p.skip_left, skip_right=p.skip_right, remove_zeros=True)
+            if np.any(keep):
+                curves.append((cq[keep], cy[keep]))
+
+        try:
+            est = estimate_multi_curve_plateau_scale(curves)
+        except ValueError as err:
+            self.lbl_plateau_info.setStyleSheet("color: #d97706; font-size: 11px;")
+            self.lbl_plateau_info.setText(f"Auto plateau unavailable: {err}")
+            self.lbl_plateau_info.setVisible(True)
+            return
+
+        p.scale_factor = float(est.scale_factor)
+        p.use_scale_factor = True
+        self._sync_reduction_controls()
+        note = est.note
+        if not p.overillumination and "overillumination" not in note.lower():
+            note += " (overillumination is off)"
+        accent = "#d97706" if (est.is_sloped or not p.overillumination) else ("#38bdf8" if self.is_dark_mode else "#0891b2")
+        self.lbl_plateau_info.setStyleSheet(f"color: {accent}; font-size: 11px;")
+        self.lbl_plateau_info.setText(note)
+        self.lbl_plateau_info.setVisible(True)
         self._update_plot()
 
     def _on_reduction_curvature_changed(self, value: float) -> None:
@@ -859,8 +1008,10 @@ class ScanPlotView(QWidget):
                 target.working_bkg_counts = None
         self._update_plot()
 
-    def _effective_roi_and_bkg_counts(self, scan: ScanData, y_key: str) -> tuple[np.ndarray, np.ndarray | None, list[str]]:
-        """Return ``(signal_counts, bkg_counts, notes)`` applying per-scan curvature and BKG ROI if active."""
+    def _effective_roi_and_bkg_counts(
+        self, scan: ScanData, y_key: str,
+    ) -> tuple[np.ndarray, np.ndarray | None, float, list[str]]:
+        """Return ``(signal_counts, bkg_counts, bkg_area_ratio, notes)`` for per-scan curvature and BKG ROI."""
         notes: list[str] = []
         raw_y = np.asarray(scan.variables[y_key].data, dtype=float)
         p = scan.reduction_params
@@ -870,49 +1021,71 @@ class ScanPlotView(QWidget):
                 notes.append("BKG ROI subtraction applies to ROI_Counts only.")
             if abs(p.curvature_rad) > 0.0:
                 notes.append("Sample curvature applies to ROI_Counts only.")
-            return raw_y, None, notes
+            return raw_y, None, 1.0, notes
 
         if not scan.has_detector_2d or scan.detector_shape is None:
-            return raw_y, scan.working_bkg_counts if p.subtract_background else None, notes
+            return raw_y, scan.working_bkg_counts if p.subtract_background else None, 1.0, notes
 
         _, nx, ny = scan.detector_shape
         record = scan.working_roi_record
         is_tracked = record is not None and record.mode == "tracked"
         roi = scan.working_detector_roi or scan.detector_roi
         if roi is None:
-            return raw_y, scan.working_bkg_counts if p.subtract_background else None, notes
+            return raw_y, scan.working_bkg_counts if p.subtract_background else None, 1.0, notes
 
         sx0, sx1, sy0, sy1 = pixel_bounds(roi, nx, ny)
-        bx0, bx1, _, _ = bkg_roi_from_signal(roi, p.bkg_x_bounds, nx, ny)
+        bx0, bx1, by0, by1 = resolve_bkg_roi(roi, p.bkg_roi_bounds, p.bkg_x_bounds, nx, ny)
         if p.bkg_x_bounds is None:
             p.bkg_x_bounds = (float(bx0), float(bx1))
+        if p.bkg_roi_bounds is None:
+            p.bkg_roi_bounds = (float(bx0), float(bx1), float(by0), float(by1))
+        area_ratio = roi_area_ratio(roi, (bx0, bx1, by0, by1), nx, ny) if p.subtract_background else 1.0
+        same_y = (by0 == sy0 and by1 == sy1)
+        x_disjoint = (bx1 <= sx0 or sx1 <= bx0)
 
         # Curvature correction path (requires fixed ROI and cached Y-integrated detector strip)
         if abs(p.curvature_rad) > 0.0:
             if is_tracked:
                 notes.append("Sample curvature skipped: requires a fixed ROI (tracked ROI active).")
             else:
+                reader = self.reader_provider(scan.file_path)
                 y_map = scan.roi_y_map_cache if scan.roi_y_map_bounds == (sy0, sy1) else None
-                if y_map is None:
-                    reader = self.reader_provider(scan.file_path)
-                    if reader is not None:
-                        y_map = reader.compute_y_integrated_map((float(sy0), float(sy1)))
-                        if y_map is not None:
-                            scan.roi_y_map_cache = y_map
-                            scan.roi_y_map_bounds = (sy0, sy1)
+                if y_map is None and reader is not None:
+                    y_map = reader.compute_y_integrated_map((float(sy0), float(sy1)))
+                    if y_map is not None:
+                        scan.roi_y_map_cache = y_map
+                        scan.roi_y_map_bounds = (sy0, sy1)
                 if y_map is None:
                     notes.append("Sample curvature unavailable: detector volume could not be read.")
                 else:
                     flipper = scan.variables["Flipper1"].data if "Flipper1" in scan.variables else None
-                    bkg_win = (bx0, bx1) if p.subtract_background else None
+                    bkg_in_same_pass = bool(p.subtract_background and same_y and x_disjoint)
                     try:
                         warped = apply_curvature_by_spin(
                             y_map.counts, flipper, y_map.written,
-                            p.curvature_rad, (sx0, sx1), bkg_x_bounds=bkg_win,
+                            p.curvature_rad, (sx0, sx1),
+                            bkg_x_bounds=(bx0, bx1) if bkg_in_same_pass else None,
                         )
                         curv_y = np.sum(warped[:, sx0:sx1], axis=1, dtype=float)
-                        curv_bkg = np.sum(warped[:, bx0:bx1], axis=1, dtype=float) if p.subtract_background else None
-                        return curv_y, curv_bkg, notes
+                        curv_bkg = None
+                        if p.subtract_background:
+                            if bkg_in_same_pass:
+                                curv_bkg = np.sum(warped[:, bx0:bx1], axis=1, dtype=float)
+                            elif same_y:
+                                warped_bkg = apply_curvature_by_spin(
+                                    y_map.counts, flipper, y_map.written,
+                                    p.curvature_rad, (bx0, bx1), bkg_x_bounds=None,
+                                )
+                                curv_bkg = np.sum(warped_bkg[:, bx0:bx1], axis=1, dtype=float)
+                            elif reader is not None:
+                                bkg_y_map = reader.compute_y_integrated_map((float(by0), float(by1)))
+                                if bkg_y_map is not None:
+                                    warped_bkg = apply_curvature_by_spin(
+                                        bkg_y_map.counts, flipper, bkg_y_map.written,
+                                        p.curvature_rad, (bx0, bx1), bkg_x_bounds=None,
+                                    )
+                                    curv_bkg = np.sum(warped_bkg[:, bx0:bx1], axis=1, dtype=float)
+                        return curv_y, curv_bkg, area_ratio, notes
                     except ValueError as err:
                         notes.append(f"Sample curvature skipped: {err}")
 
@@ -921,16 +1094,16 @@ class ScanPlotView(QWidget):
         if p.subtract_background:
             if scan.working_bkg_counts is not None and len(scan.working_bkg_counts) == len(raw_y):
                 bkg_counts = scan.working_bkg_counts
-            elif scan.roi_y_map_cache is not None and scan.roi_y_map_bounds == (sy0, sy1):
+            elif same_y and scan.roi_y_map_cache is not None and scan.roi_y_map_bounds == (sy0, sy1):
                 bkg_counts = np.sum(scan.roi_y_map_cache.counts[:, bx0:bx1], axis=1, dtype=float)
                 scan.working_bkg_counts = bkg_counts
             else:
                 reader = self.reader_provider(scan.file_path)
                 if reader is not None:
-                    bkg_counts = reader.compute_full_scan_roi((float(bx0), float(bx1), float(sy0), float(sy1)))
+                    bkg_counts = reader.compute_full_scan_roi((float(bx0), float(bx1), float(by0), float(by1)))
                     scan.working_bkg_counts = bkg_counts
 
-        return raw_y, bkg_counts, notes
+        return raw_y, bkg_counts, area_ratio, notes
 
     def _format_scan_label(self, scan: ScanData) -> str:
         name = Path(scan.file_path).name if scan.file_path else "Scan"
@@ -1479,7 +1652,7 @@ class ScanPlotView(QWidget):
                     raise ValueError(f"missing selected Y channel {y_key}")
                 y_var = scan.variables[y_key]
                 params = scan.reduction_params
-                raw_y, bkg_counts, roi_notes = self._effective_roi_and_bkg_counts(scan, y_key)
+                raw_y, bkg_counts, bkg_area_ratio, roi_notes = self._effective_roi_and_bkg_counts(scan, y_key)
                 for rn in roi_notes:
                     warnings.append(f"{name}: {rn}")
 
@@ -1543,6 +1716,7 @@ class ScanPlotView(QWidget):
                     s1_mm=s1_mm,
                     s2_mm=s2_mm,
                     bkg_counts=bkg_counts,
+                    bkg_area_ratio=bkg_area_ratio,
                     params=params,
                     resolution_angle_unit=res_angle_unit,
                 )

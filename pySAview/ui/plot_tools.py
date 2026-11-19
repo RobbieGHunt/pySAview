@@ -12,11 +12,86 @@ import math
 from collections.abc import Callable, Iterable
 from pathlib import Path
 
+import pyqtgraph as pg
 from PyQt6.QtCore import QRectF, QSize
 from PyQt6.QtGui import QPainter
 from PyQt6.QtWidgets import QFileDialog, QMessageBox, QPushButton, QWidget
 
 from pySAview.core.source_safety import validate_output_path
+
+_SUPERSCRIPT_MAP = str.maketrans("-0123456789", "⁻⁰¹²³⁴⁵⁶⁷⁸⁹")
+
+
+def format_scientific_tick(value: float, *, is_log_exponent: bool = False) -> str:
+    """Format a Y-axis tick consistently in scientific ``10ⁿ`` / ``m×10ⁿ`` notation.
+
+    Unlike default ``%g`` formatting (which prints ``0.001`` for ``10⁻³`` and
+    ``1e-05`` for ``10⁻⁵``), every decade from ``10⁻¹²`` through ``10¹²`` uses
+    consistent ``10ⁿ`` superscripts (e.g. ``10⁻⁴``, ``10⁻³``, ``10⁻²``, ``10⁻¹``,
+    ``10⁰``, ``10¹``).
+    """
+    if not math.isfinite(value):
+        return ""
+    if is_log_exponent:
+        nearest = round(value)
+        if abs(value - nearest) < 1e-6:
+            return f"10{str(int(nearest)).translate(_SUPERSCRIPT_MAP)}"
+        actual = 10.0 ** value
+        if not math.isfinite(actual) or actual <= 0.0:
+            return ""
+        exp = int(math.floor(value))
+        mant = actual / (10.0 ** exp)
+        if round(mant, 2) >= 10.0:
+            exp += 1
+            mant = 1.0
+        exp_str = str(exp).translate(_SUPERSCRIPT_MAP)
+        if abs(mant - 1.0) < 1e-3:
+            return f"10{exp_str}"
+        mant_str = f"{mant:.2g}"
+        return f"{mant_str}×10{exp_str}"
+
+    if value == 0.0:
+        return "0"
+    sign = "−" if value < 0.0 else ""
+    mag = abs(value)
+    exp = int(math.floor(math.log10(mag)))
+    mant = mag / (10.0 ** exp)
+    if round(mant, 3) >= 10.0:
+        exp += 1
+        mant = 1.0
+    exp_str = str(exp).translate(_SUPERSCRIPT_MAP)
+    if abs(mant - 1.0) < 1e-6:
+        return f"{sign}10{exp_str}"
+    mant_str = f"{mant:.3g}"
+    return f"{sign}{mant_str}×10{exp_str}"
+
+
+class ScientificAxisItem(pg.AxisItem):
+    """PyQtGraph axis that consistently labels ticks in scientific ``10ⁿ`` notation."""
+
+    def __init__(self, *args, linear_scientific: bool = True, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._linear_scientific = bool(linear_scientific)
+
+    def logTickStrings(self, values, scale, spacing):
+        scale_val = float(scale) if scale is not None else 1.0
+        log_scale = math.log10(scale_val) if scale_val > 0.0 else 0.0
+        labels: list[str] = []
+        for v in values:
+            exp_val = float(v) + log_scale
+            if spacing is not None and spacing >= 1.0 and abs(exp_val - round(exp_val)) >= 1e-6:
+                labels.append("")
+            else:
+                labels.append(format_scientific_tick(exp_val, is_log_exponent=True))
+        return labels
+
+    def tickStrings(self, values, scale, spacing):
+        if self.logMode:
+            return self.logTickStrings(values, scale, spacing)
+        if not self._linear_scientific:
+            return super().tickStrings(values, scale, spacing)
+        scale_val = float(scale) if scale is not None else 1.0
+        return [format_scientific_tick(float(v) * scale_val, is_log_exponent=False) for v in values]
 
 IMAGE_FILTERS = "PNG image (*.png);;SVG vector image (*.svg)"
 TABLE_FILTERS = "Tab-delimited text (*.txt);;Tab-delimited data (*.dat);;Tab-separated values (*.tsv)"

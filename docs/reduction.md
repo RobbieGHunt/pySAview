@@ -16,7 +16,8 @@ scan; explicit cloning via **Copy Settings to Checked Scans** creates independen
 | --- | --- | --- |
 | `pySAview/core/reduction/overillumination.py` | Trapezoidal beam footprint factor `c₀` and projected width `fwhm_proj`; Nomad `s1h`/`s2h` extraction | `f_overilluminationCorrCoeff` |
 | `pySAview/core/reduction/curvature.py` | ROI shear-and-regrid sample curvature correction (per spin state, reversible) | `f_SFM_reflectivityPreview_load` |
-| `pySAview/core/reduction/background.py` | Second Background ROI geometry (Y- and width-locked) and BKG subtraction with `Qz` cutoff | `f_button_reduceSFM` / BKG ROI |
+| `pySAview/core/reduction/background.py` | Second Background ROI geometry (freely resizable with area ratio `k = A_sig / A_bkg`) and BKG subtraction with `Qz` cutoff | `f_button_reduceSFM` / BKG ROI |
+| `pySAview/core/reduction/plateau.py` | Automated pre-critical-edge total-reflection plateau (`R = 1`) scale factor estimator (robust to low-Q spikes, slopes, and dual-spin critical edges) | Extension (no direct beam) |
 | `pySAview/core/reduction/resolution.py` | Gaussian 1σ resolution (`σ_Qz`, `σ_θ`) in both `pySAred` (`FWHM_proj`) and Gunnar `Sared` (`0.68`) modes | `f_button_reduceSFM` |
 | `pySAview/core/reduction/pysared.py` | Per-scan `ReductionParams` dataclass, pySAred 1.5.3 normalization/error pipeline, and curve trimming | `f_button_reduceSFM` |
 | `pySAview/core/export_tables.py` | Tab-delimited reflectivity export (`ResolutionSigma` + metadata) and pySAred 3/4-column `.dat` writer | `f_button_reduceSFM` `.dat` writer |
@@ -39,11 +40,12 @@ pySAred 1.5.3:
      use `θ_corr`.
 3. **Background subtraction** (`pySAview/core/reduction/background.py`)
    - Applied **before** monitor or dwell-time normalization, matching pySAred 1.5.3.
-   - For points with `Qz > bkg_skip_qz` and `I_bkg > 0`:
-     ```
-     dI = sqrt(I + I_bkg)
-     I  = I - I_bkg
-     ```
+   - Supports freely resizable background boxes via exact pixel-area scaling `k = A_sig / A_bkg` (reduces to `k = 1` when the Signal and Background ROIs have equal area):
+     - For points with `Qz > bkg_skip_qz` and `I_bkg > 0`:
+       ```
+       dI = sqrt(I + k² · I_bkg)
+       I  = I - k · I_bkg
+       ```
    - Points with `Qz <= bkg_skip_qz` or `I_bkg <= 0` are left unchanged.
 4. **Monitor / dwell-time normalization** (`pySAview/core/reduction/pysared.py`)
    - Uses the pySAred 1.5.3 counting error convention (`dI = 1` when `I == 0`,
@@ -57,10 +59,17 @@ pySAred 1.5.3:
    - When enabled, both intensity and uncertainty are divided by `c₀`:
      `I ← I / c₀`, `dI ← dI / c₀`.
    - Optionally overlays `c₀` on the chart as a dashed amber curve.
-6. **Manual scale factor**
+6. **Scale factor & automated pre-critical-edge normalization** (`pySAview/core/reduction/plateau.py`)
    - When enabled, divides `I` and `dI` by `scale_factor > 0`. Direct-beam
      normalization is intentionally deferred until verified direct-beam reference
      datasets are available.
+   - **Auto (Plateau → 1)** estimates the total-external-reflection plateau below
+     the critical edge `Q_c` (`R(Q_z < Q_c) = 1`) after active background,
+     curvature, monitor/time, and overillumination corrections. It trims low-`Q`
+     direct-beam/`1/θ` blow-up spikes, detects the critical-edge drop, evaluates
+     the pre-edge trend robustly via Theil–Sen regression (flagging sloped
+     plateaus when overillumination is off or miscalibrated), and shares the region
+     below `min(Q_c)` across spin channels on polarized scans.
 7. **Instrumental resolution** (`pySAview/core/reduction/resolution.py`)
    - **pySAred (default)**:
      ```
@@ -102,12 +111,17 @@ opposite spin states are never interpolated together.
 ## Background ROI geometry
 
 In **Detector Image**, enabling **Background ROI (pySAred 1.5.3)** displays a dashed cyan
-box locked to the Signal ROI's vertical `[y0, y1)` range and pixel width `w = x1 - x0`.
-Its default X placement is `[x0 - 2w, x0 - w]` (one ROI-width gap to the left of the
-signal ROI, falling back to `[x1 + w, x1 + 2w]` near the left edge of the detector).
-Adjusting or toggling the Background ROI updates **Scan Charts** and draws matching
-dashed cyan bounds on **2D Map**. Overlapping the Signal and Background ROIs
-displays an explicit warning.
+box initialized to the Signal ROI's vertical `[y0, y1)` range and pixel width `w = x1 - x0`
+at `[x0 - 2w, x0 - w]` (one ROI-width gap to the left of the signal ROI, falling back to
+`[x1 + w, x1 + 2w]` near the left edge of the detector).
+
+The background box can be freely dragged and resized in both X and Y (via corner handles
+or spinboxes). When its pixel area differs from the Signal ROI, background counts are
+scaled by `k = A_sig / A_bkg` (`I_net = I_sig - k · I_bkg`, `dI = sqrt(I_sig + k² · I_bkg)`).
+Using a wider background box reduces statistical noise (`k < 1`), while changing its Y
+range assumes the background is uniform vertically across the detector. Adjusting or
+toggling the Background ROI updates **Scan Charts** and draws matching dashed cyan bounds
+on **2D Map**. Overlapping the Signal and Background ROIs displays an explicit warning.
 
 ## Exporting pySAred `.dat` files
 

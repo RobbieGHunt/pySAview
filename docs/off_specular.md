@@ -107,14 +107,24 @@ so the data cannot tell the two apart.
 
 ## Sample curvature and background ROI overlay
 
-Per-scan **Sample curvature** (`γ`, in radians, following pySAred 1.5.3) can be
-adjusted directly in **2D Map** (synced bidirectionally with
+Per-scan **Sample curvature** (`γ`, in radians, default `0.0`, following pySAred 1.5.3)
+can be adjusted directly in **2D Map** (synced bidirectionally with
 **Scan Charts ▸ Reduction**). Shearing is applied non-destructively per spin state
 inside the signal ROI columns (and independently inside the background ROI columns
-when enabled); resetting `γ = 0` restores the exact uncorrected map. Enable
-**ROI-summed profile** in the cuts panel to watch Kiessig fringes sharpen live as
-`γ` is tuned. When background ROI subtraction is active, dashed cyan lines mark
-the background ROI boundaries on the map. See [Data reduction](reduction.md).
+when enabled); resetting `γ = 0` restores the exact uncorrected map. Automatic colour-bar
+levels are anchored to the uncurved (`γ = 0`) baseline (and any manual colour-bar range is
+preserved during curvature adjustment) so fractional interpolated edge counts never cause
+the palette scale to jump. Enable **ROI-summed profile** in the cuts panel to watch Kiessig
+fringes sharpen live as `γ` is tuned. When background ROI subtraction is active, dashed
+cyan lines mark the background ROI boundaries on the map. See [Data reduction](reduction.md).
+
+## Display smoothing (`α_i vs α_f` and `Qx vs Qz`)
+
+In **α_i vs α_f** and **Qx vs Qz** views, the optional **Smooth** control applies a
+separable, NaN-safe 2D Gaussian filter (configurable radius `σ` in pixels) to the rendered
+map image only. Colour-bar levels stay anchored to the unsmoothed baseline, and all
+numerical data (`_norm`, cursor readouts, 1D cuts, and exported tables) remain strictly
+unsmoothed.
 
 **Sample-to-detector distance.** In **Direct-beam fit** mode no distance is
 needed or entered: Δ is measured directly in degrees per pixel, and α_f, Qx and

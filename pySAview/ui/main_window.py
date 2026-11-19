@@ -37,6 +37,7 @@ from pySAview.ui.off_specular_view import OffSpecularView
 from pySAview.ui.scan_plot_view import ScanPlotView
 from pySAview.ui.session_files_view import SessionFilesView
 from pySAview.ui.theme import DARK_THEME, LIGHT_THEME
+from pySAview.ui.wheel_guard import install_wheel_focus_guard
 
 
 class MainWindow(QMainWindow):
@@ -61,6 +62,7 @@ class MainWindow(QMainWindow):
         self.settings = settings if settings is not None else QSettings("ILL SuperADAM", "pySAview")
         self.last_load_directory = str(Path.home())
         self._init_ui()
+        install_wheel_focus_guard(self)
         self._apply_app_theme()
         restore_preferences(self)
 

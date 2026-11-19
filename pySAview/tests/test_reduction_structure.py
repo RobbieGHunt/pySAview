@@ -18,6 +18,7 @@ import pySAview.core.reduction.curvature as red_curvature
 import pySAview.core.reduction.kinematics as red_kinematics
 import pySAview.core.reduction.normalization as red_norm
 import pySAview.core.reduction.overillumination as red_overillumination
+import pySAview.core.reduction.plateau as red_plateau
 import pySAview.core.reduction.polarization as red_pol
 import pySAview.core.reduction.pysared as red_pysared
 import pySAview.core.reduction.resolution as red_resolution
@@ -75,6 +76,7 @@ def test_reduction_public_exports_complete():
         red_kinematics,
         red_norm,
         red_overillumination,
+        red_plateau,
         red_pol,
         red_pysared,
         red_resolution,
