@@ -22,6 +22,7 @@ from PyQt6.QtWidgets import (
     QComboBox,
     QDoubleSpinBox,
     QFileDialog,
+    QFrame,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
@@ -29,6 +30,7 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QSpinBox,
     QSplitter,
@@ -75,6 +77,12 @@ from pySAview.core.off_specular import (
 )
 from pySAview.core.export_tables import map_table, write_table
 from pySAview.ui import icons
+from pySAview.ui.flow_layout import (
+    FlowLayout,
+    configure_compact_combo,
+    fit_combo_popup,
+    make_flow_group,
+)
 from pySAview.ui.plot_tools import (
     TABLE_FILTERS, ask_output_path, export_plot_image, install_context_export, tool_button,
 )
@@ -565,6 +573,13 @@ class OffSpecularThread(QThread):
                 self.failed.emit(self.token, str(error))
 
 
+class _CompactPlotWidget(pg.PlotWidget):
+    """PlotWidget with a compact preferred sizeHint so side-panel scroll areas do not inflate."""
+
+    def sizeHint(self) -> QSize:
+        return QSize(180, 120)
+
+
 class OffSpecularView(QWidget):
     """Heatmap of Y-integrated detector intensity versus X pixel and scan point."""
 
@@ -598,22 +613,24 @@ class OffSpecularView(QWidget):
 
     # ------------------------------------------------------------------ layout
     def _init_ui(self) -> None:
+        self.setMinimumSize(0, 0)
         main = QVBoxLayout(self)
         main.setContentsMargins(10, 10, 10, 10)
         main.setSpacing(8)
 
-        bar = QHBoxLayout()
-        bar.setSpacing(8)
-        bar.addWidget(QLabel("Spin:"))
-        self.combo_spin = QComboBox()
+        bar = FlowLayout(margin=0, h_spacing=8, v_spacing=6)
+        self.combo_spin = configure_compact_combo(QComboBox(), min_chars=14)
         self.combo_spin.addItem("All Frames", "all")
         self.combo_spin.addItem("u — Spin Up (Flipper OFF / 1)", "up")
         self.combo_spin.addItem("d — Spin Down (Flipper ON / 0)", "down")
         self.combo_spin.addItem("u + d — Sum of channels", "sum")
         self.combo_spin.addItem("Spin asymmetry (u−d)/(u+d)", "asym")
+        fit_combo_popup(self.combo_spin)
         self.combo_spin.currentIndexChanged.connect(self._on_spin_changed)
-        bar.addWidget(self.combo_spin)
+        bar.addWidget(make_flow_group(QLabel("Spin:"), self.combo_spin, spacing=6))
+
         self.spin_min_counts = QSpinBox()
+        self.spin_min_counts.setMinimumWidth(0)
         self.spin_min_counts.setRange(0, 1_000_000)
         self.spin_min_counts.setValue(10)
         self.spin_min_counts.setPrefix("u+d ≥ ")
@@ -625,17 +642,17 @@ class OffSpecularView(QWidget):
         self.spin_min_counts.valueChanged.connect(self._redraw)
         bar.addWidget(self.spin_min_counts)
 
-        bar.addWidget(QLabel("Integrate Y:"))
-        self.combo_y_source = QComboBox()
+        self.combo_y_source = configure_compact_combo(QComboBox(), min_chars=12)
         self.combo_y_source.addItem("Full detector height", "full")
         self.combo_y_source.addItem("Scan ROI Y range", "roi")
         self.combo_y_source.addItem("Custom Y range", "custom")
+        fit_combo_popup(self.combo_y_source)
         self.combo_y_source.setToolTip("Rows of each detector image summed for every X pixel")
         self.combo_y_source.currentIndexChanged.connect(self._on_y_source_changed)
-        bar.addWidget(self.combo_y_source)
+        bar.addWidget(make_flow_group(QLabel("Integrate Y:"), self.combo_y_source, spacing=6))
+
         # The row spinboxes always show the Y window being integrated. Editing
         # them switches to "Custom Y range" (e.g. to exclude noisy detector edges).
-        bar.addWidget(QLabel("Rows:"))
         self.spin_y0 = QSpinBox()
         self.spin_y1 = QSpinBox()
         for spin, tip in ((self.spin_y0, "First detector Y row integrated (inclusive)"),
@@ -645,30 +662,30 @@ class OffSpecularView(QWidget):
             spin.setKeyboardTracking(False)
             spin.setToolTip(tip + ". Editing switches to Custom Y range.")
             spin.valueChanged.connect(self._on_row_spin_changed)
-            bar.addWidget(spin)
+        bar.addWidget(make_flow_group(QLabel("Rows:"), self.spin_y0, self.spin_y1, spacing=6))
         self._row_timer = QTimer(self)
         self._row_timer.setSingleShot(True)
         self._row_timer.setInterval(350)  # wait for arrow-key/click bursts before recomputing
         self._row_timer.timeout.connect(self._request_compute)
 
-        bar.addWidget(QLabel("Normalize:"))
-        self.combo_norm = QComboBox()
+        self.combo_norm = configure_compact_combo(QComboBox(), min_chars=11)
         self.combo_norm.addItem("Raw counts", "raw")
         self.combo_norm.addItem("Counts / s", "time")
         self.combo_norm.addItem("Counts / Monitor1", "monitor")
+        fit_combo_popup(self.combo_norm)
         self.combo_norm.currentIndexChanged.connect(self._redraw)
-        bar.addWidget(self.combo_norm)
+        bar.addWidget(make_flow_group(QLabel("Normalize:"), self.combo_norm, spacing=6))
 
-        bar.addWidget(QLabel("Axes:"))
-        self.combo_y_axis = QComboBox()
+        self.combo_y_axis = configure_compact_combo(QComboBox(), min_chars=10)
         self.combo_y_axis.addItem("X pixel vs θ", "th")
         self.combo_y_axis.addItem("X pixel vs Point", "point")
         self.combo_y_axis.addItem("α_i vs α_f", "alpha")
         self.combo_y_axis.addItem("Qx vs Qz", "q")
+        fit_combo_popup(self.combo_y_axis)
         self.combo_y_axis.setToolTip("α_i vs α_f and Qx vs Qz use this scan's angle calibration "
                                      "(right-hand panel); Qx–Qz also uses λ")
         self.combo_y_axis.currentIndexChanged.connect(self._on_axes_changed)
-        bar.addWidget(self.combo_y_axis)
+        bar.addWidget(make_flow_group(QLabel("Axes:"), self.combo_y_axis, spacing=6))
 
         self.chk_log = QCheckBox("Log Scale")
         self.chk_log.setChecked(True)
@@ -679,12 +696,11 @@ class OffSpecularView(QWidget):
         self.chk_show_roi.toggled.connect(self._draw_roi_overlay)
         bar.addWidget(self.chk_show_roi)
 
-        bar.addWidget(QLabel("Colormap:"))
-        self.combo_cmap = QComboBox()
+        self.combo_cmap = configure_compact_combo(QComboBox(), min_chars=7)
         self.combo_cmap.addItems(["turbo", "viridis", "inferno", "plasma", "cividis", "gray", "magma"])
+        fit_combo_popup(self.combo_cmap)
         self.combo_cmap.currentTextChanged.connect(self._on_cmap_changed)
-        bar.addWidget(self.combo_cmap)
-        bar.addStretch(1)
+        bar.addWidget(make_flow_group(QLabel("Colormap:"), self.combo_cmap, spacing=6))
         main.addLayout(bar)
 
         # Only problems and caveats are shown here (hidden otherwise); the settings
@@ -697,8 +713,13 @@ class OffSpecularView(QWidget):
         main.addWidget(self.lbl_notice)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setChildrenCollapsible(True)
+        splitter.setMinimumSize(0, 0)
+        splitter.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
 
         left = QWidget()
+        left.setMinimumSize(0, 0)
+        left.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.setSpacing(6)
@@ -746,6 +767,7 @@ class OffSpecularView(QWidget):
         left_layout.addLayout(tools)
 
         self.plot = pg.PlotWidget()
+        self.plot.setMinimumSize(0, 0)
         self.plot.getViewBox().setMouseMode(pg.ViewBox.PanMode)
         self.plot.getViewBox().setCursor(QCursor(Qt.CursorShape.CrossCursor))
         self.plot.setLabel("bottom", "Detector X pixel")
@@ -788,14 +810,15 @@ class OffSpecularView(QWidget):
         splitter.addWidget(left)
 
         right = QWidget()
+        right.setMinimumSize(0, 0)
         right_layout = QVBoxLayout(right)
         right_layout.setContentsMargins(0, 0, 0, 0)
         right_layout.setSpacing(8)
         right_layout.addWidget(self._build_calibration_panel())
         group = QGroupBox("Cuts through the map")
+        group.setMinimumSize(0, 0)
         group_layout = QVBoxLayout(group)
-        cut_bar = QHBoxLayout()
-        cut_bar.setSpacing(6)
+        cut_bar = FlowLayout(margin=0, h_spacing=6, v_spacing=4)
         self.btn_drop_cuts = QPushButton("Drop Cut Lines")
         self.btn_drop_cuts.setCheckable(True)
         self.btn_drop_cuts.setToolTip(
@@ -813,19 +836,20 @@ class OffSpecularView(QWidget):
         for btn in (self.btn_drop_cuts, self.btn_cut_h, self.btn_cut_v):
             btn.setStyleSheet("QPushButton { padding: 4px 8px; }")
             cut_bar.addWidget(btn)
-        cut_bar.addStretch(1)
         group_layout.addLayout(cut_bar)
         self.lbl_row_cut = QLabel("Horizontal cut (selected point):")
         _fixed_width_text(self.lbl_row_cut)
         group_layout.addWidget(self.lbl_row_cut)
-        self.plot_row = pg.PlotWidget()
+        self.plot_row = _CompactPlotWidget()
+        self.plot_row.setMinimumHeight(110)
         self.plot_row.setLabel("bottom", "Detector X pixel")
-        group_layout.addWidget(self.plot_row)
+        group_layout.addWidget(self.plot_row, 1)
         self.lbl_col_cut = QLabel("Vertical cut (selected X pixel):")
         _fixed_width_text(self.lbl_col_cut)
         group_layout.addWidget(self.lbl_col_cut)
-        self.plot_col = pg.PlotWidget()
-        group_layout.addWidget(self.plot_col)
+        self.plot_col = _CompactPlotWidget()
+        self.plot_col.setMinimumHeight(110)
+        group_layout.addWidget(self.plot_col, 1)
         self.lbl_cut_hint = QLabel(CUT_HINT)
         self.lbl_cut_hint.setStyleSheet("color: #64748b; font-size: 11px;")
         self.lbl_cut_hint.setWordWrap(True)
@@ -840,18 +864,27 @@ class OffSpecularView(QWidget):
         self._row_curve = self.plot_row.plot([], [], connect="finite")
         self._col_curve = self.plot_col.plot([], [], connect="finite")
         right_layout.addWidget(group, 1)
-        splitter.addWidget(right)
+
+        right_scroll = QScrollArea()
+        right_scroll.setWidgetResizable(True)
+        right_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        right_scroll.setMinimumSize(0, 0)
+        right_scroll.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
+        right_scroll.setWidget(right)
+        splitter.addWidget(right_scroll)
+        splitter.setStretchFactor(0, 2)
+        splitter.setStretchFactor(1, 1)
         splitter.setSizes([760, 340])
         main.addWidget(splitter, 1)
 
     def _build_calibration_panel(self) -> QGroupBox:
         group = self.cal_group = QGroupBox("Angle calibration (α_i, α_f) — this scan")
+        group.setMinimumSize(0, 0)
         outer = QVBoxLayout(group)
         outer.setSpacing(6)
 
         # Mode toggle at the top of the calibration card: Direct-beam fit vs pySAred geometry.
-        mode_row = QHBoxLayout()
-        mode_row.setSpacing(6)
+        mode_row = FlowLayout(margin=0, h_spacing=6, v_spacing=4)
         self.btn_mode_direct_beam = QPushButton("Direct-beam fit")
         self.btn_mode_direct_beam.setCheckable(True)
         self.btn_mode_direct_beam.setChecked(True)
@@ -869,19 +902,23 @@ class OffSpecularView(QWidget):
         self.cal_mode_group.addButton(self.btn_mode_pysared, 1)
         for btn in (self.btn_mode_direct_beam, self.btn_mode_pysared):
             btn.setStyleSheet("QPushButton { padding: 4px 8px; }")
-            mode_row.addWidget(btn, 1)
+            btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            mode_row.addWidget(btn)
         self.btn_mode_direct_beam.clicked.connect(lambda: self._on_cal_mode_changed("direct_beam"))
         self.btn_mode_pysared.clicked.connect(lambda: self._on_cal_mode_changed("pysared"))
         outer.addLayout(mode_row)
 
         # Mode-specific controls in a QStackedWidget (2 rows per page so toggling never jumps layout).
         self.cal_mode_stack = QStackedWidget()
+        self.cal_mode_stack.setMinimumSize(0, 0)
 
         page_db = QWidget()
         db_grid = QGridLayout(page_db)
         db_grid.setContentsMargins(0, 0, 0, 0)
         db_grid.setHorizontalSpacing(6)
         self.spin_dpp = QDoubleSpinBox()
+        self.spin_dpp.setMinimumWidth(65)
+        self.spin_dpp.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         self.spin_dpp.setDecimals(6)
         self.spin_dpp.setRange(0.0, 1.0)
         self.spin_dpp.setSingleStep(0.00001)
@@ -895,6 +932,7 @@ class OffSpecularView(QWidget):
                                    "(discards manual values for this scan)")
         self.btn_fit_db.clicked.connect(self._refit_calibration)
         self.lbl_distance = QLabel("—")
+        _fixed_width_text(self.lbl_distance)
         self.lbl_distance.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.lbl_distance.setToolTip(
             "Check value only: sample-to-detector distance L = p / tan(Δ) implied by the "
@@ -914,6 +952,8 @@ class OffSpecularView(QWidget):
         ps_grid.setContentsMargins(0, 0, 0, 0)
         ps_grid.setHorizontalSpacing(6)
         self.spin_distance_mm = QDoubleSpinBox()
+        self.spin_distance_mm.setMinimumWidth(65)
+        self.spin_distance_mm.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         self.spin_distance_mm.setDecimals(1)
         self.spin_distance_mm.setRange(10.0, 50000.0)
         self.spin_distance_mm.setSingleStep(10.0)
@@ -923,6 +963,8 @@ class OffSpecularView(QWidget):
         self.spin_distance_mm.setToolTip("Sample-to-detector distance L used in pySAred flat-detector arctan geometry")
         self.spin_distance_mm.valueChanged.connect(lambda v: self._on_calibration_edited(distance_mm=v))
         self.spin_det_width_mm = QDoubleSpinBox()
+        self.spin_det_width_mm.setMinimumWidth(65)
+        self.spin_det_width_mm.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         self.spin_det_width_mm.setDecimals(1)
         self.spin_det_width_mm.setRange(1.0, 5000.0)
         self.spin_det_width_mm.setSingleStep(1.0)
@@ -932,6 +974,7 @@ class OffSpecularView(QWidget):
         self.spin_det_width_mm.setToolTip("Active detector readout width along X (pixel pitch p = width / nx)")
         self.spin_det_width_mm.valueChanged.connect(lambda v: self._on_calibration_edited(detector_width_mm=v))
         self.lbl_effective_scale = QLabel("—")
+        _fixed_width_text(self.lbl_effective_scale)
         self.lbl_effective_scale.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.lbl_effective_scale.setToolTip(
             "Effective small-angle scale degrees(arctan((width / nx) / L)) at the detector normal (x₀); "
@@ -953,6 +996,8 @@ class OffSpecularView(QWidget):
         shared = QGridLayout()
         shared.setHorizontalSpacing(6)
         self.spin_x0 = QDoubleSpinBox()
+        self.spin_x0.setMinimumWidth(65)
+        self.spin_x0.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         self.spin_x0.setDecimals(1)
         self.spin_x0.setRange(0.0, 4096.0)
         self.spin_x0.setSuffix(" px")
@@ -960,6 +1005,8 @@ class OffSpecularView(QWidget):
         self.spin_x0.setToolTip("Pixel of exit angle 2θ − θ (from the specular peak; editable)")
         self.spin_x0.valueChanged.connect(lambda v: self._on_calibration_edited(x0=v))
         self.spin_wavelength = QDoubleSpinBox()
+        self.spin_wavelength.setMinimumWidth(65)
+        self.spin_wavelength.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         self.spin_wavelength.setRange(0.1, 50.0)
         self.spin_wavelength.setDecimals(3)
         self.spin_wavelength.setSingleStep(0.01)
@@ -968,6 +1015,15 @@ class OffSpecularView(QWidget):
         self.spin_wavelength.setKeyboardTracking(False)
         self.spin_wavelength.setToolTip("Neutron wavelength used for Qx and Qz")
         self.spin_wavelength.valueChanged.connect(self._on_wavelength_changed)
+        shared.addWidget(QLabel("x₀:"), 0, 0)
+        shared.addWidget(self.spin_x0, 0, 1)
+        shared.addWidget(QLabel("λ:"), 0, 2)
+        shared.addWidget(self.spin_wavelength, 0, 3)
+        shared.setColumnStretch(1, 1)
+        shared.setColumnStretch(3, 1)
+        outer.addLayout(shared)
+
+        checks_flow = FlowLayout(margin=0, h_spacing=8, v_spacing=4)
         self.chk_af_increases = QCheckBox("α_f increases with X")
         self.chk_af_increases.setToolTip("Direction of the exit angle along displayed X")
         self.chk_af_increases.toggled.connect(lambda on: self._on_calibration_edited(sign=1 if on else -1))
@@ -976,15 +1032,9 @@ class OffSpecularView(QWidget):
                                     "α_f = −α_i (direct beam) and the ROI; untick for a clean α map")
         self.chk_show_db.setChecked(True)
         self.chk_show_db.toggled.connect(self._draw_roi_overlay)
-        shared.addWidget(QLabel("x₀:"), 0, 0)
-        shared.addWidget(self.spin_x0, 0, 1)
-        shared.addWidget(QLabel("λ:"), 0, 2)
-        shared.addWidget(self.spin_wavelength, 0, 3)
-        shared.addWidget(self.chk_af_increases, 1, 0, 1, 2)
-        shared.addWidget(self.chk_show_db, 1, 2, 1, 2)
-        shared.setColumnStretch(1, 1)
-        shared.setColumnStretch(3, 1)
-        outer.addLayout(shared)
+        checks_flow.addWidget(self.chk_af_increases)
+        checks_flow.addWidget(self.chk_show_db)
+        outer.addLayout(checks_flow)
 
         self._set_cal_status("Calibrated automatically from the direct beam when the map is computed.")
         return group

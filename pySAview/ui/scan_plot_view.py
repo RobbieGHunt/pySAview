@@ -16,6 +16,7 @@ from PyQt6.QtWidgets import (
     QComboBox,
     QDoubleSpinBox,
     QFileDialog,
+    QFrame,
     QGroupBox,
     QFormLayout,
     QHBoxLayout,
@@ -48,6 +49,7 @@ from pySAview.core.normalization import (
     is_count_channel, normalize_signal, log_error_bounds,
 )
 from pySAview.ui import icons
+from pySAview.ui.flow_layout import FlowLayout, configure_compact_combo, fit_combo_popup
 from pySAview.ui.plot_tools import (
     TABLE_FILTERS, ask_output_path, export_plot_image, install_context_export, tool_button,
 )
@@ -81,19 +83,27 @@ class ScanPlotView(QWidget):
         self._init_ui()
 
     def _init_ui(self) -> None:
+        self.setMinimumSize(0, 0)
         layout = QHBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setChildrenCollapsible(True)
+        splitter.setMinimumSize(0, 0)
+        splitter.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
         layout.addWidget(splitter)
 
         # ---------------- Left Panel: Controls ----------------
         ctrl_box = QWidget()
+        ctrl_box.setMinimumSize(0, 0)
         ctrl_layout = QVBoxLayout(ctrl_box)
         ctrl_layout.setContentsMargins(0, 0, 0, 0)
         ctrl_layout.setSpacing(10)
 
         self.control_tabs = QTabWidget()
+        self.control_tabs.setMinimumSize(0, 0)
+        self.control_tabs.setUsesScrollButtons(True)
+        self.control_tabs.tabBar().setExpanding(False)
         ctrl_layout.addWidget(self.control_tabs)
         processing_panel = QWidget()
         processing_layout = QVBoxLayout(processing_panel)
@@ -106,7 +116,7 @@ class ScanPlotView(QWidget):
         axis_layout.setSpacing(6)
 
         axis_layout.addWidget(QLabel("X Axis:"))
-        self.combo_x = QComboBox()
+        self.combo_x = configure_compact_combo(QComboBox(), min_chars=10)
         self.combo_x.currentIndexChanged.connect(self._on_axis_or_setting_changed)
         axis_layout.addWidget(self.combo_x)
 
@@ -124,7 +134,7 @@ class ScanPlotView(QWidget):
         axis_layout.addLayout(self.row_wavelength)
 
         axis_layout.addWidget(QLabel("Y Axis:"))
-        self.combo_y = QComboBox()
+        self.combo_y = configure_compact_combo(QComboBox(), min_chars=10)
         self.combo_y.currentIndexChanged.connect(self._on_axis_or_setting_changed)
         axis_layout.addWidget(self.combo_y)
 
@@ -136,7 +146,7 @@ class ScanPlotView(QWidget):
         proc_layout.setSpacing(6)
 
         proc_layout.addWidget(QLabel("Normalization:"))
-        self.combo_norm = QComboBox()
+        self.combo_norm = configure_compact_combo(QComboBox(), min_chars=10)
         self.combo_norm.addItem("Raw Counts (counts)", "raw")
         self.combo_norm.addItem("Counts / Monitor1 (unscaled ratio)", "monitor")
         self.combo_norm.addItem("Normalized to Time (cps)", "time")
@@ -145,6 +155,7 @@ class ScanPlotView(QWidget):
             self.combo_norm.count() - 1,
             "Counts / Monitor1 × a fixed reference monitor rate (monitor counts/s): counts per second "
             "at that monitor rate. Set the rate below.", Qt.ItemDataRole.ToolTipRole)
+        fit_combo_popup(self.combo_norm)
         self.combo_norm.currentIndexChanged.connect(self._on_axis_or_setting_changed)
         proc_layout.addWidget(self.combo_norm)
 
@@ -162,9 +173,10 @@ class ScanPlotView(QWidget):
         self.spin_reference_rate.hide()
 
         proc_layout.addWidget(QLabel("Counting uncertainty:"))
-        self.combo_uncertainty = QComboBox()
+        self.combo_uncertainty = configure_compact_combo(QComboBox(), min_chars=10)
         self.combo_uncertainty.addItem("Exact count intervals", "exact")
         self.combo_uncertainty.addItem("Propagated uncertainty", "standard")
+        fit_combo_popup(self.combo_uncertainty)
         self.combo_uncertainty.setToolTip("Exact intervals assume independent unweighted Poisson counts. Supplied variances use first-order propagation.")
         self.combo_uncertainty.currentIndexChanged.connect(self._on_axis_or_setting_changed)
         proc_layout.addWidget(self.combo_uncertainty)
@@ -179,11 +191,12 @@ class ScanPlotView(QWidget):
         proc_layout.addLayout(sigma_row)
 
         proc_layout.addWidget(QLabel("Polarization (Spin State):"))
-        self.combo_spin = QComboBox()
+        self.combo_spin = configure_compact_combo(QComboBox(), min_chars=10)
         self.combo_spin.addItem("Split by Flipper1 (d / u)", "split")
         self.combo_spin.addItem("Combined (All points)", "all")
         self.combo_spin.addItem("d — Down only (Flipper ON / 0)", "flipper0")
         self.combo_spin.addItem("u — Up only (Flipper OFF / 1)", "flipper1")
+        fit_combo_popup(self.combo_spin)
         self.combo_spin.currentIndexChanged.connect(self._on_axis_or_setting_changed)
         proc_layout.addWidget(self.combo_spin)
 
@@ -311,12 +324,16 @@ class ScanPlotView(QWidget):
         ctrl_layout.addStretch()
         controls_scroll = QScrollArea()
         controls_scroll.setWidgetResizable(True)
+        controls_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        controls_scroll.setMinimumSize(0, 0)
+        controls_scroll.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
         controls_scroll.setWidget(ctrl_box)
-        controls_scroll.setMinimumWidth(240)
         splitter.addWidget(controls_scroll)
 
         # ---------------- Right Panel: Plot & Data Tabs ----------------
         right_box = QWidget()
+        right_box.setMinimumSize(0, 0)
+        right_box.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
         right_layout = QVBoxLayout(right_box)
         right_layout.setContentsMargins(0, 0, 0, 0)
         right_layout.setSpacing(6)
@@ -333,6 +350,7 @@ class ScanPlotView(QWidget):
 
         self.lbl_coords = QLabel("Cursor: (X: -- , Y: --)")
         self.lbl_coords.setStyleSheet("color: #64748b; font-size: 11px;")
+        self.lbl_coords.setMinimumWidth(0)
         self.lbl_coords.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         self.lbl_coords.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         right_layout.addLayout(header_row)
@@ -350,8 +368,7 @@ class ScanPlotView(QWidget):
         right_layout.addWidget(self.lbl_processing)
 
         # Interactive Plot Toolbar (Pan, Box Zoom, Zoom In, Zoom Out, Auto-scale, Log Toggles)
-        toolbar_row = QHBoxLayout()
-        toolbar_row.setSpacing(6)
+        toolbar_row = FlowLayout(margin=0, h_spacing=6, v_spacing=4)
 
         self.btn_pan = tool_button("Pan: drag to move the chart", checkable=True)
         self.btn_pan.setChecked(True)
@@ -382,16 +399,15 @@ class ScanPlotView(QWidget):
         self.btn_export_plot.clicked.connect(self.export_image)
         for btn in (self.btn_pan, self.btn_box_zoom, self.btn_zoom_in, self.btn_zoom_out, self.btn_reset_view):
             toolbar_row.addWidget(btn)
-        toolbar_row.addSpacing(8)
         for btn in (self.btn_tool_log_y, self.btn_tool_log_x, self.btn_toggle_q, self.btn_export_plot):
             toolbar_row.addWidget(btn)
-        toolbar_row.addSpacing(8)
         # The cursor readout shares the toolbar row, as in the other plot tabs.
-        toolbar_row.addWidget(self.lbl_coords, 1)
+        toolbar_row.addWidget(self.lbl_coords)
         right_layout.addLayout(toolbar_row)
 
         # pyqtgraph Plot
         self.plot_widget = pg.PlotWidget()
+        self.plot_widget.setMinimumSize(0, 0)
         install_context_export(self.plot_widget, self._default_export_name("reflectivity", ".png"), self._source_paths)
         self.legend = self.plot_widget.addLegend()
         self.legend.anchor(itemPos=(1, 0), parentPos=(1, 0), offset=(-15, 15))
@@ -404,6 +420,8 @@ class ScanPlotView(QWidget):
         # Bottom Panel: Statistics and Spreadsheet
         data_header = QHBoxLayout()
         data_title = QLabel("Plotted Data Points")
+        data_title.setMinimumWidth(0)
+        data_title.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         data_title.setStyleSheet("font-weight: 700; font-size: 13px; color: #0284c7;")
         data_header.addWidget(data_title, 1)
         self.btn_toggle_data_panel = QPushButton()
@@ -416,6 +434,9 @@ class ScanPlotView(QWidget):
         data_header.addWidget(self.btn_toggle_data_panel)
         right_layout.addLayout(data_header)
         bottom_tabs = self.bottom_tabs = QTabWidget()
+        bottom_tabs.setMinimumSize(0, 0)
+        bottom_tabs.setUsesScrollButtons(True)
+        bottom_tabs.tabBar().setExpanding(False)
         self.chk_show_data_panel.toggled.connect(self._update_data_panel_toggle)
         self._update_data_panel_toggle()
 
@@ -424,12 +445,15 @@ class ScanPlotView(QWidget):
         data_tbl_layout = QVBoxLayout(tab_data)
         data_tbl_layout.setContentsMargins(4, 4, 4, 4)
         self.curve_data_table = QTableWidget()
+        self.curve_data_table.setMinimumSize(0, 0)
         data_tbl_layout.addWidget(self.curve_data_table)
         bottom_tabs.addTab(tab_data, "Plotted Data Points")
 
         right_layout.addWidget(bottom_tabs, 1)
 
         splitter.addWidget(right_box)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 3)
         splitter.setSizes([320, 760])
 
     def _format_scan_label(self, scan: ScanData) -> str:
@@ -631,6 +655,8 @@ class ScanPlotView(QWidget):
 
         self.combo_spin.setEnabled(has_flipper)
 
+        fit_combo_popup(self.combo_x)
+        fit_combo_popup(self.combo_y)
         self.combo_x.blockSignals(False)
         self.combo_y.blockSignals(False)
 

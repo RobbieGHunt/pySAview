@@ -6,19 +6,21 @@ from pathlib import Path
 from typing import Any
 import numpy as np
 import pyqtgraph as pg
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QSize, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QCursor
 from PyQt6.QtWidgets import (
     QApplication,
     QButtonGroup,
     QCheckBox,
     QComboBox,
-    QGroupBox,
     QFileDialog,
-    QMessageBox,
+    QFrame,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
+    QMessageBox,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QSlider,
     QSpinBox,
@@ -34,8 +36,21 @@ from pySAview.core.nexus_reader import NexusReader
 from pySAview.core.scan_calculations import integrate_roi_2d
 from pySAview.core.roi import pixel_bounds
 from pySAview.ui import icons
+from pySAview.ui.flow_layout import (
+    FlowLayout,
+    configure_compact_combo,
+    fit_combo_popup,
+    make_flow_group,
+)
 from pySAview.ui.plot_tools import export_plot_image, install_context_export, tool_button
 from pySAview.ui.theme import apply_plot_theme, get_safe_colormap
+
+
+class _CompactPlotWidget(pg.PlotWidget):
+    """PlotWidget with a compact preferred sizeHint so side-panel scroll areas do not inflate."""
+
+    def sizeHint(self) -> QSize:
+        return QSize(180, 120)
 
 
 class DetectorView(QWidget):
@@ -76,49 +91,48 @@ class DetectorView(QWidget):
         self._init_ui()
 
     def _init_ui(self) -> None:
+        self.setMinimumSize(0, 0)
         main_layout = QVBoxLayout(self)
         main_layout.setContentsMargins(10, 10, 10, 10)
         main_layout.setSpacing(8)
 
         # ---------------- Top Controls / Scrubber Bar ----------------
-        ctrl_bar = QHBoxLayout()
-        ctrl_bar.setSpacing(8)
+        ctrl_bar = FlowLayout(margin=0, h_spacing=8, v_spacing=6)
 
         self.btn_play = tool_button("Play / pause through the frames")
         self.btn_play.setIcon(icons.get_icon("play", is_dark=self.is_dark_mode))
         self.btn_play.clicked.connect(self._toggle_play)
-        ctrl_bar.addWidget(self.btn_play)
 
         self.btn_prev = tool_button("Previous frame")
         self.btn_prev.setIcon(icons.get_icon("chevron_left", is_dark=self.is_dark_mode))
         self.btn_prev.clicked.connect(self._step_backward)
-        ctrl_bar.addWidget(self.btn_prev)
 
         self.btn_next = tool_button("Next frame")
         self.btn_next.setIcon(icons.get_icon("chevron_right", is_dark=self.is_dark_mode))
         self.btn_next.clicked.connect(self._step_forward)
-        ctrl_bar.addWidget(self.btn_next)
+        ctrl_bar.addWidget(make_flow_group(self.btn_play, self.btn_prev, self.btn_next, spacing=4))
 
-        ctrl_bar.addWidget(QLabel("Spin:"))
-        self.combo_spin_filter = QComboBox()
+        self.combo_spin_filter = configure_compact_combo(QComboBox(), min_chars=14)
         self.combo_spin_filter.addItem("All Frames", "all")
         self.combo_spin_filter.addItem("u — Spin Up (Flipper OFF / 1)", "up")
         self.combo_spin_filter.addItem("d — Spin Down (Flipper ON / 0)", "down")
         self.combo_spin_filter.addItem("u + d — Sum of channels", "sum")
+        fit_combo_popup(self.combo_spin_filter)
         self.combo_spin_filter.currentIndexChanged.connect(self._on_spin_filter_changed)
-        ctrl_bar.addWidget(self.combo_spin_filter)
+        ctrl_bar.addWidget(make_flow_group(QLabel("Spin:"), self.combo_spin_filter, spacing=6))
 
-        ctrl_bar.addWidget(QLabel("Step:"))
         self.spin_step = QSpinBox()
         self.spin_step.setRange(0, 0)
         self.spin_step.setFixedWidth(70)
         self.spin_step.valueChanged.connect(self._on_step_spin_changed)
-        ctrl_bar.addWidget(self.spin_step)
 
         self.slider_step = QSlider(Qt.Orientation.Horizontal)
         self.slider_step.setRange(0, 0)
+        self.slider_step.setMinimumWidth(40)
         self.slider_step.valueChanged.connect(self._on_slider_changed)
-        ctrl_bar.addWidget(self.slider_step, 1)
+        ctrl_bar.addWidget(
+            make_flow_group(QLabel("Step:"), self.spin_step, self.slider_step, spacing=6, expanding=True)
+        )
 
         self.chk_log_img = QCheckBox("Log Scale")
         self.chk_log_img.setChecked(True)
@@ -130,27 +144,31 @@ class DetectorView(QWidget):
         self.chk_show_roi.toggled.connect(self._toggle_roi_visibility)
         ctrl_bar.addWidget(self.chk_show_roi)
 
-        ctrl_bar.addWidget(QLabel("Colormap:"))
-        self.combo_cmap = QComboBox()
+        self.combo_cmap = configure_compact_combo(QComboBox(), min_chars=8)
         self.combo_cmap.addItems(["turbo", "viridis", "inferno", "plasma", "cividis", "gray", "magma"])
         self.combo_cmap.setCurrentText("turbo")
+        fit_combo_popup(self.combo_cmap)
         self.combo_cmap.currentTextChanged.connect(self._on_cmap_changed)
-        ctrl_bar.addWidget(self.combo_cmap)
+        ctrl_bar.addWidget(make_flow_group(QLabel("Colormap:"), self.combo_cmap, spacing=6))
 
         main_layout.addLayout(ctrl_bar)
 
         # ---------------- Central Splitter: 2D Image + ROI Controls & 1D Profiles ----------------
         splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setChildrenCollapsible(True)
+        splitter.setMinimumSize(0, 0)
+        splitter.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
 
         # Left / Center: 2D Detector Image
         img_container = QWidget()
+        img_container.setMinimumSize(0, 0)
+        img_container.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
         img_layout = QVBoxLayout(img_container)
         img_layout.setContentsMargins(0, 0, 0, 0)
         img_layout.setSpacing(6)
 
         # Interactive 2D Image Toolbar
-        img_toolbar = QHBoxLayout()
-        img_toolbar.setSpacing(6)
+        img_toolbar = FlowLayout(margin=0, h_spacing=6, v_spacing=4)
 
         # Icon-only tools, matching the Scan Charts and Off-Specular toolbars.
         self.btn_img_pan = tool_button("Pan: drag to move the detector image", checkable=True)
@@ -169,16 +187,24 @@ class DetectorView(QWidget):
         self.btn_img_reset.clicked.connect(self._img_reset_view)
         self.btn_img_export = tool_button("Export the frame as a PNG or SVG image")
         self.btn_img_export.clicked.connect(self.export_image)
-        for btn in (self.btn_img_pan, self.btn_img_box_zoom, self.btn_img_zoom_in, self.btn_img_zoom_out,
-                    self.btn_img_reset, self.btn_img_export):
-            img_toolbar.addWidget(btn)
-        img_toolbar.addSpacing(8)
+        img_toolbar.addWidget(
+            make_flow_group(
+                self.btn_img_pan,
+                self.btn_img_box_zoom,
+                self.btn_img_zoom_in,
+                self.btn_img_zoom_out,
+                self.btn_img_reset,
+                self.btn_img_export,
+                spacing=4,
+            )
+        )
 
         # Per-frame angles, spin and counts (the step itself is in the controls above).
         self.lbl_frame_info = QLabel("")
         self.lbl_frame_info.setStyleSheet("color: #64748b; font-size: 11px;")
+        self.lbl_frame_info.setMinimumWidth(0)
         self.lbl_frame_info.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
-        img_toolbar.addWidget(self.lbl_frame_info, 1)
+        img_toolbar.addWidget(self.lbl_frame_info)
 
         self.lbl_img_coords = QLabel("Pixel: (X: ----, Y: ----)  |  Counts: --------")
         self.lbl_img_coords.setStyleSheet("color: #64748b; font-size: 11px;")
@@ -189,6 +215,7 @@ class DetectorView(QWidget):
         img_layout.addLayout(img_toolbar)
 
         self.plot_2d = pg.PlotWidget()
+        self.plot_2d.setMinimumSize(0, 0)
         self.plot_2d.setAspectLocked(True)
         self.plot_2d.showGrid(x=False, y=False)
         self.plot_2d.getViewBox().setMouseMode(pg.ViewBox.PanMode)
@@ -199,17 +226,19 @@ class DetectorView(QWidget):
         self.plot_2d.addItem(self.img_item)
 
         apply_plot_theme(self.plot_2d, self.is_dark_mode)
-        img_layout.addWidget(self.plot_2d)
+        img_layout.addWidget(self.plot_2d, 1)
         splitter.addWidget(img_container)
 
-        # Right: Interactive ROI Definition & 1D Cuts
+        # Right: Interactive ROI Definition & 1D Cuts (scrollable when compressed)
         sidebar_container = QWidget()
+        sidebar_container.setMinimumSize(0, 0)
         sidebar_layout = QVBoxLayout(sidebar_container)
         sidebar_layout.setContentsMargins(0, 0, 0, 0)
         sidebar_layout.setSpacing(10)
 
         # 1. Interactive ROI Definition Card
         roi_ctrl_group = QGroupBox("Define Region of Interest (ROI)")
+        roi_ctrl_group.setMinimumSize(0, 0)
         roi_ctrl_layout = QVBoxLayout(roi_ctrl_group)
         roi_ctrl_layout.setSpacing(8)
 
@@ -220,12 +249,16 @@ class DetectorView(QWidget):
         vbox_x = QVBoxLayout()
         vbox_x.addWidget(QLabel("X Min:"))
         self.spin_x0 = QSpinBox()
+        self.spin_x0.setMinimumWidth(55)
+        self.spin_x0.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         self.spin_x0.setRange(0, 1023)
         self.spin_x0.valueChanged.connect(self._on_spin_roi_changed)
         vbox_x.addWidget(self.spin_x0)
 
         vbox_x.addWidget(QLabel("X Max:"))
         self.spin_x1 = QSpinBox()
+        self.spin_x1.setMinimumWidth(55)
+        self.spin_x1.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         self.spin_x1.setRange(0, 1024)
         self.spin_x1.valueChanged.connect(self._on_spin_roi_changed)
         vbox_x.addWidget(self.spin_x1)
@@ -235,12 +268,16 @@ class DetectorView(QWidget):
         vbox_y = QVBoxLayout()
         vbox_y.addWidget(QLabel("Y Min:"))
         self.spin_y0 = QSpinBox()
+        self.spin_y0.setMinimumWidth(55)
+        self.spin_y0.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         self.spin_y0.setRange(0, 1023)
         self.spin_y0.valueChanged.connect(self._on_spin_roi_changed)
         vbox_y.addWidget(self.spin_y0)
 
         vbox_y.addWidget(QLabel("Y Max:"))
         self.spin_y1 = QSpinBox()
+        self.spin_y1.setMinimumWidth(55)
+        self.spin_y1.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         self.spin_y1.setRange(0, 1024)
         self.spin_y1.valueChanged.connect(self._on_spin_roi_changed)
         vbox_y.addWidget(self.spin_y1)
@@ -249,12 +286,12 @@ class DetectorView(QWidget):
         roi_ctrl_layout.addLayout(inputs_grid)
 
         # Action buttons for ROI
-        btns_row = QHBoxLayout()
+        btns_row = FlowLayout(margin=0, h_spacing=6, v_spacing=6)
         self.btn_apply_roi = QPushButton("Apply ROI to Scan Chart")
         self.btn_apply_roi.setIcon(icons.get_icon("chart", is_dark=self.is_dark_mode))
         self.btn_apply_roi.setStyleSheet("font-weight: 700; color: #0284c7;")
         self.btn_apply_roi.clicked.connect(self._apply_roi_to_scan_chart)
-        btns_row.addWidget(self.btn_apply_roi, 1)
+        btns_row.addWidget(self.btn_apply_roi)
 
         self.btn_auto_fit = QPushButton("Auto-Fit ROI")
         self.btn_auto_fit.setIcon(icons.get_icon("sparkles", is_dark=self.is_dark_mode))
@@ -268,7 +305,8 @@ class DetectorView(QWidget):
         self.btn_reset_roi.clicked.connect(self._reset_to_file_roi)
         btns_row.addWidget(self.btn_reset_roi)
         roi_ctrl_layout.addLayout(btns_row)
-        sidecar_row = QHBoxLayout()
+
+        sidecar_row = FlowLayout(margin=0, h_spacing=6, v_spacing=6)
         self.btn_save_roi = QPushButton("Save ROI…")
         self.btn_load_roi = QPushButton("Load ROI…")
         self.btn_save_roi.clicked.connect(self._save_roi_definition)
@@ -279,27 +317,40 @@ class DetectorView(QWidget):
         roi_ctrl_layout.addLayout(sidecar_row)
 
         self.lbl_roi_status = QLabel("Drag yellow box on detector to adjust ROI.")
+        self.lbl_roi_status.setWordWrap(True)
+        self.lbl_roi_status.setMinimumWidth(0)
+        self.lbl_roi_status.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         self.lbl_roi_status.setStyleSheet("color: #64748b; font-size: 11px;")
         roi_ctrl_layout.addWidget(self.lbl_roi_status)
 
         self.lbl_roi_metrics = QLabel("ROI Counts: --")
         self.lbl_roi_metrics.setWordWrap(True)
+        self.lbl_roi_metrics.setMinimumWidth(0)
+        self.lbl_roi_metrics.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         roi_ctrl_layout.addWidget(self.lbl_roi_metrics)
 
         sidebar_layout.addWidget(roi_ctrl_group)
 
         # 2. 1D Horizontal Cut
-        sidebar_layout.addWidget(QLabel("Horizontal Profile (X-Cut through ROI):"))
-        self.plot_x_cut = pg.PlotWidget()
+        lbl_x_cut = QLabel("Horizontal Profile (X-Cut through ROI):")
+        lbl_x_cut.setMinimumWidth(0)
+        lbl_x_cut.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        sidebar_layout.addWidget(lbl_x_cut)
+        self.plot_x_cut = _CompactPlotWidget()
         self.plot_x_cut.showGrid(x=True, y=True, alpha=0.3)
+        self.plot_x_cut.setMinimumHeight(100)
         self.plot_x_cut.setMaximumHeight(160)
         apply_plot_theme(self.plot_x_cut, self.is_dark_mode)
         sidebar_layout.addWidget(self.plot_x_cut)
 
         # 3. 1D Vertical Cut
-        sidebar_layout.addWidget(QLabel("Vertical Profile (Y-Cut through ROI):"))
-        self.plot_y_cut = pg.PlotWidget()
+        lbl_y_cut = QLabel("Vertical Profile (Y-Cut through ROI):")
+        lbl_y_cut.setMinimumWidth(0)
+        lbl_y_cut.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        sidebar_layout.addWidget(lbl_y_cut)
+        self.plot_y_cut = _CompactPlotWidget()
         self.plot_y_cut.showGrid(x=True, y=True, alpha=0.3)
+        self.plot_y_cut.setMinimumHeight(100)
         self.plot_y_cut.setMaximumHeight(160)
         apply_plot_theme(self.plot_y_cut, self.is_dark_mode)
         sidebar_layout.addWidget(self.plot_y_cut)
@@ -308,7 +359,16 @@ class DetectorView(QWidget):
             install_context_export(widget, (lambda k=kind: self._default_export_name(k)), self._source_paths)
 
         sidebar_layout.addStretch()
-        splitter.addWidget(sidebar_container)
+
+        sidebar_scroll = QScrollArea()
+        sidebar_scroll.setWidgetResizable(True)
+        sidebar_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        sidebar_scroll.setMinimumSize(0, 0)
+        sidebar_scroll.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
+        sidebar_scroll.setWidget(sidebar_container)
+        splitter.addWidget(sidebar_scroll)
+        splitter.setStretchFactor(0, 2)
+        splitter.setStretchFactor(1, 1)
         splitter.setSizes([680, 360])
 
         main_layout.addWidget(splitter, 1)

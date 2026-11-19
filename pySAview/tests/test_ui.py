@@ -539,6 +539,137 @@ def test_scan_charts_log_toolbar_buttons(qtbot, main_window: MainWindow):
     main_window.act_dark_mode.setChecked(False)
 
 
+def test_window_unrestricted_compression_empty_and_loaded(qtbot, qapp, example_nxs_path: Path):
+    """MainWindow launches at 1300x860 and compresses freely horizontally & vertically across all tabs."""
+    win = MainWindow()
+    qtbot.addWidget(win)
+    win.show()
+    qapp.processEvents()
+
+    try:
+        # 1. Default launch size is 1300x860 with tiny minimum size floor
+        assert (win.width(), win.height()) == (1300, 860)
+        assert win.minimumSize().width() <= 250
+        assert win.minimumSize().height() <= 200
+        assert win.minimumSizeHint().width() <= 250
+        assert win.minimumSizeHint().height() <= 200
+
+        # 2. Empty window compresses cleanly across all 5 tabs with sidebar expanded, minimized, and re-expanded
+        for minimized in (False, True, False):
+            win.session_files_view.set_minimized(minimized)
+            qapp.processEvents()
+            for tab_idx in range(win.tabs.count()):
+                win.tabs.setCurrentIndex(tab_idx)
+                for target_w, target_h in ((320, 240), (500, 350)):
+                    win.resize(target_w, target_h)
+                    qapp.processEvents()
+                    assert (win.width(), win.height()) == (target_w, target_h)
+        assert win.session_files_view.minimumWidth() == 0
+
+        # 3. Loaded scan (005572.nxs) + long status text + tree minimize/expand cycle + dark mode
+        win.resize(1300, 860)
+        assert win.load_file(example_nxs_path)
+        win.status_bar.showMessage("LongStatusTextWithoutSpaces_" * 20)
+        win.tabs.setCurrentIndex(0)
+        qapp.processEvents()
+        win.view_hierarchy.set_tree_minimized(True)
+        qapp.processEvents()
+        assert win.view_hierarchy.left_widget.maximumWidth() == 34
+        win.view_hierarchy.set_tree_minimized(False)
+        qapp.processEvents()
+        assert win.view_hierarchy.left_widget.minimumWidth() == 0
+
+        for dark in (False, True):
+            win.act_dark_mode.setChecked(dark)
+            qapp.processEvents()
+            assert win.minimumSize().width() <= 250
+            assert win.minimumSize().height() <= 200
+            assert win.minimumSizeHint().width() <= 250
+            assert win.minimumSizeHint().height() <= 200
+            for tab_idx in range(win.tabs.count()):
+                win.tabs.setCurrentIndex(tab_idx)
+                for target_w, target_h in ((320, 240), (500, 350)):
+                    win.resize(target_w, target_h)
+                    qapp.processEvents()
+                    assert (win.width(), win.height()) == (target_w, target_h)
+        win.act_dark_mode.setChecked(False)
+
+        # 4. Restoring to 1300x860 keeps primary plots and cut plots comfortably visible
+        win.resize(1300, 860)
+        win.tabs.setCurrentIndex(2)
+        qapp.processEvents()
+        det = win.view_detector
+        assert det.plot_2d.width() > 300 and det.plot_2d.height() > 200
+        assert det.plot_x_cut.height() >= 100 and det.plot_y_cut.height() >= 100
+        assert det.lbl_img_coords.minimumWidth() == 290 and det.lbl_img_coords.maximumWidth() == 290
+
+        win.tabs.setCurrentIndex(3)
+        qapp.processEvents()
+        off = win.view_offspec
+        assert off.plot.width() > 300 and off.plot.height() > 200
+        assert off.plot_row.height() >= 110 and off.plot_col.height() >= 110
+    finally:
+        win.view_offspec.shutdown()
+        win.close()
+
+
+def test_flow_layout_wraps_control_bars_without_overlap(qtbot, qapp, main_window: MainWindow):
+    """Wide top control bars in DetectorView and OffSpecularView wrap smoothly without overlap."""
+    from PyQt6.QtWidgets import QComboBox
+    from pySAview.ui.flow_layout import FlowLayout
+
+    main_window.show()
+    qapp.processEvents()
+
+    try:
+        # Compact combo boxes must not bloat minimumSizeHint horizontally
+        for combo in (
+            main_window.combo_active_file,
+            main_window.view_detector.combo_spin_filter,
+            main_window.view_detector.combo_cmap,
+            main_window.view_offspec.combo_spin,
+            main_window.view_offspec.combo_y_source,
+            main_window.view_offspec.combo_norm,
+            main_window.view_offspec.combo_y_axis,
+            main_window.view_offspec.combo_cmap,
+        ):
+            assert combo.sizeAdjustPolicy() == QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+            assert combo.minimumSizeHint().width() < 300
+
+        # Toggle optional asymmetry spinbox visible so FlowLayout wrapping is exercised with it too
+        main_window.view_offspec.spin_min_counts.setVisible(True)
+
+        for tab_idx in (2, 3):
+            main_window.tabs.setCurrentIndex(tab_idx)
+            view = main_window.tabs.widget(tab_idx)
+            top_flow = view.layout().itemAt(0).layout()
+            assert isinstance(top_flow, FlowLayout)
+
+            heights = {}
+            for width, height in ((1600, 860), (1300, 860), (500, 350)):
+                main_window.resize(width, height)
+                qapp.processEvents()
+                heights[width] = top_flow.geometry().height()
+
+                # No overlapping visible sibling widgets in any FlowLayout inside the tab
+                for flow in view.findChildren(FlowLayout):
+                    visible_rects = []
+                    for i in range(flow.count()):
+                        w = flow.itemAt(i).widget()
+                        if w is not None and not w.isHidden() and w.isVisibleTo(view):
+                            visible_rects.append(w.geometry())
+                    for a in range(len(visible_rects)):
+                        for b in range(a + 1, len(visible_rects)):
+                            inter = visible_rects[a].intersected(visible_rects[b])
+                            assert not (inter.width() > 0 and inter.height() > 0)
+
+            assert heights[500] > heights[1600]
+    finally:
+        main_window.view_offspec.shutdown()
+        main_window.close()
+
+
+
 
 
 

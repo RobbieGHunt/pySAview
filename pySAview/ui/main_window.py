@@ -75,13 +75,24 @@ class MainWindow(QMainWindow):
     def _init_ui(self) -> None:
         # Central Horizontal Splitter: Session Files Sidebar on Left, Tabbed Views on Right
         self.session_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.session_splitter.setChildrenCollapsible(True)
+        self.session_splitter.setMinimumSize(0, 0)
+        self.session_splitter.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
         self.setCentralWidget(self.session_splitter)
 
         self.session_files_view = SessionFilesView()
         self.session_splitter.addWidget(self.session_files_view)
 
         self.tabs = QTabWidget()
+        self.tabs.setMinimumSize(0, 0)
+        self.tabs.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
+        self.tabs.setUsesScrollButtons(True)
+        self.tabs.tabBar().setExpanding(False)
+        self.tabs.tabBar().setUsesScrollButtons(True)
+        self.tabs.tabBar().setMinimumWidth(0)
         self.session_splitter.addWidget(self.tabs)
+        self.session_splitter.setStretchFactor(0, 1)
+        self.session_splitter.setStretchFactor(1, 4)
         self.session_splitter.setSizes([280, 1020])
 
         self.view_hierarchy = FileStructureView()
@@ -117,6 +128,8 @@ class MainWindow(QMainWindow):
 
         # Status Bar
         self.status_bar = QStatusBar()
+        self.status_bar.setMinimumWidth(0)
+        self.status_bar.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         self.setStatusBar(self.status_bar)
         self.status_bar.showMessage("Ready. Open one or more NeXus (.nxs) files to begin.")
 
@@ -270,6 +283,8 @@ class MainWindow(QMainWindow):
     def _create_toolbar(self) -> None:
         toolbar = QToolBar("Main Controls")
         toolbar.setMovable(False)
+        toolbar.setMinimumSize(0, 0)
+        toolbar.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         self.addToolBar(toolbar)
 
         toolbar.addAction(self.act_toggle_sidebar)
@@ -286,9 +301,9 @@ class MainWindow(QMainWindow):
         toolbar.addWidget(lbl_active)
 
         self.combo_active_file = QComboBox()
-        self.combo_active_file.setMinimumWidth(260)
-        self.combo_active_file.setMinimumContentsLength(24)
         self.combo_active_file.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.combo_active_file.setMinimumContentsLength(6)
+        self.combo_active_file.setMinimumWidth(0)
         self.combo_active_file.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.combo_active_file.currentIndexChanged.connect(self._on_active_file_combo_changed)
         toolbar.addWidget(self.combo_active_file)
