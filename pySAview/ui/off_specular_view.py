@@ -92,7 +92,7 @@ def _decimals_for_step(step: float) -> int:
 _tool_button = tool_button
 
 
-CUT_HINT = "Turn on the crosshair tool (⌖ in the map toolbar) and click the map to drop the cuts."
+CUT_HINT = "Click Drop Cut Lines, Horizontal, or Vertical above (or ⌖ in the toolbar) to drop draggable cuts."
 
 
 def _fixed_width_text(label: QLabel) -> None:
@@ -712,8 +712,8 @@ class OffSpecularView(QWidget):
         self.mouse_group.addButton(self.btn_box_zoom)
         self.btn_pan.clicked.connect(lambda: self.plot.getViewBox().setMouseMode(pg.ViewBox.PanMode))
         self.btn_box_zoom.clicked.connect(lambda: self.plot.getViewBox().setMouseMode(pg.ViewBox.RectMode))
-        self.btn_crosshair = _tool_button("Crosshair: click the map to drop it, drag its centre to move "
-                                          "the cuts, click elsewhere to jump; toggle off to remove")
+        self.btn_crosshair = _tool_button("Cut lines / crosshair: drop draggable horizontal & vertical cut "
+                                          "lines on the map; click to jump or toggle off to remove")
         self.btn_crosshair.setCheckable(True)
         self.btn_crosshair.toggled.connect(self._on_crosshair_toggled)
         tools.addWidget(self.btn_crosshair)
@@ -751,10 +751,20 @@ class OffSpecularView(QWidget):
         self.plot.addItem(self.img_item)
         self.colorbar = pg.ColorBarItem(values=(0, 1), colorMap=get_safe_colormap("turbo"), interactive=True, width=14)
         self.colorbar.setImageItem(self.img_item, insert_in=self.plot.getPlotItem())
-        # Crosshair: guide lines follow one draggable centre marker; hidden until dropped.
-        guide = pg.mkPen("#ffffff", width=1, style=Qt.PenStyle.DashLine)
-        self.line_row = pg.InfiniteLine(angle=0, movable=False, pen=guide)
-        self.line_x = pg.InfiniteLine(angle=90, movable=False, pen=guide)
+        # Draggable cut lines linked to the 1D cut plots, plus a shared crosshair intersection marker.
+        hover_pen = pg.mkPen("#facc15", width=2.5)
+        self.line_row = pg.InfiniteLine(
+            angle=0,
+            movable=True,
+            pen=pg.mkPen("#38bdf8", width=1.5, style=Qt.PenStyle.DashLine),
+            hoverPen=hover_pen,
+        )
+        self.line_x = pg.InfiniteLine(
+            angle=90,
+            movable=True,
+            pen=pg.mkPen("#f43f5e", width=1.5, style=Qt.PenStyle.DashLine),
+            hoverPen=hover_pen,
+        )
         self.crosshair = pg.TargetItem(pos=(0, 0), size=16, symbol="crosshair", movable=True,
                                        pen=pg.mkPen("#ffffff", width=2), hoverPen=pg.mkPen("#facc15", width=2),
                                        brush=pg.mkBrush(0, 0, 0, 0))
@@ -762,6 +772,8 @@ class OffSpecularView(QWidget):
             item.setZValue(z)
             item.setVisible(False)
             self.plot.addItem(item)
+        self.line_row.sigPositionChanged.connect(self._on_line_row_moved)
+        self.line_x.sigPositionChanged.connect(self._on_line_x_moved)
         self.crosshair.sigPositionChanged.connect(self._on_crosshair_moved)
         self.plot.scene().sigMouseMoved.connect(self._on_mouse_moved)
         self.plot.scene().sigMouseClicked.connect(self._on_map_clicked)
@@ -778,6 +790,27 @@ class OffSpecularView(QWidget):
         right_layout.addWidget(self._build_calibration_panel())
         group = QGroupBox("Cuts through the map")
         group_layout = QVBoxLayout(group)
+        cut_bar = QHBoxLayout()
+        cut_bar.setSpacing(6)
+        self.btn_drop_cuts = QPushButton("Drop Cut Lines")
+        self.btn_drop_cuts.setCheckable(True)
+        self.btn_drop_cuts.setToolTip(
+            "Drop or remove linked draggable horizontal and vertical cut lines on the 2D map"
+        )
+        self.btn_drop_cuts.toggled.connect(self._on_drop_cuts_toggled)
+        self.btn_cut_h = QPushButton("Horizontal")
+        self.btn_cut_h.setCheckable(True)
+        self.btn_cut_h.setToolTip("Show or hide the draggable horizontal cut line on the 2D map")
+        self.btn_cut_h.toggled.connect(self._on_single_cut_toggled)
+        self.btn_cut_v = QPushButton("Vertical")
+        self.btn_cut_v.setCheckable(True)
+        self.btn_cut_v.setToolTip("Show or hide the draggable vertical cut line on the 2D map")
+        self.btn_cut_v.toggled.connect(self._on_single_cut_toggled)
+        for btn in (self.btn_drop_cuts, self.btn_cut_h, self.btn_cut_v):
+            btn.setStyleSheet("QPushButton { padding: 4px 8px; }")
+            cut_bar.addWidget(btn)
+        cut_bar.addStretch(1)
+        group_layout.addLayout(cut_bar)
         self.lbl_row_cut = QLabel("Horizontal cut (selected point):")
         _fixed_width_text(self.lbl_row_cut)
         group_layout.addWidget(self.lbl_row_cut)
@@ -899,7 +932,8 @@ class OffSpecularView(QWidget):
         for widget in (self.combo_spin, self.combo_y_source, self.combo_norm, self.combo_y_axis,
                        self.btn_export_png):
             widget.setEnabled(enabled)
-        for widget in (self.spin_y0, self.spin_y1, self.btn_crosshair, self.spin_dpp, self.spin_x0,
+        for widget in (self.spin_y0, self.spin_y1, self.btn_crosshair, self.btn_drop_cuts,
+                       self.btn_cut_h, self.btn_cut_v, self.spin_dpp, self.spin_x0,
                        self.chk_af_increases, self.btn_fit_db, self.chk_show_db, self.spin_wavelength):
             widget.setEnabled(enabled)
 
@@ -911,6 +945,10 @@ class OffSpecularView(QWidget):
         self._map = None
         self._norm = None
         self._pending_key = None
+        self._crosshair_placed = False
+        self._set_cut_buttons(False, False)
+        for item in (self.crosshair, self.line_row, self.line_x):
+            item.setVisible(False)
         self.img_item.clear()
         self._clear_alpha_items()
         self._clear_roi_overlay()
@@ -1237,6 +1275,8 @@ class OffSpecularView(QWidget):
         if self._crosshair_placed:
             # Keep the crosshair on the same map cell (also across axis modes).
             self._place_crosshair(*self._cell_center(self._sel_row, self._sel_x))
+        elif self.btn_cut_h.isChecked() or self.btn_cut_v.isChecked():
+            self._place_crosshair(*self._default_cut_pos())
 
     def _apply_no_data_background(self) -> None:
         # Neutral slate behind the map: blank (log-omitted / excluded) pixels stay
@@ -1248,6 +1288,8 @@ class OffSpecularView(QWidget):
         self.img_item.clear()
         self._clear_alpha_items()
         self._clear_roi_overlay()
+        for item in (self.crosshair, self.line_row, self.line_x):
+            item.setVisible(False)
         self._clear_cuts()
         self.lbl_coords.setText("")
         self._set_notice(message)
@@ -1430,14 +1472,95 @@ class OffSpecularView(QWidget):
             return self._th_geom is not None
         return True
 
-    def _on_crosshair_toggled(self, checked: bool) -> None:
-        if not checked:
+    def _cut_line_flags(self) -> tuple[bool, bool]:
+        """(show_horizontal_line, show_vertical_line) on the 2D map."""
+        return self.btn_cut_h.isChecked(), self.btn_cut_v.isChecked()
+
+    def _cut_curve_flags(self) -> tuple[bool, bool]:
+        """(show_row_plot_curve, show_col_plot_curve) matching the active cut lines."""
+        show_h, show_v = self._cut_line_flags()
+        if self._alpha_mode() and not self._q_mode():
+            # In α_i vs α_f: vertical line (x = α_i) drives plot_row (vs α_f);
+            # horizontal line (y = α_f) drives plot_col (vs α_i).
+            return show_v, show_h
+        return show_h, show_v
+
+    def _set_cut_buttons(self, h_on: bool, v_on: bool) -> None:
+        for btn, state in (
+            (self.btn_cut_h, h_on),
+            (self.btn_cut_v, v_on),
+            (self.btn_drop_cuts, h_on and v_on),
+            (self.btn_crosshair, h_on or v_on),
+        ):
+            btn.blockSignals(True)
+            btn.setChecked(state)
+            btn.blockSignals(False)
+
+    def _sync_cut_visibility(self) -> None:
+        show_h, show_v = self._cut_line_flags()
+        placed = self._crosshair_placed and self._map_ready()
+        self.line_row.setVisible(placed and show_h)
+        self.line_x.setVisible(placed and show_v)
+        self.crosshair.setVisible(placed and show_h and show_v)
+
+    def _update_cut_line_styles(self) -> None:
+        """Colour-match each cut line on the map to the 1D cut plot it drives."""
+        row_color = "#38bdf8"
+        col_color = "#f43f5e"
+        if self._alpha_mode() and not self._q_mode():
+            h_color, v_color = col_color, row_color
+        else:
+            h_color, v_color = row_color, col_color
+        self.line_row.setPen(pg.mkPen(h_color, width=1.5, style=Qt.PenStyle.DashLine))
+        self.line_x.setPen(pg.mkPen(v_color, width=1.5, style=Qt.PenStyle.DashLine))
+
+    def _default_cut_pos(self) -> tuple[float, float]:
+        """Useful default drop position: specular x0 (or ROI centre) at mid-scan row."""
+        if self._alpha_mode() and self._alpha_geom is not None:
+            rows = self._alpha_geom["rows"]
+            row = int(rows[rows.size // 2])
+        elif self._theta_mode() and self._th_geom is not None:
+            rows = self._th_geom["rows"]
+            row = int(rows[rows.size // 2])
+        else:
+            n = self._norm.frame_indices.size if self._norm is not None else 1
+            row = max(0, n // 2)
+        cal = getattr(self.scan_data, "angle_calibration", None) if self.scan_data is not None else None
+        nx = self._map.nx if self._map is not None else 1
+        if cal is not None and 0.0 <= cal.x0 < nx:
+            x = int(min(max(round(cal.x0), 0), nx - 1))
+        else:
+            bounds = self._scan_roi_bounds()
+            x_mid = 0.5 * (bounds[0][0] + bounds[0][1]) if bounds else nx / 2.0
+            x = int(min(max(round(x_mid), 0), nx - 1))
+        return self._cell_center(row, x)
+
+    def _apply_cut_selection(self, h_on: bool, v_on: bool) -> None:
+        self._set_cut_buttons(h_on, v_on)
+        if not (h_on or v_on):
             self._crosshair_placed = False
             for item in (self.crosshair, self.line_row, self.line_x):
                 item.setVisible(False)
             self._clear_cuts()
+            return
+        if not self._map_ready():
+            self.lbl_cut_hint.setText("Click the map to drop the cut lines once loaded.")
+            return
+        if not self._crosshair_placed:
+            self._place_crosshair(*self._default_cut_pos())
         else:
-            self.lbl_cut_hint.setText("Click the map to drop the crosshair.")
+            self._sync_cut_visibility()
+            self._update_cut_line_styles()
+            self._update_cuts()
+
+    def _on_crosshair_toggled(self, checked: bool) -> None:
+        self._apply_cut_selection(checked, checked)
+
+    def _on_drop_cuts_toggled(self, checked: bool) -> None:
+        self._apply_cut_selection(checked, checked)
+
+    def _on_single_cut_toggled(self, _checked: bool) -> None:
+        self._apply_cut_selection(self.btn_cut_h.isChecked(), self.btn_cut_v.isChecked())
 
     def _on_map_clicked(self, event) -> None:
         if not self.btn_crosshair.isChecked() or not self._map_ready():
@@ -1454,11 +1577,35 @@ class OffSpecularView(QWidget):
             event.accept()
 
     def _place_crosshair(self, x: float, y: float) -> None:
+        if not (self.btn_cut_h.isChecked() or self.btn_cut_v.isChecked()):
+            self._set_cut_buttons(True, True)
         self._crosshair_placed = True
-        for item in (self.crosshair, self.line_row, self.line_x):
-            item.setVisible(True)
+        self._sync_cut_visibility()
+        self._update_cut_line_styles()
+        self.crosshair.blockSignals(True)
         self.crosshair.setPos((x, y))
+        self.crosshair.blockSignals(False)
         self._on_crosshair_moved(force=True)
+
+    def _on_line_row_moved(self) -> None:
+        if not self._crosshair_placed or not self._map_ready():
+            return
+        x = float(self.crosshair.pos().x())
+        y = float(self.line_row.value())
+        self.crosshair.blockSignals(True)
+        self.crosshair.setPos((x, y))
+        self.crosshair.blockSignals(False)
+        self._on_crosshair_moved()
+
+    def _on_line_x_moved(self) -> None:
+        if not self._crosshair_placed or not self._map_ready():
+            return
+        x = float(self.line_x.value())
+        y = float(self.crosshair.pos().y())
+        self.crosshair.blockSignals(True)
+        self.crosshair.setPos((x, y))
+        self.crosshair.blockSignals(False)
+        self._on_crosshair_moved()
 
     def _on_crosshair_moved(self, *_, force: bool = False) -> None:
         if not self._crosshair_placed or not self._map_ready():
@@ -1471,8 +1618,12 @@ class OffSpecularView(QWidget):
             self.crosshair.blockSignals(True)
             self.crosshair.setPos((x, y))
             self.crosshair.blockSignals(False)
+        self.line_x.blockSignals(True)
         self.line_x.setValue(x)
+        self.line_x.blockSignals(False)
+        self.line_row.blockSignals(True)
         self.line_row.setValue(y)
+        self.line_row.blockSignals(False)
         if self._alpha_mode():
             self._cross_alpha = (x, y)
             row, col = self._alpha_cut_cell(x, y)
@@ -1535,6 +1686,10 @@ class OffSpecularView(QWidget):
         if not self._crosshair_placed or not self._map_ready():
             self._clear_cuts()
             return
+        row_active, col_active = self._cut_curve_flags()
+        if not (row_active or col_active):
+            self._clear_cuts()
+            return
         row = min(self._sel_row, self._norm.frame_indices.size - 1)
         x = min(self._sel_x, self._map.nx - 1)
         log = self._log_active()
@@ -1548,20 +1703,30 @@ class OffSpecularView(QWidget):
         if self._alpha_mode():
             self._update_alpha_cuts(positive)
             return
-        self._row_curve.setData(np.arange(self._map.nx) + 0.5, positive(self._cut_values[row]))
-        if self._theta_mode():
-            g = self._th_geom
-            order = np.argsort(g["theta"], kind="stable")
-            self._col_curve.setData(g["theta"][order], positive(self._cut_values[g["rows"][order], x]))
-        else:
-            col_vals = self._cut_values[:, x]
-            self._col_curve.setData(np.arange(col_vals.size) + 0.5, positive(col_vals))
-        for curve in (self._row_curve, self._col_curve):
-            curve.setVisible(True)
         frame = int(self._norm.frame_indices[row])
-        self.lbl_row_cut.setText(f"Horizontal cut — point {frame} ({self._describe_frame(frame)}):")
-        self.lbl_col_cut.setText(f"Vertical cut — X pixel {x}:")
-        self.lbl_cut_hint.setText("Drag the crosshair centre to move the cuts; click elsewhere to jump.")
+        if row_active:
+            self._row_curve.setData(np.arange(self._map.nx) + 0.5, positive(self._cut_values[row]))
+            self._row_curve.setVisible(True)
+            self.lbl_row_cut.setText(f"Horizontal cut — point {frame} ({self._describe_frame(frame)}):")
+        else:
+            self._row_curve.setData([], [])
+            self._row_curve.setVisible(False)
+            self.lbl_row_cut.setText("Horizontal cut (toggle Horizontal above):")
+        if col_active:
+            if self._theta_mode():
+                g = self._th_geom
+                order = np.argsort(g["theta"], kind="stable")
+                self._col_curve.setData(g["theta"][order], positive(self._cut_values[g["rows"][order], x]))
+            else:
+                col_vals = self._cut_values[:, x]
+                self._col_curve.setData(np.arange(col_vals.size) + 0.5, positive(col_vals))
+            self._col_curve.setVisible(True)
+            self.lbl_col_cut.setText(f"Vertical cut — X pixel {x}:")
+        else:
+            self._col_curve.setData([], [])
+            self._col_curve.setVisible(False)
+            self.lbl_col_cut.setText("Vertical cut (toggle Vertical above):")
+        self.lbl_cut_hint.setText("Drag the cut lines or crosshair on the map to move cuts; click to jump.")
 
     def _angle_decimals(self, name: str) -> int:
         """Decimals matching the scan's resolution in an angle channel (its finest step)."""
@@ -1812,19 +1977,30 @@ class OffSpecularView(QWidget):
                 vals.append(self._cut_values[g["rows"][j], px])
             return np.array(xs_q, dtype=float).reshape(-1, 2), np.array(vals, dtype=float)
 
-        af_const_qz = constant_qz_alpha_f(g["alpha_i"], qz, lam)
-        af_const_qx = constant_qx_alpha_f(g["alpha_i"], qx, lam, side=side)
-        q_rows, v_rows = sample(af_const_qz)
-        order = np.argsort(q_rows[:, 0])
-        self._row_curve.setData(q_rows[order, 0] * QX_SCALE, positive(v_rows[order]))
-        q_cols, v_cols = sample(af_const_qx)
-        order = np.argsort(q_cols[:, 1])
-        self._col_curve.setData(q_cols[order, 1], positive(v_cols[order]))
-        for curve in (self._row_curve, self._col_curve):
-            curve.setVisible(True)
-        self.lbl_row_cut.setText(f"Cut at constant Qz = {qz:.4f} Å⁻¹ ({v_rows.size} points):")
-        self.lbl_col_cut.setText(f"Cut at constant Qx = {qx_view:.3g}×10⁻³ Å⁻¹ ({v_cols.size} points):")
-        self.lbl_cut_hint.setText("Drag the crosshair centre to move the cuts; click elsewhere to jump.")
+        row_active, col_active = self._cut_curve_flags()
+        if row_active:
+            af_const_qz = constant_qz_alpha_f(g["alpha_i"], qz, lam)
+            q_rows, v_rows = sample(af_const_qz)
+            order = np.argsort(q_rows[:, 0])
+            self._row_curve.setData(q_rows[order, 0] * QX_SCALE, positive(v_rows[order]))
+            self._row_curve.setVisible(True)
+            self.lbl_row_cut.setText(f"Cut at constant Qz = {qz:.4f} Å⁻¹ ({v_rows.size} points):")
+        else:
+            self._row_curve.setData([], [])
+            self._row_curve.setVisible(False)
+            self.lbl_row_cut.setText("Horizontal cut at constant Qz (toggle Horizontal above):")
+        if col_active:
+            af_const_qx = constant_qx_alpha_f(g["alpha_i"], qx, lam, side=side)
+            q_cols, v_cols = sample(af_const_qx)
+            order = np.argsort(q_cols[:, 1])
+            self._col_curve.setData(q_cols[order, 1], positive(v_cols[order]))
+            self._col_curve.setVisible(True)
+            self.lbl_col_cut.setText(f"Cut at constant Qx = {qx_view:.3g}×10⁻³ Å⁻¹ ({v_cols.size} points):")
+        else:
+            self._col_curve.setData([], [])
+            self._col_curve.setVisible(False)
+            self.lbl_col_cut.setText("Vertical cut at constant Qx (toggle Vertical above):")
+        self.lbl_cut_hint.setText("Drag the cut lines or crosshair on the map to move cuts; click to jump.")
 
     def _on_axes_changed(self) -> None:
         self._redraw()
@@ -2246,25 +2422,36 @@ class OffSpecularView(QWidget):
         if self._q_mode():
             self._update_q_cuts(positive, *view)
             return
+        row_active, col_active = self._cut_curve_flags()
         xv, yv = (float(v) for v in self._from_view(*view))
         k = self._nearest_strip(xv)
         row = int(g["rows"][k])
         cal = g["cal"]
-        self._row_curve.setData(g["base"][k] + alpha_f_offsets(self._map.nx, cal),
-                                positive(self._cut_values[row]))
-        col = np.full(g["rows"].size, np.nan)
-        for j in range(g["rows"].size):
-            px = self._pixel_for_alpha(j, yv)
-            if px is not None:
-                col[j] = self._cut_values[g["rows"][j], px]
-        order = np.argsort(g["alpha_i"], kind="stable")
-        self._col_curve.setData(g["alpha_i"][order], positive(col[order]))
-        for curve in (self._row_curve, self._col_curve):
-            curve.setVisible(True)
-        frame = int(self._norm.frame_indices[row])
-        self.lbl_row_cut.setText(f"Cut at α_i = {g['alpha_i'][k]:.4f}° — point {frame} ({self._describe_frame(frame)}):")
-        self.lbl_col_cut.setText(f"Cut at constant α_f = {yv:.4f}°:")
-        self.lbl_cut_hint.setText("Drag the crosshair centre to move the cuts; click elsewhere to jump.")
+        if row_active:
+            self._row_curve.setData(g["base"][k] + alpha_f_offsets(self._map.nx, cal),
+                                    positive(self._cut_values[row]))
+            self._row_curve.setVisible(True)
+            frame = int(self._norm.frame_indices[row])
+            self.lbl_row_cut.setText(f"Cut at α_i = {g['alpha_i'][k]:.4f}° — point {frame} ({self._describe_frame(frame)}):")
+        else:
+            self._row_curve.setData([], [])
+            self._row_curve.setVisible(False)
+            self.lbl_row_cut.setText("Vertical cut at α_i (toggle Vertical above):")
+        if col_active:
+            col = np.full(g["rows"].size, np.nan)
+            for j in range(g["rows"].size):
+                px = self._pixel_for_alpha(j, yv)
+                if px is not None:
+                    col[j] = self._cut_values[g["rows"][j], px]
+            order = np.argsort(g["alpha_i"], kind="stable")
+            self._col_curve.setData(g["alpha_i"][order], positive(col[order]))
+            self._col_curve.setVisible(True)
+            self.lbl_col_cut.setText(f"Cut at constant α_f = {yv:.4f}°:")
+        else:
+            self._col_curve.setData([], [])
+            self._col_curve.setVisible(False)
+            self.lbl_col_cut.setText("Horizontal cut at constant α_f (toggle Horizontal above):")
+        self.lbl_cut_hint.setText("Drag the cut lines or crosshair on the map to move cuts; click to jump.")
 
     def _draw_alpha_overlay(self) -> None:
         g = self._alpha_geom

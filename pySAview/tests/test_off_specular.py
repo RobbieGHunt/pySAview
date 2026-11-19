@@ -767,3 +767,89 @@ def test_offspec_settings_reuse_items_and_preserve_values(qtbot, window):
     assert view._alpha_items[0] is q_mesh
     view.chk_log.setChecked(True)
     assert view._alpha_items[0] is q_mesh
+
+
+def test_cut_lines_drop_buttons_and_draggable_lines_all_modes(qtbot, window):
+    """The Cuts panel provides prominent Horizontal/Vertical/Drop Cut Lines controls synced
+    with btn_crosshair, drops at a useful specular/mid-scan default with immediate cut data,
+    and lets users drag line_row and line_x directly."""
+    view = window.view_offspec
+    window.tabs.setCurrentWidget(view)
+    view._request_compute()
+    _wait_for_map(qtbot, view)
+
+    assert view.line_row.movable and view.line_x.movable
+    assert not view.btn_drop_cuts.isChecked()
+    assert not view.btn_cut_h.isChecked() and not view.btn_cut_v.isChecked()
+    assert not view.line_row.isVisible() and not view.line_x.isVisible()
+
+    # 1. Clicking "Drop Cut Lines" immediately drops both lines at specular x0 + mid-scan θ and populates cuts.
+    view.btn_drop_cuts.click()
+    assert view.btn_drop_cuts.isChecked() and view.btn_crosshair.isChecked()
+    assert view.btn_cut_h.isChecked() and view.btn_cut_v.isChecked()
+    assert view.line_row.isVisible() and view.line_x.isVisible() and view.crosshair.isVisible()
+    assert view._row_curve.isVisible() and view._col_curve.isVisible()
+    assert view._row_curve.yData.size == 1024 and np.any(np.isfinite(view._row_curve.yData))
+    assert view._col_curve.yData.size == view._norm.frame_indices.size and np.any(np.isfinite(view._col_curve.yData))
+    cal = window.loaded_scans[str(EXAMPLE.resolve())].angle_calibration
+    assert abs(view._sel_x - round(cal.x0)) <= 1
+    assert view._sel_row == int(view._th_geom["rows"][view._th_geom["rows"].size // 2])
+
+    # 2. Dragging line_row directly updates crosshair Y, _sel_row, and _row_curve without moving line_x.
+    x_before = view.line_x.value()
+    th_25 = float(view._th_geom["theta"][25])
+    view.line_row.setValue(th_25)
+    assert view._sel_row == 25
+    assert view.crosshair.pos().y() == pytest.approx(th_25)
+    assert view.line_x.value() == pytest.approx(x_before)
+    expected_row = np.where(view._norm.values[25] > 0, view._norm.values[25], np.nan)
+    np.testing.assert_array_equal(view._row_curve.yData, expected_row)
+
+    # 3. Dragging line_x directly updates crosshair X, _sel_x, and _col_curve without moving line_row.
+    y_before = view.line_row.value()
+    view.line_x.setValue(512.4)
+    assert view._sel_x == 512
+    assert view.crosshair.pos().x() == pytest.approx(512.4)
+    assert view.line_row.value() == pytest.approx(y_before)
+    assert "512" in view.lbl_col_cut.text()
+
+    # 4. Out-of-bounds drag on either line clamps back onto the map.
+    view.line_x.setValue(99999.0)
+    assert view._sel_x == 1023
+    view.line_row.setValue(-999.0)
+    assert view._sel_row == 0
+
+    # 5. Individual Horizontal / Vertical toggles show only the selected line and cut curve.
+    view.btn_cut_v.click()  # turn off Vertical -> Horizontal only
+    assert view.btn_cut_h.isChecked() and not view.btn_cut_v.isChecked()
+    assert not view.btn_drop_cuts.isChecked() and view.btn_crosshair.isChecked()
+    assert view.line_row.isVisible() and not view.line_x.isVisible() and not view.crosshair.isVisible()
+    assert view._row_curve.isVisible() and not view._col_curve.isVisible()
+
+    # In α_i vs α_f mode, horizontal line is constant α_f -> drives _col_curve; vertical is α_i -> _row_curve.
+    view.combo_y_axis.setCurrentIndex(view.combo_y_axis.findData("alpha"))
+    assert view.line_row.isVisible() and not view.line_x.isVisible()
+    assert view._col_curve.isVisible() and not view._row_curve.isVisible()
+
+    view.btn_cut_v.click()  # turn Vertical back on -> both active
+    assert view.btn_drop_cuts.isChecked()
+    assert view.line_row.isVisible() and view.line_x.isVisible() and view.crosshair.isVisible()
+    assert view._row_curve.isVisible() and view._col_curve.isVisible()
+
+    # Dragging lines works in Qx vs Qz and Point modes too.
+    for axis_mode in ("q", "point"):
+        view.combo_y_axis.setCurrentIndex(view.combo_y_axis.findData(axis_mode))
+        x0, x1, y0, y1 = view._map_extent()
+        mid_x, mid_y = 0.5 * (x0 + x1), 0.5 * (y0 + y1)
+        view.line_x.setValue(mid_x)
+        view.line_row.setValue(mid_y)
+        assert view.crosshair.pos().x() == pytest.approx(mid_x)
+        assert view.crosshair.pos().y() == pytest.approx(mid_y)
+        assert view._row_curve.isVisible() and view._col_curve.isVisible()
+
+    # Turning Drop Cut Lines off removes everything cleanly.
+    view.btn_drop_cuts.click()
+    assert not view.btn_drop_cuts.isChecked() and not view.btn_crosshair.isChecked()
+    assert not view.btn_cut_h.isChecked() and not view.btn_cut_v.isChecked()
+    assert not view.line_row.isVisible() and not view.line_x.isVisible() and not view.crosshair.isVisible()
+    assert not view._row_curve.isVisible() and not view._col_curve.isVisible()
