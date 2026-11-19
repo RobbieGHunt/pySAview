@@ -197,9 +197,16 @@ def test_tab_computes_map_and_cuts(qtbot, window, tmp_path):
     assert view.spin_y0.isEnabled() and view.spin_y1.isEnabled()
     flipper = scan.variables["Flipper1"].data
     assert view.combo_spin.currentData() == "up"
+    assert view.combo_y_axis.currentData() == "th"
     assert view._norm.values.shape == (int(np.sum(flipper == 1)), 1024)
-    assert view.img_item.image is not None
+    assert view._th_geom is not None and len(view._alpha_items) == 1  # exact-cell PColorMesh in θ
+    assert view.img_item.image is None
     assert len(view._roi_items) == 3  # two ROI edges + the fitted direct-beam line
+
+    # Switching to Point mode uses the uniform-row ImageItem.
+    view.combo_y_axis.setCurrentIndex(view.combo_y_axis.findData("point"))
+    assert view._th_geom is None and view.img_item.image is not None
+    view.combo_y_axis.setCurrentIndex(view.combo_y_axis.findData("th"))
 
     view.combo_y_source.setCurrentIndex(view.combo_y_source.findData("roi"))
     _, _, y0, y1 = scan.detector_roi
@@ -270,8 +277,18 @@ def test_crosshair_drop_and_drag_updates_cuts_without_rescaling(qtbot, window):
     _wait_for_map(qtbot, view)
     assert not view.crosshair.isVisible() and not view._row_curve.isVisible()
 
+    # Crosshair in the default X pixel vs θ view maps real θ coordinates to measured cells.
     view.btn_crosshair.setChecked(True)
-    view._place_crosshair(370.5, 40.2)  # what a click on the map does
+    th_40 = float(view._th_geom["theta"][40])
+    view._place_crosshair(370.5, th_40)
+    assert view.crosshair.isVisible() and view.line_x.isVisible()
+    assert (view._sel_row, view._sel_x) == (40, 370)
+    np.testing.assert_allclose(view._col_curve.xData, view._th_geom["theta"])
+
+    # Switching to Point mode preserves the selected cell and drags in row coordinates.
+    view.combo_y_axis.setCurrentIndex(view.combo_y_axis.findData("point"))
+    assert (view._sel_row, view._sel_x) == (40, 370)
+    view._place_crosshair(370.5, 40.2)  # what a click on the Point map does
     assert view.crosshair.isVisible() and view.line_x.isVisible()
     assert (view._sel_row, view._sel_x) == (40, 370)
     expected = np.where(view._norm.values[40] > 0, view._norm.values[40], np.nan)  # log: zeros omitted
@@ -385,3 +402,95 @@ def test_asymmetry_mode_in_tab(qtbot, window, tmp_path):
 
     view.combo_spin.setCurrentIndex(view.combo_spin.findData("up"))
     assert view.chk_log.isEnabled() and view.spin_min_counts.isHidden()
+
+
+def test_theta_view_uses_true_angle_mesh_without_step_size_kink(qtbot, window):
+    """Example scan 005572 changes Δθ from 0.01° to 0.03° to 0.04°; the θ mesh must place
+    each frame at its actual θ so linear features in angle have no artificial slope kink."""
+    from pySAview.ui.off_specular_view import CachedMeshItem
+
+    view = window.view_offspec
+    window.tabs.setCurrentWidget(view)
+    view._request_compute()
+    _wait_for_map(qtbot, view)
+    assert view.combo_y_axis.currentData() == "th"
+    assert len(view._alpha_items) == 1 and isinstance(view._alpha_items[0], CachedMeshItem)
+
+    g = view._th_geom
+    assert g is not None
+    # Step widths in the mesh follow actual Δθ (~0.01° early, ~0.03° mid, ~0.04° late).
+    widths = g["strips"][:, 1] - g["strips"][:, 0]
+    assert widths[10] == pytest.approx(0.01, abs=1e-3)
+    assert widths[70] == pytest.approx(0.03, abs=1e-3)
+    assert widths[130] == pytest.approx(0.04, abs=1e-3)
+
+    # Every cell centre round-trips back to its exact (row, x) across all step regimes.
+    for row, x in ((10, 370), (50, 500), (70, 620), (130, 800)):
+        assert view._cell_at(*view._cell_center(row, x)) == (row, x)
+
+    # Direct-beam overlay (first _roi_items curve) is linear in θ across step transitions.
+    db_line = view._roi_items[0]
+    slopes = np.diff(db_line.xData) / np.diff(db_line.yData)
+    cal = window.loaded_scans[str(EXAMPLE.resolve())].angle_calibration
+    # Since tth ≈ 2 * th in a specular scan, dx / dθ ≈ 2 * slope_px_per_deg everywhere.
+    np.testing.assert_allclose(slopes, 2.0 * cal.fit.slope_px_per_deg, rtol=0.05)
+
+
+def test_sum_spin_frames_pooled_exposure_and_uncertainty():
+    from pySAview.core.off_specular import SummedSpinMap, sum_spin_frames
+
+    counts = np.array([[30.0, 0.0], [10.0, 0.0], [5.0, 2.0], [7.0, 3.0]])  # (0,1) and (2,3) pairs
+    raw = sum_spin_frames(counts, [0, 2], [1, 3], "raw")
+    assert isinstance(raw, SummedSpinMap)
+    np.testing.assert_allclose(raw.values, [[40.0, 0.0], [12.0, 5.0]])
+    np.testing.assert_allclose(raw.standard_uncertainty, np.sqrt([[40.0, 0.0], [12.0, 5.0]]))
+
+    # Pooled time normalization: (N_u + N_d) / (t_u + t_d); invalid partner exposure -> NaN + warning.
+    timed = sum_spin_frames(counts, [0, 2], [1, 3], "time", exposure=[2.0, 6.0, 3.0, 0.0])
+    np.testing.assert_allclose(timed.values[0], [40.0 / 8.0, 0.0])
+    np.testing.assert_allclose(timed.standard_uncertainty[0], [np.sqrt(40.0) / 8.0, 0.0])
+    assert np.all(np.isnan(timed.values[1])) and timed.warnings
+
+    # Pooled monitor normalization: (N_u + N_d) / (M_u + M_d) with Poisson monitor variance M_u + M_d.
+    mon = sum_spin_frames(counts[:2], [0], [1], "monitor", monitor=[200.0, 100.0])
+    assert mon.values[0, 0] == pytest.approx(40.0 / 300.0)
+    expected_var = 40.0 / 300.0**2 + 40.0**2 * 300.0 / 300.0**4
+    assert mon.standard_uncertainty[0, 0] == pytest.approx(np.sqrt(expected_var))
+    assert mon.standard_uncertainty[0, 1] == 0.0
+
+    # Supplied monitor variances add in quadrature: v_M = v_Mu + v_Md.
+    mon_v = sum_spin_frames(counts[:2], [0], [1], "monitor", monitor=[200.0, 100.0], monitor_variance=[250.0, 150.0])
+    expected_var_custom = 40.0 / 300.0**2 + 40.0**2 * 400.0 / 300.0**4
+    assert mon_v.standard_uncertainty[0, 0] == pytest.approx(np.sqrt(expected_var_custom))
+
+
+def test_sum_spin_mode_in_tab_and_export(qtbot, window):
+    from pySAview.core.off_specular import SummedSpinMap
+
+    view = window.view_offspec
+    window.tabs.setCurrentWidget(view)
+    view._request_compute()
+    _wait_for_map(qtbot, view)
+
+    view.combo_norm.setCurrentIndex(view.combo_norm.findData("monitor"))
+    view.combo_spin.setCurrentIndex(view.combo_spin.findData("sum"))
+    norm = view._norm
+    assert isinstance(norm, SummedSpinMap) and norm.values.shape == (151, 1024)
+    assert view.chk_log.isEnabled() and view.combo_cmap.isEnabled() and view.spin_min_counts.isHidden()
+
+    # Check pooled monitor value against raw map counts and Monitor1.
+    scan = window.loaded_scans[str(EXAMPLE.resolve())]
+    mon = scan.variables["Monitor1"].data
+    u0, d0 = int(norm.frame_indices[0]), int(norm.partner_indices[0])
+    expected = (view._map.counts[u0] + view._map.counts[d0]) / (mon[u0] + mon[d0])
+    np.testing.assert_allclose(norm.values[0], expected)
+
+    # Works in α_i/α_f and Qx/Qz views and exports PartnerFrame.
+    for axes in ("alpha", "q", "th"):
+        view.combo_y_axis.setCurrentIndex(view.combo_y_axis.findData(axes))
+        assert view._map_ready()
+    header, columns, rows = view.export_table()
+    assert columns[:3] == ["Frame", "PartnerFrame", "XPixel"]
+    first = next(rows)
+    assert first[0] == u0 and first[1] == d0
+    assert any("pooled u + d" in line for line in header)

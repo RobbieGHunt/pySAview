@@ -28,6 +28,7 @@ from PyQt6.QtWidgets import (
 )
 
 from pySAview.core.models import ScanData
+from pySAview.core.off_specular import _written_frames, pair_spin_frames
 from pySAview.core.roi_record import ROIRecord, save_roi, load_roi
 from pySAview.core.nexus_reader import NexusReader
 from pySAview.core.scan_calculations import integrate_roi_2d
@@ -53,6 +54,7 @@ class DetectorView(QWidget):
         self._total_frames: int = 0
         self._current_frame_data: np.ndarray | None = None
         self._filtered_indices: list[int] = []
+        self._paired_frames: dict[int, int] = {}
         self._current_filtered_pos: int = 0
 
         # Animation timer for scan play
@@ -97,8 +99,9 @@ class DetectorView(QWidget):
         ctrl_bar.addWidget(QLabel("Spin:"))
         self.combo_spin_filter = QComboBox()
         self.combo_spin_filter.addItem("All Frames", "all")
-        self.combo_spin_filter.addItem("u — Spin Up (F=1)", "up")
-        self.combo_spin_filter.addItem("d — Spin Down (F=0)", "down")
+        self.combo_spin_filter.addItem("u — Spin Up (Flipper OFF / 1)", "up")
+        self.combo_spin_filter.addItem("d — Spin Down (Flipper ON / 0)", "down")
+        self.combo_spin_filter.addItem("u + d — Sum of channels", "sum")
         self.combo_spin_filter.currentIndexChanged.connect(self._on_spin_filter_changed)
         ctrl_bar.addWidget(self.combo_spin_filter)
 
@@ -391,6 +394,7 @@ class DetectorView(QWidget):
         self._update_filtered_indices(reset_pos=False)
 
     def _update_filtered_indices(self, reset_pos: bool = False) -> None:
+        self._paired_frames = {}
         if self.scan_data is None or self._total_frames <= 0:
             self._filtered_indices = []
             self.slider_step.setRange(0, 0)
@@ -407,8 +411,42 @@ class DetectorView(QWidget):
         elif mode == "down":
             f_data = flipper.data
             self._filtered_indices = [i for i in range(min(self._total_frames, len(f_data))) if float(f_data[i]) == 0]
+        elif mode == "sum":
+            f_data = np.asarray(flipper.data, dtype=float)[:self._total_frames]
+            th_var = self.scan_data.variables.get("th")
+            tth_var = self.scan_data.variables.get("tth")
+            written = None
+            if (self.reader is not None and self.scan_data.detector_path
+                    and self.scan_data.detector_path in self.reader.file):
+                written = _written_frames(self.reader.file[self.scan_data.detector_path])
+            if th_var is not None and tth_var is not None:
+                ups, downs = pair_spin_frames(
+                    th_var.data[:self._total_frames], tth_var.data[:self._total_frames], f_data, written,
+                )
+            else:
+                ups_raw = np.flatnonzero(f_data == 1)
+                downs_raw = np.flatnonzero(f_data == 0)
+                n_p = min(ups_raw.size, downs_raw.size)
+                ups, downs = ups_raw[:n_p], downs_raw[:n_p]
+            self._paired_frames = {int(u): int(d) for u, d in zip(ups, downs)}
+            self._filtered_indices = [int(u) for u in ups]
 
         if not self._filtered_indices:
+            if mode == "sum":
+                self._current_frame_data = None
+                self.img_item.clear()
+                self.plot_x_cut.clear()
+                self.plot_y_cut.clear()
+                self.slider_step.blockSignals(True)
+                self.spin_step.blockSignals(True)
+                self.slider_step.setRange(0, 0)
+                self.spin_step.setRange(0, 0)
+                self.slider_step.setValue(0)
+                self.spin_step.setValue(0)
+                self.slider_step.blockSignals(False)
+                self.spin_step.blockSignals(False)
+                self.lbl_frame_info.setText("No matching u/d frame pairs found to sum.")
+                return
             self._filtered_indices = list(range(self._total_frames))
 
         n_filt = len(self._filtered_indices)
@@ -444,7 +482,12 @@ class DetectorView(QWidget):
 
     def _default_export_name(self, kind: str) -> str:
         stem = Path(self.scan_data.file_path).stem if self.scan_data is not None and self.scan_data.file_path else "scan"
-        return f"{stem}_{kind}{self._current_frame_idx:04d}.png" if kind == "frame" else f"{stem}_{kind}.png"
+        if kind == "frame":
+            partner = self._paired_frames.get(self._current_frame_idx) if self.combo_spin_filter.currentData() == "sum" else None
+            if partner is not None:
+                return f"{stem}_frame{self._current_frame_idx:04d}_{partner:04d}_sum.png"
+            return f"{stem}_{kind}{self._current_frame_idx:04d}.png"
+        return f"{stem}_{kind}.png"
 
     def export_image(self) -> Path | None:
         """Save the displayed frame (with ROI box) as PNG or SVG."""
@@ -833,17 +876,25 @@ class DetectorView(QWidget):
             return
 
         self._current_frame_idx = frame_idx
+        partner_idx = self._paired_frames.get(frame_idx) if self.combo_spin_filter.currentData() == "sum" else None
         try:
             raw_frame = self.reader.read_detector_frame(frame_idx)
+            partner_raw = self.reader.read_detector_frame(partner_idx) if partner_idx is not None else None
         except Exception:
             raw_frame = None
+            partner_raw = None
 
-        if raw_frame is None:
+        if raw_frame is None or (partner_idx is not None and partner_raw is None):
             return
+
+        if partner_raw is not None:
+            raw_combined = np.asarray(raw_frame, dtype=float) + np.asarray(partner_raw, dtype=float)
+        else:
+            raw_combined = np.asarray(raw_frame, dtype=float)
 
         # Rotate 90 degrees clockwise and mirror horizontally as requested:
         # np.fliplr(np.rot90(raw_frame, -1)) is equivalent to raw_frame.T
-        frame_rot = np.rot90(raw_frame, -1)
+        frame_rot = np.rot90(raw_combined, -1)
         frame_mir = np.fliplr(frame_rot)
         frame = np.asarray(frame_mir, dtype=float)
         self._current_frame_data = frame
@@ -869,9 +920,13 @@ class DetectorView(QWidget):
         flip_val = self.scan_data.variables["Flipper1"].data[frame_idx] if "Flipper1" in self.scan_data.variables else np.nan
         total_counts = float(np.sum(frame))
 
-        spin_str = {0: "d (F=0)", 1: "u (F=1)"}.get(flip_val, "spin ?")
-        self.lbl_frame_info.setText(
-            f"Frame {frame_idx}   θ {th_val:.4f}°   2θ {tth_val:.4f}°   {spin_str}   {total_counts:,.0f} counts")
+        if partner_idx is not None:
+            self.lbl_frame_info.setText(
+                f"Frames {frame_idx}+{partner_idx}   θ {th_val:.4f}°   2θ {tth_val:.4f}°   u+d (sum)   {total_counts:,.0f} counts")
+        else:
+            spin_str = {0: "d (ON)", 1: "u (OFF)"}.get(flip_val, "spin ?")
+            self.lbl_frame_info.setText(
+                f"Frame {frame_idx}   θ {th_val:.4f}°   2θ {tth_val:.4f}°   {spin_str}   {total_counts:,.0f} counts")
 
         # Prepare 2D Image
         img_display = frame

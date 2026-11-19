@@ -182,8 +182,8 @@ class ScanPlotView(QWidget):
         self.combo_spin = QComboBox()
         self.combo_spin.addItem("Split by Flipper1 (d / u)", "split")
         self.combo_spin.addItem("Combined (All points)", "all")
-        self.combo_spin.addItem("d — Down only (Flipper OFF / 0)", "flipper0")
-        self.combo_spin.addItem("u — Up only (Flipper ON / 1)", "flipper1")
+        self.combo_spin.addItem("d — Down only (Flipper ON / 0)", "flipper0")
+        self.combo_spin.addItem("u — Up only (Flipper OFF / 1)", "flipper1")
         self.combo_spin.currentIndexChanged.connect(self._on_axis_or_setting_changed)
         proc_layout.addWidget(self.combo_spin)
 
@@ -197,8 +197,8 @@ class ScanPlotView(QWidget):
 
         self.shade_range = (0.0, 1.0)
         self.spin_style_controls = {}
-        for spin, title, default_map in (("d", "d / Down — Flipper OFF (0)", "Blues"),
-                                          ("u", "u / Up — Flipper ON (1)", "Reds")):
+        for spin, title, default_map in (("d", "d / Down — Flipper ON (0)", "Blues"),
+                                          ("u", "u / Up — Flipper OFF (1)", "Reds")):
             group = QGroupBox(title)
             form = QFormLayout(group)
             palette = QComboBox()

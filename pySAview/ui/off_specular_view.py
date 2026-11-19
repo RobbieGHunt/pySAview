@@ -38,21 +38,30 @@ from PyQt6.QtWidgets import (
 
 from pySAview.core.angle_calibration import (
     AngleCalibration,
+    DETECTOR_WIDTH_MM,
     CalibrationError,
     alpha_f_offsets,
     alpha_i_strip_edges,
     angles_from_q,
     calibrate,
+    pixel_pitch_mm,
     q_from_angles,
     specular_center,
+)
+from pySAview.core.reduction.kinematics import (
+    constant_qx_alpha_f,
+    constant_qz_alpha_f,
+    qz_step_per_pixel,
 )
 from pySAview.core.models import ScanData
 from pySAview.core.nexus_reader import NexusReader
 from pySAview.core.off_specular import (
     DETECTOR_PATH,
     AsymmetryMap,
+    SummedSpinMap,
     pair_spin_frames,
     spin_asymmetry,
+    sum_spin_frames,
     OffSpecularMap,
     compute_off_specular_map,
     frame_y_bounds,
@@ -245,8 +254,9 @@ class OffSpecularView(QWidget):
         self._sel_x = 0
         self._crosshair_placed = False
         self._roi_items: list[pg.PlotDataItem] = []
-        self._alpha_items: list[pg.ImageItem] = []
+        self._alpha_items: list[pg.GraphicsObject] = []
         self._alpha_geom: dict | None = None
+        self._th_geom: dict | None = None
         self._cal_message = ""
         self._colorbar_on_strips = False
         self.session_source_paths = lambda: []  # every loaded file; set by the main window
@@ -265,8 +275,9 @@ class OffSpecularView(QWidget):
         bar.addWidget(QLabel("Spin:"))
         self.combo_spin = QComboBox()
         self.combo_spin.addItem("All Frames", "all")
-        self.combo_spin.addItem("u — Spin Up (F=1)", "up")
-        self.combo_spin.addItem("d — Spin Down (F=0)", "down")
+        self.combo_spin.addItem("u — Spin Up (Flipper OFF / 1)", "up")
+        self.combo_spin.addItem("d — Spin Down (Flipper ON / 0)", "down")
+        self.combo_spin.addItem("u + d — Sum of channels", "sum")
         self.combo_spin.addItem("Spin asymmetry (u−d)/(u+d)", "asym")
         self.combo_spin.currentIndexChanged.connect(self._on_spin_changed)
         bar.addWidget(self.combo_spin)
@@ -318,8 +329,8 @@ class OffSpecularView(QWidget):
 
         bar.addWidget(QLabel("Axes:"))
         self.combo_y_axis = QComboBox()
-        self.combo_y_axis.addItem("X pixel vs Point", "point")
         self.combo_y_axis.addItem("X pixel vs θ", "th")
+        self.combo_y_axis.addItem("X pixel vs Point", "point")
         self.combo_y_axis.addItem("α_i vs α_f", "alpha")
         self.combo_y_axis.addItem("Qx vs Qz", "q")
         self.combo_y_axis.setToolTip("α_i vs α_f and Qx vs Qz use this scan's angle calibration "
@@ -406,7 +417,7 @@ class OffSpecularView(QWidget):
         self.plot.getViewBox().setMouseMode(pg.ViewBox.PanMode)
         self.plot.getViewBox().setCursor(QCursor(Qt.CursorShape.CrossCursor))
         self.plot.setLabel("bottom", "Detector X pixel")
-        self.plot.setLabel("left", "Point")
+        self.plot.setLabel("left", "θ (°)")
         self.img_item = pg.ImageItem()
         self.img_item.setColorMap(get_safe_colormap("turbo"))
         self.plot.addItem(self.img_item)
@@ -518,10 +529,38 @@ class OffSpecularView(QWidget):
         self.spin_wavelength.valueChanged.connect(self._on_wavelength_changed)
         grid.addWidget(QLabel("λ:"), 2, 2)
         grid.addWidget(self.spin_wavelength, 2, 3)
+        self.lbl_distance = QLabel("—")
+        self.lbl_distance.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.lbl_distance.setToolTip(
+            "Check value only: sample-to-detector distance L = p / tan(Δ) implied by the "
+            "calibrated °/pixel scale Δ assuming nominal pixel pitch p = 300 mm / nx "
+            "(full readout width). Not used in any angle (α_f) or Q conversion.")
+        grid.addWidget(QLabel("Distance:"), 3, 0)
+        grid.addWidget(self.lbl_distance, 3, 1, 1, 3)
         grid.setColumnStretch(1, 1)
         grid.setColumnStretch(3, 1)
         self._set_cal_status("Calibrated automatically from the direct beam when the map is computed.")
         return group
+
+    def _pixel_pitch(self) -> float | None:
+        """Displayed-X pixel spacing (mm) from the detector width, or None without detector data."""
+        if self._map is not None:
+            nx = self._map.counts.shape[1]
+        elif self.scan_data is not None and self.scan_data.detector_shape:
+            nx = self.scan_data.detector_shape[1]
+        else:
+            return None
+        return pixel_pitch_mm(nx)
+
+    def _show_calibration(self, cal: AngleCalibration | None) -> None:
+        """Status tooltip and implied distance for this scan's calibration."""
+        pitch = self._pixel_pitch()
+        if cal is None or pitch is None:
+            self.lbl_distance.setText("—")
+            return
+        nx = round(DETECTOR_WIDTH_MM / pitch)
+        self.lbl_distance.setText(f"{cal.distance_mm(pitch):.0f} mm  (from {DETECTOR_WIDTH_MM:g} mm / {nx} px)")
+        self._set_cal_status(cal.describe(pitch))
 
     def _set_cal_status(self, text: str) -> None:
         """Calibration details stay available on hover without cluttering the panel."""
@@ -783,17 +822,21 @@ class OffSpecularView(QWidget):
             kw = dict(exposure=exposure,
                       monitor=None if monitor is None else np.asarray(monitor.data, dtype=float),
                       monitor_variance=None if monitor is None else monitor.variance)
-            if spin == "asym":
+            if spin in ("asym", "sum"):
                 th, tth = self._variable("th"), self._variable("tth")
+                label_name = "Spin asymmetry" if spin == "asym" else "Sum of channels"
                 if flipper is None or th is None or tth is None:
-                    self._show_unavailable("Spin asymmetry needs Flipper1, θ and 2θ channels.")
+                    self._show_unavailable(f"{label_name} needs Flipper1, θ and 2θ channels.")
                     return
                 up, down = pair_spin_frames(th, tth, flipper, self._map.written)
                 if up.size == 0:
-                    self._show_unavailable("Spin asymmetry: no u/d frame pairs at matching θ and 2θ.")
+                    self._show_unavailable(f"{label_name}: no u/d frame pairs at matching θ and 2θ.")
                     return
-                norm = spin_asymmetry(self._map.counts, up, down, mode,
-                                      min_counts=self.spin_min_counts.value(), **kw)
+                if spin == "asym":
+                    norm = spin_asymmetry(self._map.counts, up, down, mode,
+                                          min_counts=self.spin_min_counts.value(), **kw)
+                else:
+                    norm = sum_spin_frames(self._map.counts, up, down, mode, **kw)
             else:
                 frames = select_frames(self._map.n_frames, flipper, spin)
                 norm = normalize_map(self._map.counts, frames, mode, **kw)
@@ -827,11 +870,15 @@ class OffSpecularView(QWidget):
             alpha_note = self._draw_alpha(display)
             if alpha_note is None:
                 return
+        elif self._theta_mode():
+            alpha_note = self._draw_theta(display)
+            if alpha_note is None:
+                return
         else:
             self._clear_alpha_items()
             self.img_item.setImage(display.T, autoLevels=False)
             self.img_item.setRect(0, 0, self._map.nx, len(frames))
-            if self._colorbar_on_strips:  # re-link only when coming back from the α view
+            if self._colorbar_on_strips:  # re-link only when coming back from mesh/strip views
                 self.colorbar.setImageItem(self.img_item)
                 self._colorbar_on_strips = False
         self.colorbar.setLevels((lo, hi))
@@ -897,9 +944,6 @@ class OffSpecularView(QWidget):
 
     def _row_label(self, row: int) -> str:
         frame = int(self._norm.frame_indices[row])
-        th = self._variable("th")
-        if self.combo_y_axis.currentData() == "th" and th is not None and frame < len(th):
-            return f"{th[frame]:.3f}"
         return str(frame)
 
     def _update_y_ticks(self) -> None:
@@ -923,17 +967,24 @@ class OffSpecularView(QWidget):
                 self.plot_row.setLabel("bottom", "α_f (°)")
                 self.plot_col.setLabel("bottom", "α_i (°)")
             return
+        if self._theta_mode():
+            axis.setTicks(None)
+            col_axis.setTicks(None)
+            self.plot.setLabel("bottom", "Detector X pixel")
+            self.plot.setLabel("left", "θ (°)")
+            self.plot_row.setLabel("bottom", "Detector X pixel")
+            self.plot_col.setLabel("bottom", "θ (°)")
+            return
         self.plot.setLabel("bottom", "Detector X pixel")
         self.plot_row.setLabel("bottom", "Detector X pixel")
         n = self._norm.frame_indices.size
-        use_th = self.combo_y_axis.currentData() == "th" and self._variable("th") is not None
-        self.plot.setLabel("left", "θ (°)" if use_th else "Point (frame index)")
+        self.plot.setLabel("left", "Point (frame index)")
         step = max(1, int(np.ceil(n / 12)))
         major = [(row + 0.5, self._row_label(row)) for row in range(0, n, step)]
         minor = [(row + 0.5, "") for row in range(n) if row % step]
         axis.setTicks([major, minor])
         col_axis.setTicks([major, minor])
-        self.plot_col.setLabel("bottom", "θ (°)" if use_th else "Point (frame index)")
+        self.plot_col.setLabel("bottom", "Point (frame index)")
 
     def _clear_roi_overlay(self) -> None:
         for item in self._roi_items:
@@ -953,6 +1004,9 @@ class OffSpecularView(QWidget):
             return
         if self._alpha_mode():
             self._draw_alpha_overlay()
+            return
+        if self._theta_mode():
+            self._draw_theta_overlay()
             return
         cal = getattr(self.scan_data, "angle_calibration", None)
         tth = self._variable("tth")
@@ -983,10 +1037,47 @@ class OffSpecularView(QWidget):
             self.plot.addItem(item)
             self._roi_items.append(item)
 
+    def _draw_theta_overlay(self) -> None:
+        g = self._th_geom
+        if g is None:
+            return
+        rows, theta, strips = g["rows"], g["theta"], g["strips"]
+        sel_frames = self._norm.frame_indices[rows]
+        cal = getattr(self.scan_data, "angle_calibration", None)
+        tth = self._variable("tth")
+        if self.chk_show_db.isChecked() and cal is not None and cal.fit is not None and tth is not None:
+            ok = sel_frames < tth.size
+            xs = cal.fit.position_at(tth[sel_frames[ok]])
+            ys = theta[ok]
+            order = np.argsort(ys, kind="stable")
+            xs, ys = xs[order], ys[order]
+            inside = (xs >= 0) & (xs <= self._map.nx)
+            self._add_overlay(xs[inside], ys[inside], "#e879f9", connect="finite")
+        if not self.chk_show_roi.isChecked():
+            return
+        bounds = self._scan_roi_bounds()
+        if len(bounds) == 1:
+            x_lo, x_hi = min(bounds[0][0], bounds[0][1]), max(bounds[0][0], bounds[0][1])
+            y0, y1 = float(strips[:, 0].min()), float(strips[:, 1].max())
+            for xb in (x_lo, x_hi):
+                self._add_overlay([xb, xb], [y0, y1], "#facc15")
+        else:
+            per_row = np.array([bounds[min(int(f), len(bounds) - 1)] for f in sel_frames], dtype=float)
+            ys = strips.reshape(-1)
+            for col in (0, 1):
+                xb = np.minimum(per_row[:, 0], per_row[:, 1]) if col == 0 else np.maximum(per_row[:, 0], per_row[:, 1])
+                self._add_overlay(np.repeat(xb, 2), ys, "#facc15")
+
     # ------------------------------------------------------------- crosshair
     def _map_ready(self) -> bool:
         ready = self._norm is not None and self._map is not None and self._norm.frame_indices.size > 0
-        return ready and (not self._alpha_mode() or self._alpha_geom is not None)
+        if not ready:
+            return False
+        if self._alpha_mode():
+            return self._alpha_geom is not None
+        if self._theta_mode():
+            return self._th_geom is not None
+        return True
 
     def _on_crosshair_toggled(self, checked: bool) -> None:
         if not checked:
@@ -1037,6 +1128,16 @@ class OffSpecularView(QWidget):
             self._sel_row, self._sel_x = row, col
             self._update_cuts()
             return
+        if self._theta_mode():
+            g = self._th_geom
+            col = int(np.clip(np.floor(x), 0, self._map.nx - 1))
+            dist = np.abs(g["theta"] - y)
+            k = int(dist.size - 1 - np.argmin(dist[::-1]))
+            row = int(g["rows"][k])
+            if force or (row, col) != (self._sel_row, self._sel_x):
+                self._sel_row, self._sel_x = row, col
+                self._update_cuts()
+            return
         row, col = int(y), int(x)
         if force or (row, col) != (self._sel_row, self._sel_x):
             self._sel_row, self._sel_x = row, col
@@ -1067,6 +1168,9 @@ class OffSpecularView(QWidget):
             # runs along Qx, constant-Qx cut along Qz.
             spans = (((self.plot_row, x0, x1), (self.plot_col, y0, y1)) if self._q_mode()
                      else ((self.plot_row, y0, y1), (self.plot_col, x0, x1)))
+        elif self._theta_mode():
+            x0, x1, y0, y1 = self._map_extent()
+            spans = ((self.plot_row, x0, x1), (self.plot_col, y0, y1))
         else:
             spans = ((self.plot_row, 0, self._map.nx), (self.plot_col, 0, self._norm.frame_indices.size))
         for plot, start, stop in spans:
@@ -1094,8 +1198,13 @@ class OffSpecularView(QWidget):
             self._update_alpha_cuts(positive)
             return
         self._row_curve.setData(np.arange(self._map.nx) + 0.5, positive(self._cut_values[row]))
-        col_vals = self._cut_values[:, x]
-        self._col_curve.setData(np.arange(col_vals.size) + 0.5, positive(col_vals))
+        if self._theta_mode():
+            g = self._th_geom
+            order = np.argsort(g["theta"], kind="stable")
+            self._col_curve.setData(g["theta"][order], positive(self._cut_values[g["rows"][order], x]))
+        else:
+            col_vals = self._cut_values[:, x]
+            self._col_curve.setData(np.arange(col_vals.size) + 0.5, positive(col_vals))
         for curve in (self._row_curve, self._col_curve):
             curve.setVisible(True)
         frame = int(self._norm.frame_indices[row])
@@ -1120,9 +1229,14 @@ class OffSpecularView(QWidget):
             values = self._variable(name)
             if values is not None and frame < len(values):
                 parts.append(f"{label} = {values[frame]:.{self._angle_decimals(name)}f}°")
-        flipper = self._variable("Flipper1")
-        if flipper is not None and frame < len(flipper):
-            parts.append({0.0: "d", 1.0: "u"}.get(float(flipper[frame]), "?"))
+        if isinstance(self._norm, SummedSpinMap):
+            parts.append("u+d")
+        elif isinstance(self._norm, AsymmetryMap):
+            parts.append("u/d")
+        else:
+            flipper = self._variable("Flipper1")
+            if flipper is not None and frame < len(flipper):
+                parts.append({0.0: "d", 1.0: "u"}.get(float(flipper[frame]), "?"))
         return ", ".join(parts)
 
     def _format_value(self, row: int, x: int) -> str:
@@ -1166,7 +1280,7 @@ class OffSpecularView(QWidget):
             if self._q_mode():
                 lam = self.spin_wavelength.value()
                 qx, qz = q_from_angles(th[frame], af, lam)
-                dq = 2 * np.pi / lam * np.radians(cal.deg_per_pixel)  # Qz step per pixel
+                dq = qz_step_per_pixel(cal.deg_per_pixel, lam)
                 parts.append(f"Qx {qx * QX_SCALE:.3g}×10⁻³")
                 parts.append(f"Qz {qz:.{_decimals_for_step(dq)}f} Å⁻¹")
         parts.append(f"X {x}")
@@ -1208,12 +1322,11 @@ class OffSpecularView(QWidget):
         frames = norm.frame_indices
         rows = np.arange(frames.size)
         coords: dict[str, np.ndarray] = {}
-        th = self._variable("th")
-        if axes == "th" and th is not None:
-            theta = np.full(frames.size, np.nan)
-            ok = frames < th.size
-            theta[ok] = th[frames[ok]]
-            coords["Theta (deg)"] = theta
+        if axes == "th":
+            if self._th_geom is None:
+                raise ValueError(self.lbl_notice.text() or "The θ view is not available for these settings")
+            rows = self._th_geom["rows"]
+            coords["Theta (deg)"] = self._th_geom["theta"]
         if self._alpha_mode():
             geom = self._alpha_geom
             if geom is None:
@@ -1227,15 +1340,21 @@ class OffSpecularView(QWidget):
             else:
                 coords["AlphaI (deg)"], coords["AlphaF (deg)"] = geom["alpha_i"], alpha_f
         asym = isinstance(norm, AsymmetryMap)
+        summed = isinstance(norm, SummedSpinMap)
+        paired = asym or summed
         columns, data = map_table(frames[rows], norm.values[rows], norm.standard_uncertainty[rows], coords,
-                                  partner_indices=norm.partner_indices[rows] if asym else None)
+                                  partner_indices=norm.partner_indices[rows] if paired else None)
         y0, y1 = omap.y_bounds
+        spin_note = ""
+        if asym:
+            spin_note = " (Frame = u frame, PartnerFrame = paired d frame)"
+        elif summed:
+            spin_note = " (Frame = u frame, PartnerFrame = paired d frame; pooled u + d exposure)"
         header = [
             f"Off-specular map: {self.combo_y_axis.currentText()}; detector frames integrated along Y, "
-            "displayed X pixel (90 deg CW + mirrored, as in the 2D Detector tab).",
+            "displayed X pixel (90 deg CW + mirrored, as in the Detector Image tab).",
             f"Source: {self.scan_data.file_path}",
-            f"Spin: {self.combo_spin.currentText()}"
-            + (" (Frame = u frame, PartnerFrame = paired d frame)" if asym else ""),
+            f"Spin: {self.combo_spin.currentText()}" + spin_note,
             f"Integrated Y rows: {'per-frame tracked ROI within ' if omap.y_varies else ''}[{y0}, {y1})",
             f"Normalization: {self.combo_norm.currentText()}; Value units: {norm.units}",
             "StdUncertainty is first-order 1 sigma (docs/normalization.md, docs/off_specular.md).",
@@ -1246,6 +1365,11 @@ class OffSpecularView(QWidget):
             header.append(f"Angle calibration: {cal.deg_per_pixel!r} deg/pixel ({cal.deg_per_pixel_source}), "
                           f"x0 = {cal.x0!r} px, alpha_f {'increases' if cal.sign > 0 else 'decreases'} with X; "
                           "coordinates are pixel centres")
+            pitch = self._pixel_pitch()
+            if pitch is not None:
+                header.append(f"Implied sample-detector distance: {cal.distance_mm(pitch):.1f} mm "
+                              f"(pixel {pitch!r} mm = {DETECTOR_WIDTH_MM:g} mm detector width; "
+                              "derived from deg/pixel, not used in the conversion)")
             if self._q_mode():
                 header.append(f"Wavelength: {self.spin_wavelength.value()!r} Angstrom; "
                               "Qx = (2pi/lambda)(cos af - cos ai), Qz = (2pi/lambda)(sin af + sin ai)")
@@ -1280,7 +1404,10 @@ class OffSpecularView(QWidget):
         QMessageBox.information(self, "Export Succeeded", f"Exported {count:,} map cells to {target.name}.")
         return target
 
-    # ------------------------------------------------------------- α_i / α_f
+    # ------------------------------------------------------------- α_i / α_f & θ
+    def _theta_mode(self) -> bool:
+        return self.combo_y_axis.currentData() == "th"
+
     def _alpha_mode(self) -> bool:
         """Angle-space views (α_i–α_f and Qx–Qz) share the calibrated strip geometry."""
         return self.combo_y_axis.currentData() in ("alpha", "q")
@@ -1317,9 +1444,7 @@ class OffSpecularView(QWidget):
         g = self._alpha_geom
         cal = g["cal"]
         lam = self.spin_wavelength.value()
-        k0 = 2 * np.pi / lam
         qx = qx_view / QX_SCALE
-        ai = np.radians(g["alpha_i"])
         _, af_cross = self._from_view(qx_view, qz)
         side = 1.0 if af_cross >= 0 else -1.0
 
@@ -1336,9 +1461,8 @@ class OffSpecularView(QWidget):
                 vals.append(self._cut_values[g["rows"][j], px])
             return np.array(xs_q, dtype=float).reshape(-1, 2), np.array(vals, dtype=float)
 
-        with np.errstate(invalid="ignore"):
-            af_const_qz = np.degrees(np.arcsin(qz / k0 - np.sin(ai)))
-            af_const_qx = side * np.degrees(np.arccos(qx / k0 + np.cos(ai)))
+        af_const_qz = constant_qz_alpha_f(g["alpha_i"], qz, lam)
+        af_const_qx = constant_qx_alpha_f(g["alpha_i"], qx, lam, side=side)
         q_rows, v_rows = sample(af_const_qz)
         order = np.argsort(q_rows[:, 0])
         self._row_curve.setData(q_rows[order, 0] * QX_SCALE, positive(v_rows[order]))
@@ -1370,8 +1494,13 @@ class OffSpecularView(QWidget):
             self._cal_message = "No 2θ channel: angle calibration unavailable."
             return None
         try:
-            scan.angle_calibration = calibrate(self._map.counts, tth, self._roi_x_ranges(),
-                                               y_rows=self._map.y_bounds)
+            scan.angle_calibration = calibrate(
+                self._map.counts,
+                tth,
+                self._roi_x_ranges(),
+                y_rows=self._map.y_bounds,
+                written=self._map.written,
+            )
         except CalibrationError as error:
             self._cal_message = str(error)
         return scan.angle_calibration
@@ -1403,12 +1532,20 @@ class OffSpecularView(QWidget):
             self.spin_dpp.setValue(cal.deg_per_pixel)
             self.spin_x0.setValue(cal.x0)
             self.chk_af_increases.setChecked(cal.sign > 0)
-            self._set_cal_status(cal.describe())
+            self._show_calibration(cal)
         else:
+            self._show_calibration(None)
             self.spin_dpp.setValue(0.0)
             if self._map is not None:
                 try:
-                    self.spin_x0.setValue(specular_center(self._map.counts, self._roi_x_ranges()))
+                    self.spin_x0.setValue(
+                        specular_center(
+                            self._map.counts,
+                            self._roi_x_ranges(),
+                            tth=self._variable("tth"),
+                            written=self._map.written,
+                        )
+                    )
                 except CalibrationError:
                     self.spin_x0.setValue(float(np.mean(self._roi_x_ranges()[0])))
             self.chk_af_increases.setChecked(False)
@@ -1439,7 +1576,7 @@ class OffSpecularView(QWidget):
             self._set_notice(f"Calibration not changed: {error}")
             return
         scan.angle_calibration = cal
-        self._set_cal_status(cal.describe())
+        self._show_calibration(cal)
         self._redraw()
 
     def _clear_alpha_items(self) -> None:
@@ -1447,6 +1584,55 @@ class OffSpecularView(QWidget):
             self.plot.removeItem(item)
         self._alpha_items = []
         self._alpha_geom = None
+        self._th_geom = None
+
+    def _draw_theta(self, display: np.ndarray) -> str | None:
+        """Draw each frame at its measured θ as an exact PColorMesh strip (no uniform-row kink)."""
+        flipper = self._variable("Flipper1")
+        if (self.combo_spin.currentData() == "all" and flipper is not None
+                and np.any(flipper == 0) and np.any(flipper == 1)):
+            self._show_unavailable("X pixel vs θ: choose one spin state (u or d), their sum (u + d), "
+                                   "or the spin asymmetry; both states share the same angles and would overlap.")
+            return None
+        th = self._variable("th")
+        if th is None:
+            self._show_unavailable("X pixel vs θ needs a θ (th) channel.")
+            return None
+        frames = self._norm.frame_indices
+        ok = frames < th.size
+        ok[ok] &= np.isfinite(th[frames[ok]])
+        written = self._map.written
+        if written is not None:
+            ok &= written[frames]
+        rows = np.flatnonzero(ok)
+        if rows.size == 0:
+            self._show_unavailable("X pixel vs θ: no measured frames with valid θ angles.")
+            return None
+        self.img_item.clear()
+        self._clear_alpha_items()
+        theta = th[frames[rows]]
+        strips = alpha_i_strip_edges(theta)
+        n = rows.size
+        nx = self._map.nx
+        x_edges = np.arange(nx + 1, dtype=float)
+        X = np.broadcast_to(x_edges[None, :], (2 * n, nx + 1)).copy()
+        Y = np.broadcast_to(strips.reshape(-1, 1), (2 * n, nx + 1)).copy()
+        Z = np.full((2 * n - 1, nx), np.nan)
+        Z[0::2] = display[rows]
+        mesh = CachedMeshItem(X, Y, Z, enableAutoLevels=False)
+        self.plot.addItem(mesh)
+        items = [mesh]
+        self._alpha_items = items
+        self._th_geom = dict(
+            rows=rows,
+            theta=theta,
+            strips=strips,
+            extent=(0.0, float(nx), float(strips[:, 0].min()), float(strips[:, 1].max())),
+        )
+        self.colorbar.setImageItem(items)
+        self._colorbar_on_strips = True
+        skipped = frames.size - rows.size
+        return f"X pixel vs θ: {skipped} unwritten/invalid frame(s) omitted." if skipped else ""
 
     def _draw_alpha(self, display: np.ndarray) -> str | None:
         """Draw each frame as its own α_i strip of exact pixel cells. Returns a notice,
@@ -1460,7 +1646,7 @@ class OffSpecularView(QWidget):
         flipper = self._variable("Flipper1")
         if (self.combo_spin.currentData() == "all" and flipper is not None
                 and np.any(flipper == 0) and np.any(flipper == 1)):
-            self._show_unavailable(f"{name}: choose one spin state (u or d) or the spin asymmetry; "
+            self._show_unavailable(f"{name}: choose one spin state (u or d), their sum (u + d), or the spin asymmetry; "
                                    "both states share the same angles and would overlap.")
             return None
         th, tth = self._variable("th"), self._variable("tth")
@@ -1521,6 +1707,8 @@ class OffSpecularView(QWidget):
             if "extent" in g:
                 return g["extent"]
             return float(g["strips"][:, 0].min()), float(g["strips"][:, 1].max()), g["af_lo"], g["af_hi"]
+        if self._theta_mode() and self._th_geom is not None:
+            return self._th_geom["extent"]
         n_rows = self._norm.frame_indices.size if self._norm is not None else 1
         nx = self._map.nx if self._map is not None else 1
         return 0.0, float(nx), 0.0, float(n_rows)
@@ -1544,6 +1732,16 @@ class OffSpecularView(QWidget):
             k = int(inside[-1])  # strips at repeated θ overlap; the last drawn is visible
             px = self._pixel_for_alpha(k, yv)
             return None if px is None else (int(g["rows"][k]), px)
+        if self._theta_mode():
+            g = self._th_geom
+            x = int(np.floor(xv))
+            if not (0 <= x < self._map.nx):
+                return None
+            inside = np.flatnonzero((g["strips"][:, 0] <= yv) & (yv < g["strips"][:, 1]))
+            if inside.size == 0:
+                return None
+            k = int(inside[-1])
+            return int(g["rows"][k]), x
         row, x = int(np.floor(yv)), int(np.floor(xv))
         if 0 <= x < self._map.nx and 0 <= row < self._norm.frame_indices.size:
             return row, x
@@ -1576,6 +1774,10 @@ class OffSpecularView(QWidget):
             ai, af = g["alpha_i"][k], g["base"][k] + alpha_f_offsets(self._map.nx, g["cal"])[x]
             vx, vy = self._to_view(ai, af)
             return float(vx), float(vy)
+        if self._theta_mode() and self._th_geom is not None:
+            g = self._th_geom
+            k = int(np.argmin(np.abs(g["rows"] - row)))
+            return x + 0.5, float(g["theta"][k])
         return x + 0.5, row + 0.5
 
     def _update_alpha_cuts(self, positive) -> None:

@@ -13,6 +13,8 @@ from pySAview.core.angle_calibration import (
     alpha_i_strip_edges,
     calibrate,
     fit_direct_beam,
+    implied_distance_mm,
+    pixel_pitch_mm,
 )
 from pySAview.ui.main_window import MainWindow
 
@@ -78,6 +80,22 @@ def test_geometry_and_manual_override():
         AngleCalibration(0.0, 1.0, -1)
 
 
+def test_implied_distance_from_detector_width():
+    pitch = pixel_pitch_mm(1024)
+    assert pitch == pytest.approx(300.0 / 1024)
+    # A pixel p at distance L subtends atan(p / L): the inverse must give L back.
+    for distance in (1000.0, 2050.0, 3500.0):
+        dpp = np.degrees(np.arctan(pitch / distance))
+        assert implied_distance_mm(dpp, pitch) == pytest.approx(distance, rel=1e-12)
+    cal = AngleCalibration(0.00819, 370.0, -1)
+    assert cal.distance_mm(pitch) == pytest.approx(2049.6, abs=0.5)
+    assert cal.with_manual(deg_per_pixel=0.01).distance_mm(pitch) < cal.distance_mm(pitch)
+    assert "Implied sample–detector distance 2050 mm" in cal.describe(pitch)
+    assert "distance" not in cal.describe()
+    with pytest.raises(ValueError):
+        pixel_pitch_mm(0)
+
+
 def test_strip_edges_do_not_interpolate_counts():
     edges = alpha_i_strip_edges(np.array([0.0, 0.1, 0.3, 0.3]))
     np.testing.assert_allclose(edges[0], [-0.075, 0.05])  # end strip: half the median θ step
@@ -108,6 +126,9 @@ def test_alpha_view_on_example_scan(qtbot, window, tmp_path):
     assert cal.deg_per_pixel == pytest.approx(0.00819, abs=2e-5)
     assert cal.sign == -1 and cal.x0 == pytest.approx(369.9, abs=1.0)
     assert cal.fit_y_rows == (0, 1024)
+    # Distance implied by the fitted scale and the 300 mm / 1024 px detector.
+    assert view.lbl_distance.text().startswith("2051 mm")
+    assert "Implied sample–detector distance" in view.cal_status
     assert scan.detector_roi is not None  # file ROI untouched
 
     view.combo_y_axis.setCurrentIndex(view.combo_y_axis.findData("alpha"))
@@ -256,3 +277,311 @@ def test_cached_mesh_blits_and_invalidates(qtbot):
     painter.end()
     assert mesh._detail is detail and not mesh._detail_timer.isActive()
     mesh.setExportMode(False)
+
+
+def test_low_tth_exclusion_blocks_gibaud_shift_and_validates_bounds():
+    from pySAview.core.angle_calibration import find_direct_beam
+
+    rng = np.random.default_rng(11)
+    nx = 1024
+    x = np.arange(nx, dtype=float) + 0.5
+    tth = np.linspace(0.0, 4.0, 81)  # 0.05° steps
+    slope_true, intercept_true, x0_true = 122.0, 364.0, 370.0
+    counts = rng.poisson(1.0, size=(tth.size, nx)).astype(float)
+    counts += 3000.0 * np.exp(-0.5 * ((x - x0_true) / 2.5) ** 2)
+    for i, t in enumerate(tth):
+        # Below 0.40°, inject a Gibaud-style grazing-angle masking shift toward the specular ridge.
+        shift = -2.2 if t < 0.40 else 0.0
+        centre = intercept_true + slope_true * t + shift
+        counts[i] += 1000.0 * np.exp(-0.5 * ((x - centre) / 2.0) ** 2)
+
+    roi_x = np.tile([355.0, 385.0], (tth.size, 1))
+    cal = calibrate(counts, tth, roi_x)
+    assert cal.fit is not None
+    assert cal.fit.min_tth_used >= 0.40
+    assert np.all(np.abs(cal.fit.tth) >= 0.40)
+    assert cal.fit.excluded_low_tth == int(np.sum(tth < 0.40))
+    assert cal.deg_per_pixel == pytest.approx(1.0 / slope_true, rel=5e-4)
+    assert cal.fit.rms_px < 0.15
+
+    # Including the shifted low-2θ region (min_tth=0.10) degrades RMS markedly.
+    cal_unfiltered = calibrate(counts, tth, roi_x, min_tth=0.10)
+    assert cal_unfiltered.fit.min_tth_used < 0.40
+    assert cal_unfiltered.fit.rms_px > 0.35
+
+    # max_tth caps the fitted 2θ range cleanly.
+    cal_capped = calibrate(counts, tth, roi_x, min_tth=0.50, max_tth=2.50)
+    assert 0.50 <= cal_capped.fit.min_tth_used and cal_capped.fit.max_tth_used <= 2.50
+    assert "(2θ 0.50°–2.50°)" in cal_capped.describe()
+
+    # Input validation for min_tth, max_tth, and edge_margin.
+    with pytest.raises(ValueError):
+        find_direct_beam(counts, tth, (355, 385), min_tth=-0.1)
+    with pytest.raises(ValueError):
+        find_direct_beam(counts, tth, (355, 385), min_tth=0.40, max_tth=0.40)
+    with pytest.raises(ValueError):
+        find_direct_beam(counts, tth, (355, 385), min_tth=0.40, max_tth=0.20)
+    with pytest.raises(ValueError):
+        fit_direct_beam(counts, tth, (355, 385), edge_margin=-1)
+
+
+def test_active_edge_cutoff_detection_upper_and_lower():
+    nx = 1024
+    x = np.arange(nx, dtype=float) + 0.5
+    slope_true, intercept_true, x0_true = 122.0, 364.0, 370.0
+    tth = np.linspace(0.0, 5.1, 103)  # x_pred spans 364..986 px
+    counts = np.full((tth.size, nx), 1.0, dtype=float)
+    counts += 3000.0 * np.exp(-0.5 * ((x - x0_true) / 2.5) ** 2)
+    for i, t in enumerate(tth):
+        centre = intercept_true + slope_true * t
+        counts[i] += 1200.0 * np.exp(-0.5 * ((x - centre) / 2.2) ** 2)
+    # Dead cathode border (x >= 900) with realistic 15-px rolloff clipping the beam over 885..900.
+    counts *= np.clip((900.0 - x) / 15.0, 0.0, 1.0)[None, :]
+
+    roi_x = np.tile([355.0, 385.0], (tth.size, 1))
+    cal = calibrate(counts, tth, roi_x)
+    assert cal.fit is not None
+    assert cal.fit.detected_edge_px is not None
+    assert 890.0 <= cal.fit.detected_edge_px <= 901.0
+    assert cal.fit.excluded_edge > 0
+    assert cal.fit.positions_px.max() <= cal.fit.detected_edge_px - 20.0
+    assert cal.deg_per_pixel == pytest.approx(1.0 / slope_true, rel=5e-4)
+    assert cal.fit.rms_px < 0.05
+
+    # Without edge_margin protection, the clipped edge frames bias slope and inflate RMS.
+    cal_no_margin = calibrate(counts, tth, roi_x, edge_margin=0)
+    assert cal_no_margin.fit.rms_px > 5.0 * cal.fit.rms_px
+
+    # Symmetric check with negative slope (beam moves toward lower X and hits a dead border at x < 120).
+    slope_neg, intercept_neg, x0_neg = -120.0, 660.0, 655.0
+    counts_neg = np.full((tth.size, nx), 1.0, dtype=float)
+    counts_neg += 3000.0 * np.exp(-0.5 * ((x - x0_neg) / 2.5) ** 2)
+    for i, t in enumerate(tth):
+        centre = intercept_neg + slope_neg * t
+        counts_neg[i] += 1200.0 * np.exp(-0.5 * ((x - centre) / 2.2) ** 2)
+    counts_neg *= np.clip((x - 120.0) / 15.0, 0.0, 1.0)[None, :]
+
+    cal_neg = calibrate(counts_neg, tth, np.tile([640.0, 670.0], (tth.size, 1)))
+    assert cal_neg.sign == 1
+    assert cal_neg.fit.detected_edge_px is not None
+    assert 119.0 <= cal_neg.fit.detected_edge_px <= 130.0
+    assert cal_neg.fit.excluded_edge > 0
+    assert cal_neg.fit.positions_px.min() >= cal_neg.fit.detected_edge_px + 20.0
+    assert cal_neg.deg_per_pixel == pytest.approx(1.0 / abs(slope_neg), rel=5e-4)
+    assert cal_neg.fit.rms_px < 0.05
+
+
+def test_short_scan_before_edge_is_not_trimmed():
+    nx = 1024
+    x = np.arange(nx, dtype=float) + 0.5
+    tth = np.linspace(0.0, 2.0, 41)  # direct beam stays in [364, 608], well before any edge
+    counts = np.full((tth.size, nx), 1.0, dtype=float)
+    counts += 3000.0 * np.exp(-0.5 * ((x - 370.0) / 2.5) ** 2)
+    for i, t in enumerate(tth):
+        counts[i] += 1000.0 * np.exp(-0.5 * ((x - (364.0 + 122.0 * t)) / 2.0) ** 2)
+
+    cal = calibrate(counts, tth, np.tile([355.0, 385.0], (tth.size, 1)))
+    assert cal.fit is not None
+    assert cal.fit.detected_edge_px is None
+    assert cal.fit.excluded_edge == 0
+    assert cal.fit.max_tth_used == pytest.approx(2.0)
+    assert cal.deg_per_pixel == pytest.approx(1.0 / 122.0, rel=5e-4)
+
+
+def test_local_background_subtraction_removes_centroid_bias():
+    from pySAview.core.angle_calibration import find_direct_beam
+
+    nx = 1024
+    x = np.arange(nx, dtype=float) + 0.5
+    true_centres = np.array([500.85, 560.20, 620.75, 680.15])
+    tth = np.array([1.0, 1.5, 2.0, 2.5])
+    # Sloped & elevated background (~115–145 counts around the peak) that would pull an unsubtracted centroid by ~0.09 px.
+    bg = 40.0 + 0.15 * x
+    counts = np.tile(bg, (tth.size, 1))
+    counts += 4000.0 * np.exp(-0.5 * ((x - 370.0) / 2.5) ** 2)
+    for i, c in enumerate(true_centres):
+        counts[i] += 1400.0 * np.exp(-0.5 * ((x - c) / 2.0) ** 2)
+
+    frames, pos = find_direct_beam(counts, tth, (355.0, 385.0))
+    np.testing.assert_array_equal(frames, [0, 1, 2, 3])
+    np.testing.assert_allclose(pos, true_centres, atol=0.015)
+
+
+def test_specular_center_guards_low_tth_and_unwritten_frames():
+    from pySAview.core.angle_calibration import specular_center
+
+    nx = 200
+    x = np.arange(nx, dtype=float) + 0.5
+    tth = np.array([0.05, 0.10, 0.20, 0.30, 0.50, 1.00, 1.50, 2.00, 2.50])
+    written = np.array([True, True, True, True, True, True, True, False, False])
+    counts = np.zeros((tth.size, nx), dtype=float)
+    # Low-2θ frames: contaminated inside ROI (shifted to 104.5).
+    for i in range(4):
+        counts[i] = 2000.0 * np.exp(-0.5 * ((x - 104.5) / 1.5) ** 2)
+    # Clean high-2θ frames: true specular peak at 100.5.
+    for i in range(4, 7):
+        counts[i] = 2000.0 * np.exp(-0.5 * ((x - 100.5) / 1.5) ** 2)
+    # Unwritten trailing frames: bogus counts at 92.5 that must be ignored.
+    for i in range(7, 9):
+        counts[i] = 5000.0 * np.exp(-0.5 * ((x - 92.5) / 1.5) ** 2)
+
+    ranges = np.tile([85.0, 115.0], (tth.size, 1))
+    assert specular_center(counts, ranges, tth=tth, written=written) == pytest.approx(100.5, abs=0.05)
+
+    # Fallback when no frame reaches min_tth: uses written low-2θ frames, still ignoring unwritten frames.
+    low_only_tth = np.array([0.05, 0.10, 0.20, 0.30])
+    low_written = np.array([True, True, False, False])
+    low_counts = np.zeros((4, nx), dtype=float)
+    low_counts[:2] = 2000.0 * np.exp(-0.5 * ((x - 101.5) / 1.5) ** 2)
+    low_counts[2:] = 5000.0 * np.exp(-0.5 * ((x - 90.5) / 1.5) ** 2)
+    assert specular_center(low_counts, ranges[:4], tth=low_only_tth, written=low_written) == pytest.approx(101.5, abs=0.05)
+
+    # Written mask is also respected by fit_direct_beam (unwritten bogus peaks are skipped).
+    counts_db, tth_db = _synthetic(n=60)
+    written_db = np.ones(tth_db.size, dtype=bool)
+    written_db[-10:] = False
+    counts_db[-10:] = 0.0
+    counts_db[-10:, 700] = 9000.0  # bogus unwritten peaks
+    cal_db = calibrate(counts_db, tth_db, np.tile([385.0, 415.0], (tth_db.size, 1)), written=written_db)
+    assert np.all(cal_db.fit.frames < tth_db.size - 10)
+    assert cal_db.deg_per_pixel == pytest.approx(1.0 / 120.0, rel=2e-3)
+
+
+def test_real_scans_exclude_low_tth_and_edge_and_agree():
+    from pySAview.core.nexus_reader import NexusReader
+    from pySAview.core.off_specular import DETECTOR_PATH, compute_off_specular_map
+
+    results = {}
+    for fname in ("005572.nxs", "005594.nxs"):
+        path = DATA / fname
+        with NexusReader(path) as reader:
+            scan = reader.parse_scan()
+            omap = compute_off_specular_map(reader.file[DETECTOR_PATH], None, source_path=path)
+        tth = np.asarray(scan.variables["tth"].data, dtype=float)
+        roi = scan.detector_roi
+        roi_x = np.tile([roi[0], roi[1]], (omap.n_frames, 1)).astype(float)
+        cal = calibrate(omap.counts, tth, roi_x, written=omap.written)
+        assert cal.fit is not None
+        assert cal.fit.min_tth_used >= 0.40
+        assert cal.fit.excluded_low_tth > 0
+        assert cal.fit.detected_edge_px is not None
+        assert cal.fit.excluded_edge > 0
+        assert cal.fit.positions_px.max() < 895.0
+        assert cal.fit.rms_px < 0.45
+        results[fname] = cal
+
+    dpp_5572 = results["005572.nxs"].deg_per_pixel
+    dpp_5594 = results["005594.nxs"].deg_per_pixel
+    assert abs(dpp_5572 - dpp_5594) / dpp_5572 < 1e-3  # agree within 0.1%
+
+
+def test_post_trim_constant_position_raises_calibration_error():
+    """Post-trim refit with zero slope (constant positions) raises CalibrationError, not ZeroDivisionError."""
+    nx = 1024
+    x = np.arange(nx, dtype=float) + 0.5
+    # 10 interior frames pinned at x = 500.5, 4 edge-adjacent frames stepped slightly higher
+    # so the initial fit has positive slope, followed by 6 dead frames triggering upper edge trim.
+    tth = np.concatenate([
+        np.linspace(0.5, 2.3, 10),
+        np.array([2.5, 2.7, 2.9, 3.1]),
+        np.linspace(6.0, 12.0, 6),
+    ])
+    counts = np.full((tth.size, nx), 1.0, dtype=float)
+    for i in range(10):
+        counts[i] += 1200.0 * np.exp(-0.5 * ((x - 500.5) / 1.5) ** 2)
+    for k, centre in enumerate((502.0, 502.2, 502.4, 502.6), start=10):
+        counts[k] += 1200.0 * np.exp(-0.5 * ((x - centre) / 1.5) ** 2)
+
+    with pytest.raises(CalibrationError):
+        fit_direct_beam(counts, tth, (355.0, 385.0), edge_margin=2)
+
+
+def test_narrow_dead_border_does_not_double_trim():
+    """A narrow dead border (< edge_margin wide, e.g. x >= 1015 on nx=1024) trims from ~1015, not ~1003."""
+    nx = 1024
+    x = np.arange(nx, dtype=float) + 0.5
+    slope_true, intercept_true, x0_true = 122.0, 364.0, 370.0
+    tth = np.linspace(0.0, 5.4, 361)  # ~1.83 px steps; x_pred runs 364..1022.8
+    counts = np.full((tth.size, nx), 1.0, dtype=float)
+    counts += 3000.0 * np.exp(-0.5 * ((x - x0_true) / 2.5) ** 2)
+    for i, t in enumerate(tth):
+        counts[i] += 1200.0 * np.exp(-0.5 * ((x - (intercept_true + slope_true * t)) / 1.2) ** 2)
+    counts[:, 1015:] = 0.0  # narrow 9-px dead border (< edge_margin=20)
+
+    cal = calibrate(counts, tth, np.tile([355.0, 385.0], (tth.size, 1)), edge_margin=20)
+    assert cal.fit is not None
+    assert cal.fit.detected_edge_px is not None
+    assert 1012.0 <= cal.fit.detected_edge_px <= 1015.5
+    # Trimming from ~1014.5 - 20 = 994.5 keeps interior points above 990 (would drop to ~983 if double-trimmed).
+    assert cal.fit.positions_px.max() > 990.0
+    assert cal.fit.positions_px.max() <= cal.fit.detected_edge_px - 20.0
+    assert cal.deg_per_pixel == pytest.approx(1.0 / slope_true, rel=5e-4)
+
+
+def test_negative_tth_scan_filters_by_abs_tth():
+    nx = 1024
+    x = np.arange(nx, dtype=float) + 0.5
+    slope_true, intercept_true, x0_true = -120.0, 364.0, 370.0
+    tth = np.round(np.linspace(-4.0, 0.0, 81), 6)  # exact 0.05° steps from -4.00° to 0.00°
+    counts = np.full((tth.size, nx), 1.0, dtype=float)
+    counts += 3000.0 * np.exp(-0.5 * ((x - x0_true) / 2.5) ** 2)
+    for i, t in enumerate(tth):
+        shift = -2.0 if abs(t) < 0.40 else 0.0
+        counts[i] += 1000.0 * np.exp(-0.5 * ((x - (intercept_true + slope_true * t + shift)) / 2.0) ** 2)
+
+    cal = calibrate(counts, tth, np.tile([355.0, 385.0], (tth.size, 1)))
+    assert cal.fit is not None
+    assert np.all(np.abs(cal.fit.tth) >= 0.40)
+    assert cal.fit.excluded_low_tth == int(np.sum(np.abs(tth) < 0.40))
+    assert cal.fit.min_tth_used == pytest.approx(-4.0)
+    assert cal.fit.max_tth_used == pytest.approx(-0.40)
+    assert cal.deg_per_pixel == pytest.approx(1.0 / abs(slope_true), rel=5e-4)
+    assert cal.sign == 1
+
+
+def test_small_detector_width_within_edge_margin_raises_calibration_error():
+    from pySAview.core.angle_calibration import find_direct_beam
+
+    nx = 32  # 2 * edge_margin (40) >= nx
+    tth = np.linspace(0.5, 3.0, 20)
+    counts = np.full((tth.size, nx), 1.0, dtype=float)
+    counts[:, 16] = 1000.0
+    frames, pos = find_direct_beam(counts, tth, (2.0, 6.0), edge_margin=20)
+    assert frames.size == 0 and pos.size == 0
+    with pytest.raises(CalibrationError):
+        fit_direct_beam(counts, tth, (2.0, 6.0), edge_margin=20)
+
+
+def test_nonfinite_and_negative_count_safety():
+    from pySAview.core.angle_calibration import find_direct_beam, specular_center
+
+    nx = 256
+    x = np.arange(nx, dtype=float) + 0.5
+    tth = np.array([1.0, 1.5, 2.0])
+    counts = np.full((3, nx), 1.0, dtype=float)
+    for i, c in enumerate((140.5, 160.5, 180.5)):
+        counts[i] += 1000.0 * np.exp(-0.5 * ((x - c) / 2.0) ** 2)
+        counts[i] += 2500.0 * np.exp(-0.5 * ((x - 60.5) / 2.0) ** 2)
+    # Inject ±inf, NaN, and negative values into both the ROI and outside regions.
+    counts[:, 100] = np.inf
+    counts[:, 101] = -np.inf
+    counts[:, 102] = np.nan
+    counts[:, 120:130] = -50.0
+    counts[:, 52] = np.inf
+    counts[:, 53] = -np.inf
+    counts[:, 54] = -200.0
+
+    frames, pos = find_direct_beam(counts, tth, (45.0, 75.0))
+    np.testing.assert_array_equal(frames, [0, 1, 2])
+    np.testing.assert_allclose(pos, [140.5, 160.5, 180.5], atol=0.05)
+
+    assert specular_center(counts, np.tile([45.0, 75.0], (3, 1)), tth=tth) == pytest.approx(60.5, abs=0.05)
+
+    # All-negative / zero ROI with min_counts=0.0 must raise CalibrationError rather than divide by zero.
+    bad_roi_counts = np.full((3, 40), -5.0, dtype=float)
+    bad_roi_counts[:, 10] = np.inf
+    bad_roi_counts[:, 11] = -np.inf
+    with pytest.raises(CalibrationError):
+        specular_center(bad_roi_counts, np.tile([5.0, 20.0], (3, 1)), min_counts=0.0)
+
+

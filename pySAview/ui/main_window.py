@@ -94,8 +94,8 @@ class MainWindow(QMainWindow):
 
         self.tabs.addTab(self.view_hierarchy, "File Hierarchy")
         self.tabs.addTab(self.view_charts, "Scan Charts")
-        self.tabs.addTab(self.view_detector, "2D Detector")
-        self.tabs.addTab(self.view_offspec, "Off-Specular")
+        self.tabs.addTab(self.view_detector, "Detector Image")
+        self.tabs.addTab(self.view_offspec, "2D Map")
         self.tabs.addTab(self.view_metadata, "Metadata & Motors")
 
         # Connect session files view signals
@@ -189,12 +189,12 @@ class MainWindow(QMainWindow):
         act_tab1.triggered.connect(lambda: self.tabs.setCurrentIndex(1))
         menu_view.addAction(act_tab1)
 
-        act_tab2 = QAction("2D Detector Tab", self)
+        act_tab2 = QAction("Detector Image Tab", self)
         act_tab2.setShortcut(QKeySequence("Ctrl+3"))
         act_tab2.triggered.connect(lambda: self.tabs.setCurrentIndex(2))
         menu_view.addAction(act_tab2)
 
-        act_tab3 = QAction("Off-Specular Tab", self)
+        act_tab3 = QAction("2D Map Tab", self)
         act_tab3.setShortcut(QKeySequence("Ctrl+4"))
         act_tab3.triggered.connect(lambda: self.tabs.setCurrentIndex(3))
         menu_view.addAction(act_tab3)

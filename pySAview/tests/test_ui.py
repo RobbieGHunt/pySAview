@@ -30,8 +30,8 @@ def test_window_tabs_and_loading(main_window: MainWindow):
     tab_titles = [main_window.tabs.tabText(i) for i in range(5)]
     assert "File Hierarchy" in tab_titles[0]
     assert "Scan Charts" in tab_titles[1]
-    assert "2D Detector" in tab_titles[2]
-    assert "Off-Specular" in tab_titles[3]
+    assert "Detector Image" in tab_titles[2]
+    assert "2D Map" in tab_titles[3]
     assert "Metadata & Motors" in tab_titles[4]
 
     assert main_window.current_file_path is not None
@@ -306,28 +306,28 @@ def test_multi_file_loading_and_overlay(main_window: MainWindow):
 
 def test_spin_filter_in_detector_view(main_window: MainWindow):
     det = main_window.view_detector
-    assert det.combo_spin_filter.count() == 3
+    assert det.combo_spin_filter.count() == 4
     assert det.combo_spin_filter.isEnabled() is True
 
     total = det._total_frames
     assert total > 0
 
-    # Test Spin Up (F=1)
+    # Test Spin Up (Flipper OFF / 1)
     idx_up = det.combo_spin_filter.findData("up")
     det.combo_spin_filter.setCurrentIndex(idx_up)
     assert len(det._filtered_indices) == total // 2
     assert all(det.scan_data.variables["Flipper1"].data[i] == 1 for i in det._filtered_indices)
-    assert "u (F=1)" in det.lbl_frame_info.text()
+    assert "u (OFF)" in det.lbl_frame_info.text()
     det.btn_next.click()
     assert det._current_filtered_pos == 1
-    assert "u (F=1)" in det.lbl_frame_info.text()
+    assert "u (OFF)" in det.lbl_frame_info.text()
 
-    # Test Spin Down (F=0)
+    # Test Spin Down (Flipper ON / 0)
     idx_down = det.combo_spin_filter.findData("down")
     det.combo_spin_filter.setCurrentIndex(idx_down)
     assert len(det._filtered_indices) == total // 2
     assert all(det.scan_data.variables["Flipper1"].data[i] == 0 for i in det._filtered_indices)
-    assert "d (F=0)" in det.lbl_frame_info.text()
+    assert "d (ON)" in det.lbl_frame_info.text()
 
     # Test All Frames
     idx_all = det.combo_spin_filter.findData("all")
@@ -429,6 +429,42 @@ def test_file_hierarchy_tree_minimization(main_window: MainWindow):
     assert hier.is_tree_minimized is False
     assert not hier.tree_expanded_container.isHidden()
     assert hier.tree_minimized_container.isHidden()
+
+
+def test_flipper_labels_and_detector_sum_mode(main_window: MainWindow):
+    import numpy as np
+
+    # 1. Flipper ON = spin d (0), Flipper OFF = spin u (1) across all three spin selectors
+    charts = main_window.view_charts
+    det = main_window.view_detector
+    offspec = main_window.view_offspec
+
+    assert "Flipper ON" in charts.combo_spin.itemText(charts.combo_spin.findData("flipper0"))
+    assert "Flipper OFF" in charts.combo_spin.itemText(charts.combo_spin.findData("flipper1"))
+    assert "Flipper OFF" in det.combo_spin_filter.itemText(det.combo_spin_filter.findData("up"))
+    assert "Flipper ON" in det.combo_spin_filter.itemText(det.combo_spin_filter.findData("down"))
+    assert "Flipper OFF" in offspec.combo_spin.itemText(offspec.combo_spin.findData("up"))
+    assert "Flipper ON" in offspec.combo_spin.itemText(offspec.combo_spin.findData("down"))
+
+    # Frame 0 in 005572.nxs has Flipper1 == 1 -> u (OFF); Frame 1 has Flipper1 == 0 -> d (ON)
+    det.combo_spin_filter.setCurrentIndex(det.combo_spin_filter.findData("all"))
+    det.spin_step.setValue(0)
+    frame_0 = det._current_frame_data.copy()
+    assert "u (OFF)" in det.lbl_frame_info.text()
+    det.spin_step.setValue(1)
+    frame_1 = det._current_frame_data.copy()
+    assert "d (ON)" in det.lbl_frame_info.text()
+
+    # 2. Sum of spin channels (u + d) in Detector Image
+    idx_sum = det.combo_spin_filter.findData("sum")
+    assert idx_sum >= 0
+    det.combo_spin_filter.setCurrentIndex(idx_sum)
+    assert det.slider_step.maximum() == 150  # 151 paired (θ, 2θ) steps
+    det.spin_step.setValue(0)
+    assert "Frames 0+1" in det.lbl_frame_info.text()
+    assert "u+d (sum)" in det.lbl_frame_info.text()
+    np.testing.assert_array_equal(det._current_frame_data, frame_0 + frame_1)
+
 
 
 
