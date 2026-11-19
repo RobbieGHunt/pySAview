@@ -22,7 +22,7 @@ jobs:
             bundle_dir: dist/pySAview
             binary_path: dist/pySAview/pySAview.exe
           - label: macos-arm64
-            os: macos-14
+            os: macos-latest
             artifact_name: pySAview-macos-arm64
             archive_name: pySAview-macos-arm64.dmg
             bundle_dir: dist/pySAview.app
