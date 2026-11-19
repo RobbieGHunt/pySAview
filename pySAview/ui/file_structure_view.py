@@ -18,6 +18,7 @@ from PyQt6.QtWidgets import (
     QLabel,
     QLineEdit,
     QPushButton,
+    QSizePolicy,
     QSplitter,
     QTabWidget,
     QTableWidget,
@@ -42,6 +43,8 @@ class FileStructureView(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.reader: NexusReader | None = None
+        self._owns_reader: bool = False
+        self._pending_root_expand: bool = False
         self.session_source_paths = lambda: []  # every loaded file; set by the main window
         self.is_dark_mode: bool = False
         self._current_node: NodeInfo | None = None
@@ -50,20 +53,27 @@ class FileStructureView(QWidget):
         self._init_ui()
 
     def _init_ui(self) -> None:
+        self.setMinimumSize(0, 0)
         main_layout = QHBoxLayout(self)
         main_layout.setContentsMargins(10, 10, 10, 10)
 
         self.splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.splitter.setChildrenCollapsible(True)
+        self.splitter.setMinimumSize(0, 0)
+        self.splitter.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
         main_layout.addWidget(self.splitter)
 
         # ---------------- Left Panel: Tree & Search ----------------
         self.left_widget = QWidget()
+        self.left_widget.setMinimumSize(0, 0)
+        self.left_widget.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
         left_layout = QVBoxLayout(self.left_widget)
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.setSpacing(0)
 
         # 1. Expanded tree container
         self.tree_expanded_container = QWidget()
+        self.tree_expanded_container.setMinimumSize(0, 0)
         tree_exp_layout = QVBoxLayout(self.tree_expanded_container)
         tree_exp_layout.setContentsMargins(0, 0, 0, 0)
         tree_exp_layout.setSpacing(8)
@@ -73,6 +83,7 @@ class FileStructureView(QWidget):
         search_box.setSpacing(6)
 
         self.search_input = QLineEdit()
+        self.search_input.setMinimumWidth(0)
         self.search_input.setPlaceholderText("Filter hierarchy by name or path...")
         self.search_input.setClearButtonEnabled(True)
         self.search_input.textChanged.connect(self._on_search_text_changed)
@@ -95,6 +106,7 @@ class FileStructureView(QWidget):
 
         # Hierarchy Tree with modern styling
         self.tree = QTreeWidget()
+        self.tree.setMinimumSize(0, 0)
         self.tree.setHeaderLabels(["Node", "Type & Shape", "NeXus Class"])
         self.tree.setIndentation(18)
         self.tree.setAnimated(True)
@@ -108,6 +120,7 @@ class FileStructureView(QWidget):
 
         # 2. Minimized tree strip container
         self.tree_minimized_container = QWidget()
+        self.tree_minimized_container.setMinimumSize(0, 0)
         self.tree_minimized_container.setVisible(False)
         self.tree_minimized_container.setCursor(Qt.CursorShape.PointingHandCursor)
         self.tree_minimized_container.setToolTip("Click to expand File Hierarchy Tree")
@@ -131,18 +144,24 @@ class FileStructureView(QWidget):
 
         # ---------------- Right Panel: Node Details & Previews ----------------
         right_widget = QWidget()
+        right_widget.setMinimumSize(0, 0)
+        right_widget.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
         right_layout = QVBoxLayout(right_widget)
         right_layout.setContentsMargins(0, 0, 0, 0)
         right_layout.setSpacing(10)
 
         # 1. Node metadata card
         meta_group = QGroupBox("Node Information & Attributes")
+        meta_group.setMinimumSize(0, 0)
         meta_layout = QVBoxLayout(meta_group)
         meta_layout.setContentsMargins(10, 14, 10, 10)
         meta_layout.setSpacing(8)
 
         path_row = QHBoxLayout()
         self.lbl_path = QLabel("Select a node from the hierarchy tree to view details.")
+        self.lbl_path.setWordWrap(True)
+        self.lbl_path.setMinimumWidth(0)
+        self.lbl_path.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         self.lbl_path.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.lbl_path.setStyleSheet("font-weight: 600; font-family: monospace;")
         path_row.addWidget(self.lbl_path, 1)
@@ -155,11 +174,15 @@ class FileStructureView(QWidget):
         meta_layout.addLayout(path_row)
 
         self.lbl_summary = QLabel("")
+        self.lbl_summary.setWordWrap(True)
+        self.lbl_summary.setMinimumWidth(0)
+        self.lbl_summary.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         self.lbl_summary.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         meta_layout.addWidget(self.lbl_summary)
 
         # Attributes table
         self.attr_table = QTableWidget(0, 2)
+        self.attr_table.setMinimumSize(0, 0)
         self.attr_table.setHorizontalHeaderLabels(["Attribute Name", "Value"])
         self.attr_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         self.attr_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
@@ -170,10 +193,15 @@ class FileStructureView(QWidget):
 
         # 2. Dataset Visual & Tabular Preview
         preview_group = QGroupBox("Data Preview & Inspection")
+        preview_group.setMinimumSize(0, 0)
         prev_layout = QVBoxLayout(preview_group)
         prev_layout.setContentsMargins(10, 14, 10, 10)
 
         self.prev_tabs = QTabWidget()
+        self.prev_tabs.setMinimumSize(0, 0)
+        self.prev_tabs.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
+        self.prev_tabs.setUsesScrollButtons(True)
+        self.prev_tabs.tabBar().setExpanding(False)
 
         # Tab 1: Visual Plot
         tab_visual = QWidget()
@@ -184,14 +212,18 @@ class FileStructureView(QWidget):
         self.chk_log_y = QCheckBox("Log Scale")
         self.chk_log_y.toggled.connect(self._on_log_toggled)
         vis_controls.addWidget(self.chk_log_y)
-        vis_controls.addStretch()
 
         self.lbl_stats = QLabel("")
+        self.lbl_stats.setMinimumWidth(0)
+        self.lbl_stats.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.lbl_stats.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self.lbl_stats.setStyleSheet("color: #0284c7; font-weight: 600;")
-        vis_controls.addWidget(self.lbl_stats)
+        vis_controls.addWidget(self.lbl_stats, 1)
         vis_layout.addLayout(vis_controls)
 
         self.plot_widget = pg.PlotWidget()
+        self.plot_widget.setMinimumSize(0, 0)
+        self.plot_widget.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
         self.plot_widget.showGrid(x=True, y=True, alpha=0.3)
         apply_plot_theme(self.plot_widget, self.is_dark_mode)
         vis_layout.addWidget(self.plot_widget, 1)
@@ -201,6 +233,8 @@ class FileStructureView(QWidget):
             lambda: ([str(self.reader.path)] if self.reader is not None else []) + list(self.session_source_paths()))
 
         self.text_preview = QTextEdit()
+        self.text_preview.setMinimumSize(0, 0)
+        self.text_preview.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
         self.text_preview.setReadOnly(True)
         self.text_preview.setVisible(False)
         vis_layout.addWidget(self.text_preview, 1)
@@ -212,6 +246,7 @@ class FileStructureView(QWidget):
         tbl_layout = QVBoxLayout(tab_table)
         tbl_layout.setContentsMargins(6, 6, 6, 6)
         self.data_table = QTableWidget()
+        self.data_table.setMinimumSize(0, 0)
         tbl_layout.addWidget(self.data_table)
         self.prev_tabs.addTab(tab_table, "Spreadsheet Table")
 
@@ -219,6 +254,8 @@ class FileStructureView(QWidget):
         right_layout.addWidget(preview_group, 1)
 
         self.splitter.addWidget(right_widget)
+        self.splitter.setStretchFactor(0, 1)
+        self.splitter.setStretchFactor(1, 2)
         self.splitter.setSizes([390, 660])
 
     def mousePressEvent(self, event) -> None:
@@ -245,20 +282,33 @@ class FileStructureView(QWidget):
             tot = sum(self.splitter.sizes())
             self.splitter.setSizes([34, max(50, tot - 34)])
         else:
-            self.left_widget.setMinimumWidth(200)
+            self.left_widget.setMinimumWidth(0)
             self.left_widget.setMaximumWidth(16777215)
             self.tree_minimized_container.setVisible(False)
             self.tree_expanded_container.setVisible(True)
             tot = sum(self.splitter.sizes())
             target_w = self._last_tree_width if self._last_tree_width >= 200 else 390
+            if tot > 0:
+                target_w = min(target_w, max(40, tot // 2))
             self.splitter.setSizes([target_w, max(50, tot - target_w)])
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        if self._pending_root_expand and self.reader is not None:
+            self._expand_root_items()
+
+    def set_reader(self, reader: NexusReader | None, *, owned: bool = False) -> None:
+        """Bind an existing read-only NexusReader (or None) to the hierarchy viewer."""
+        if self.reader is not None and self._owns_reader and self.reader is not reader:
+            self.reader.close()
+        self.reader = reader
+        self._owns_reader = bool(owned and reader is not None)
+        self._current_node = None
+        self._populate_root()
 
     def set_file(self, path: Path | str) -> None:
         """Load a new NeXus file into the hierarchy viewer."""
-        if self.reader is not None:
-            self.reader.close()
-        self.reader = NexusReader(path)
-        self._populate_root()
+        self.set_reader(NexusReader(path), owned=True)
 
     def set_theme(self, is_dark: bool) -> None:
         """Update styling for dark or light mode."""
@@ -277,16 +327,27 @@ class FileStructureView(QWidget):
             self._display_node(self._current_node)
 
     def close(self) -> None:
-        """Close underlying HDF5 file handle."""
+        """Detach (and close if owned) the underlying HDF5 file handle."""
         if self.reader is not None:
-            self.reader.close()
+            if self._owns_reader:
+                self.reader.close()
             self.reader = None
+            self._owns_reader = False
+        self._pending_root_expand = False
 
     def _collapse_all(self) -> None:
         self.tree.collapseAll()
 
+    def _expand_root_items(self) -> None:
+        self._pending_root_expand = False
+        for i in range(self.tree.topLevelItemCount()):
+            top = self.tree.topLevelItem(i)
+            if top:
+                top.setExpanded(True)
+
     def _populate_root(self) -> None:
         self.tree.clear()
+        self._pending_root_expand = False
         if self.reader is None:
             return
 
@@ -297,11 +358,11 @@ class FileStructureView(QWidget):
                 item.addChild(QTreeWidgetItem(["Loading...", "", ""]))
             self.tree.addTopLevelItem(item)
 
-        # Expand root top-level items by default
-        for i in range(self.tree.topLevelItemCount()):
-            top = self.tree.topLevelItem(i)
-            if top:
-                top.setExpanded(True)
+        # Defer expanding /entry0 (which walks all child nodes and attributes) until the tab is visible.
+        if self.isVisible():
+            self._expand_root_items()
+        else:
+            self._pending_root_expand = True
 
     def _create_tree_item(self, node: NodeInfo) -> QTreeWidgetItem:
         nx_class = node.attrs.get("NX_class", "")
@@ -366,6 +427,8 @@ class FileStructureView(QWidget):
 
     def _on_search_text_changed(self, text: str) -> None:
         query = text.strip().lower()
+        if query and self._pending_root_expand and self.reader is not None:
+            self._expand_root_items()
         if not query:
             for i in range(self.tree.topLevelItemCount()):
                 self._filter_tree_item(self.tree.topLevelItem(i), "")

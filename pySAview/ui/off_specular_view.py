@@ -14,7 +14,7 @@ from threading import Event
 import numpy as np
 import pyqtgraph as pg
 from PyQt6.QtCore import QPointF, QRectF, QSize, Qt, QThread, QTimer, pyqtSignal
-from PyQt6.QtGui import QCursor, QImage, QPainter, QTransform
+from PyQt6.QtGui import QColor, QCursor, QImage, QPainter, QPainterPath, QPicture, QTransform, qRgba
 from PyQt6.QtWidgets import (
     QApplication,
     QButtonGroup,
@@ -22,6 +22,7 @@ from PyQt6.QtWidgets import (
     QComboBox,
     QDoubleSpinBox,
     QFileDialog,
+    QFrame,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
@@ -29,30 +30,44 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QSpinBox,
     QSplitter,
+    QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
 
 from pySAview.core.angle_calibration import (
     AngleCalibration,
+    DETECTOR_WIDTH_MM,
+    PYSARED_DEFAULT_DISTANCE_MM,
     CalibrationError,
+    alpha_f_offset_for_pixel,
     alpha_f_offsets,
     alpha_i_strip_edges,
     angles_from_q,
     calibrate,
+    pixel_for_alpha_f_offset,
+    pixel_pitch_mm,
     q_from_angles,
     specular_center,
+)
+from pySAview.core.reduction.kinematics import (
+    constant_qx_alpha_f,
+    constant_qz_alpha_f,
+    qz_step_per_pixel,
 )
 from pySAview.core.models import ScanData
 from pySAview.core.nexus_reader import NexusReader
 from pySAview.core.off_specular import (
     DETECTOR_PATH,
     AsymmetryMap,
+    SummedSpinMap,
     pair_spin_frames,
     spin_asymmetry,
+    sum_spin_frames,
     OffSpecularMap,
     compute_off_specular_map,
     frame_y_bounds,
@@ -62,6 +77,13 @@ from pySAview.core.off_specular import (
 )
 from pySAview.core.export_tables import map_table, write_table
 from pySAview.ui import icons
+from pySAview.ui.flow_layout import (
+    FlowContainer,
+    FlowLayout,
+    configure_compact_combo,
+    fit_combo_popup,
+    make_flow_group,
+)
 from pySAview.ui.plot_tools import (
     TABLE_FILTERS, ask_output_path, export_plot_image, install_context_export, tool_button,
 )
@@ -83,13 +105,57 @@ def _decimals_for_step(step: float) -> int:
 _tool_button = tool_button
 
 
-CUT_HINT = "Turn on the crosshair tool (⌖ in the map toolbar) and click the map to drop the cuts."
+CUT_HINT = "Click Drop Cut Lines, Horizontal, or Vertical above (or ⌖ in the toolbar) to drop draggable cuts."
 
 
 def _fixed_width_text(label: QLabel) -> None:
     """Changing text must never resize the layout (the map would jump while hovering)."""
     label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
     label.setMinimumWidth(0)
+
+
+_RDBU_R_POS = np.linspace(0.0, 1.0, 11)
+_RDBU_R_RGBA = np.array(
+    [
+        [5, 48, 97, 255],
+        [33, 102, 172, 255],
+        [67, 147, 195, 255],
+        [146, 197, 222, 255],
+        [209, 229, 240, 255],
+        [247, 247, 247, 255],
+        [253, 219, 199, 255],
+        [244, 165, 130, 255],
+        [214, 96, 77, 255],
+        [178, 24, 43, 255],
+        [103, 0, 31, 255],
+    ],
+    dtype=np.ubyte,
+)
+_CMAP_CACHE: dict[str, pg.ColorMap] = {}
+_IDENTITY_GRAY_ALPHA_TABLE = [qRgba(0, 0, 0, 0)] + [qRgba(i, i, i, 255) for i in range(1, 256)]
+
+
+def _diverging_rdbu_r() -> pg.ColorMap:
+    """ColorBrewer RdBu_r diverging map without importing matplotlib."""
+    cmap = _CMAP_CACHE.get("__rdbu_r__")
+    if cmap is None:
+        cmap = pg.ColorMap(pos=_RDBU_R_POS, color=_RDBU_R_RGBA)
+        _CMAP_CACHE["__rdbu_r__"] = cmap
+    return cmap
+
+
+def _color_table_from_colormap(cmap: pg.ColorMap) -> list[int]:
+    """256-entry ARGB color table for Format_Indexed8: index 0 transparent, 1..255 LUT."""
+    lut = cmap.getLookupTable(nPts=255, alpha=True)
+    return [qRgba(0, 0, 0, 0)] + [qRgba(int(r), int(g), int(b), int(a)) for r, g, b, a in lut]
+
+
+def _color_table_from_qcolors(lut) -> list[int]:
+    n = len(lut)
+    if n == 0:
+        return [qRgba(0, 0, 0, 0)] + [qRgba(0, 0, 0, 255)] * 255
+    idx = np.linspace(0, n - 1, 255).round().astype(int)
+    return [qRgba(0, 0, 0, 0)] + [QColor(lut[int(i)]).rgba() for i in idx]
 
 
 def _same_transform(a: QTransform, b: QTransform, tol: float = 1e-6) -> bool:
@@ -99,41 +165,288 @@ def _same_transform(a: QTransform, b: QTransform, tol: float = 1e-6) -> bool:
 
 
 class CachedMeshItem(pg.PColorMeshItem):
-    """Exact-cell mesh that blits rendered images while the view moves.
+    """Exact-cell mesh that blits cached indexed-color images while the view moves.
 
     ``PColorMeshItem`` replays one polygon per cell on every repaint (~150k for a
-    Qx–Qz map, tens of ms), which makes panning, zooming and crosshair dragging
-    stutter. Here the same cells are rendered once into images: a whole-map
-    overview and a screen-resolution image of the current view (plus a margin).
-    While the view moves those images are only transformed; once it has been
-    still for ``DETAIL_DELAY_MS`` the view image is re-rendered pixel-exact.
-    Display only: the cell geometry and values are unchanged, and exports always
-    draw the cells directly.
+    Qx–Qz or θ map, ~1–2 s), which makes panning, zooming, and adjusting plot
+    settings sluggish. Here the exact cells are rasterized into ``Format_Indexed8``
+    images (a whole-map overview and a screen-resolution image of the current view
+    plus a margin):
+    - Rectilinear uniform-X meshes (such as ``X pixel vs θ``) blit per-row strips
+      directly without allocating 300k polygons (~100× faster).
+    - Curved meshes (such as ``Qx vs Qz``) bin finite quads into chunked
+      ``QPainterPath``s without ``QuadInstances`` Python overhead.
+    - Colormap switches swap the 256-entry color table in-place (<1 ms, zero
+      re-rasterization).
+    Display only: cell geometry and values are unchanged, and exports always draw
+    the exact cells directly.
     """
 
     DETAIL_DELAY_MS = 120
     MARGIN = 0.25  # fraction of the view rendered beyond each edge, so short pans stay sharp
     OVERVIEW_MAX_PX = 4096
+    PATH_CHUNK_QUADS = 4096
 
     def __init__(self, *args, **kwargs) -> None:
+        self._color_table: list[int] | None = None
+        self._geom_cache = None  # ("rect", x0, x1, y_lo, y_hi) or ("quads",)
+        self._render_plan = None  # ("empty",) | ("rect", ...) | ("paths", [...]) | ("picture", QPicture)
+        self._conn_buf = np.ones((self.PATH_CHUNK_QUADS, 5), dtype=np.int32)
+        self._conn_buf[:, 4] = 0
+        self._conn_flat = self._conn_buf.ravel()
         super().__init__(*args, **kwargs)
+        self._color_table = (
+            _color_table_from_colormap(self.cmap)
+            if self.cmap is not None
+            else _color_table_from_qcolors(self.lut_qcolor)
+        )
         self._picture_used = None
         self._overview = None  # (QImage, item-coordinate rect)
-        self._detail = None  # (QImage, item-coordinate rect, device transform, device offset)
+        self._detail = None  # (QImage, inverse device transform, device transform, device offset)
         self._last_view = None  # (device transform, viewport size, device pixel ratio)
         self._detail_timer = QTimer()
         self._detail_timer.setSingleShot(True)
         self._detail_timer.setInterval(self.DETAIL_DELAY_MS)
         self._detail_timer.timeout.connect(self._render_detail)
 
+    def _prepareData(self, args):
+        dirty = super()._prepareData(args)
+        # Invalidate cached XY geometry only when XY coordinates or dimensions actually changed.
+        if len(args) != 3 or args[0] is not None or args[1] is not None:
+            self._geom_cache = None
+        self._render_plan = None
+        return dirty
+
+    def _rerender(self, *, autoLevels):
+        super()._rerender(autoLevels=autoLevels)
+        self._render_plan = None
+
+    def setLevels(self, levels, update=True):
+        if (
+            self.levels is not None
+            and levels is not None
+            and len(levels) == 2
+            and float(levels[0]) == float(self.levels[0])
+            and float(levels[1]) == float(self.levels[1])
+        ):
+            return
+        super().setLevels(levels, update=update)
+
+    def _apply_color_table(self, table: list[int], *, update: bool) -> None:
+        self._color_table = table
+        if self.edgecolors is not None:
+            if update:
+                self._rerender(autoLevels=False)
+                self.update()
+            return
+        recolored = False
+        if self._overview is not None and self._overview[0].format() == QImage.Format.Format_Indexed8:
+            self._overview[0].setColorTable(table)
+            recolored = True
+        if self._detail is not None and self._detail[0].format() == QImage.Format.Format_Indexed8:
+            self._detail[0].setColorTable(table)
+            recolored = True
+        if update:
+            if not recolored:
+                self.qpicture = None
+                self._render_plan = None
+            self.update()
+
+    def setColorMap(self, cmap):
+        self.cmap = cmap
+        self.lut_qcolor = cmap.getLookupTable(nPts=256, mode=cmap.QCOLOR)
+        if self.glstate is not None:
+            self.setLookupTable(self.lut_qcolor, update=True)
+            self.cmap = cmap
+            return
+        self._apply_color_table(_color_table_from_colormap(cmap), update=True)
+
+    def setLookupTable(self, lut, update=True):
+        self.cmap = None
+        self.lut_qcolor = lut[:]
+        if self.glstate is not None:
+            super().setLookupTable(lut, update=update)
+            return
+        self._apply_color_table(_color_table_from_qcolors(lut), update=update)
+
+    def _ensure_geom(self):
+        if self._geom_cache is not None:
+            return self._geom_cache
+        x, y = self.x, self.y
+        if x is None or y is None or self.z is None or self.z.size == 0:
+            self._geom_cache = ("empty",)
+            return self._geom_cache
+        # O(1) quick check before scanning arrays: rectilinear uniform-X strip mesh?
+        r_count, c_count = self.z.shape
+        is_rect = False
+        if (
+            c_count > 0
+            and r_count > 0
+            and x[0, 0] == x[-1, 0]
+            and x[0, -1] == x[-1, -1]
+            and x[0, -1] > x[0, 0]
+            and y[0, 0] == y[0, -1]
+            and y[-1, 0] == y[-1, -1]
+            and np.all(np.isfinite(x))
+            and np.all(np.isfinite(y))
+        ):
+            expected_x = np.linspace(float(x[0, 0]), float(x[0, -1]), c_count + 1)
+            if np.allclose(x, expected_x[None, :], rtol=1e-7, atol=1e-9) and np.allclose(
+                y, y[:, :1], rtol=1e-7, atol=1e-9
+            ):
+                is_rect = True
+        if is_rect:
+            y_col = np.asarray(y[:, 0], dtype=float)
+            self._geom_cache = ("rect", float(x[0, 0]), float(x[0, -1]), y_col[:-1].copy(), y_col[1:].copy())
+        else:
+            self._geom_cache = ("quads",)
+        return self._geom_cache
+
+    def _build_render_plan(self):
+        if self.edgecolors is not None:
+            return ("picture", super()._drawPicture())
+        if self.z is None or self.z.size == 0:
+            return ("empty",)
+        geom = self._ensure_geom()
+        if geom[0] == "empty":
+            return ("empty",)
+        if self.levels is None:
+            finite = self.z[np.isfinite(self.z)]
+            if finite.size == 0:
+                return ("empty",)
+            lo, hi = float(finite.min()), float(finite.max())
+        else:
+            lo, hi = float(self.levels[0]), float(self.levels[1])
+        rng = hi - lo
+        if rng == 0.0:
+            rng = 1.0
+        scale = 254.0 / rng
+
+        if geom[0] == "rect":
+            _, x0, x1, y_lo, y_hi = geom
+            valid = np.isfinite(self.z)
+            active_rows = np.flatnonzero(np.any(valid, axis=1))
+            if active_rows.size == 0:
+                return ("empty",)
+            z_act = self.z[active_rows]
+            v_act = valid[active_rows]
+            bins = np.zeros(z_act.shape, dtype=np.uint8)
+            scaled = np.clip(np.rint((z_act[v_act] - lo) * scale), 0.0, 254.0).astype(np.uint8)
+            bins[v_act] = scaled + 1
+            bins = np.ascontiguousarray(bins)
+            rects = [
+                (
+                    QRectF(x0, float(min(y_lo[r], y_hi[r])), x1 - x0, float(abs(y_hi[r] - y_lo[r]))),
+                    QRectF(0.0, float(k), float(bins.shape[1]), 1.0),
+                )
+                for k, r in enumerate(active_rows)
+                if y_hi[r] != y_lo[r]
+            ]
+            if not rects:
+                return ("empty",)
+            src_img = QImage(bins.data, bins.shape[1], bins.shape[0], bins.shape[1], QImage.Format.Format_Indexed8)
+            src_img.setColorTable(_IDENTITY_GRAY_ALPHA_TABLE)
+            return ("rect", bins, src_img, rects)
+
+        # Curved / general quadrilateral mesh: group finite cells by quantized color bin into chunked paths.
+        valid = np.isfinite(self.z)
+        rows, cols = np.nonzero(valid)
+        if rows.size == 0:
+            return ("empty",)
+        zv = self.z[rows, cols]
+        bins = np.clip(np.rint((zv - lo) * scale), 0.0, 254.0).astype(np.int32) + 1
+        order = np.argsort(bins, kind="mergesort")
+        sbins = bins[order]
+        srows = rows[order]
+        scols = cols[order]
+        u_bins, starts, counts = np.unique(sbins, return_index=True, return_counts=True)
+
+        x, y = self.x, self.y
+        chunk = self.PATH_CHUNK_QUADS
+        qx = np.empty((chunk, 5), dtype=np.float64)
+        qy = np.empty((chunk, 5), dtype=np.float64)
+        paths: list[tuple[int, QPainterPath]] = []
+        for b_val, st, cnt in zip(u_bins, starts, counts):
+            b_int = int(b_val)
+            st_i = int(st)
+            cnt_i = int(cnt)
+            for off in range(0, cnt_i, chunk):
+                end = min(cnt_i, off + chunk)
+                k = end - off
+                rr = srows[st_i + off : st_i + end]
+                cc = scols[st_i + off : st_i + end]
+                qx[:k, 0] = x[rr, cc]
+                qy[:k, 0] = y[rr, cc]
+                qx[:k, 1] = x[rr + 1, cc]
+                qy[:k, 1] = y[rr + 1, cc]
+                qx[:k, 2] = x[rr + 1, cc + 1]
+                qy[:k, 2] = y[rr + 1, cc + 1]
+                qx[:k, 3] = x[rr, cc + 1]
+                qy[:k, 3] = y[rr, cc + 1]
+                qx[:k, 4] = qx[:k, 0]
+                qy[:k, 4] = qy[:k, 0]
+                path = pg.arrayToQPath(qx[:k].ravel(), qy[:k].ravel(), connect=self._conn_flat[: 5 * k])
+                paths.append((b_int, path))
+        return ("paths", paths)
+
+    def _ensure_plan(self):
+        if self._render_plan is None:
+            self._render_plan = self._build_render_plan()
+        return self._render_plan
+
+    def _paint_exact(self, painter: QPainter) -> None:
+        """Draw exact cells directly to ``painter`` (used for PNG/SVG exports)."""
+        plan = self._ensure_plan()
+        kind = plan[0]
+        if kind == "empty":
+            return
+        if kind == "picture":
+            painter.drawPicture(0, 0, plan[1])
+            return
+        table = self._color_table or _IDENTITY_GRAY_ALPHA_TABLE
+        if kind == "rect":
+            _, bins, _, rects = plan
+            export_img = QImage(bins.data, bins.shape[1], bins.shape[0], bins.shape[1], QImage.Format.Format_Indexed8)
+            export_img.setColorTable(table)
+            for dst_rect, src_rect in rects:
+                painter.drawImage(dst_rect, export_img, src_rect)
+            return
+        # kind == "paths"
+        painter.save()
+        painter.setPen(Qt.PenStyle.NoPen)
+        for b_int, path in plan[1]:
+            painter.fillPath(path, QColor.fromRgba(table[b_int]))
+        painter.restore()
+
     def _render(self, size: QSize, dpr: float, transform: QTransform) -> QImage:
-        image = QImage(size * dpr, QImage.Format.Format_ARGB32_Premultiplied)
+        plan = self._ensure_plan()
+        kind = plan[0]
+        if kind == "picture":
+            image = QImage(size * dpr, QImage.Format.Format_ARGB32_Premultiplied)
+            image.setDevicePixelRatio(dpr)
+            image.fill(Qt.GlobalColor.transparent)
+            painter = QPainter(image)
+            painter.setTransform(transform)
+            painter.drawPicture(0, 0, plan[1])
+            painter.end()
+            return image
+        image = QImage(size * dpr, QImage.Format.Format_Grayscale8)
         image.setDevicePixelRatio(dpr)
-        image.fill(Qt.GlobalColor.transparent)
-        painter = QPainter(image)
-        painter.setTransform(transform)
-        painter.drawPicture(0, 0, self.qpicture)
-        painter.end()
+        image.fill(0)
+        if kind != "empty":
+            painter = QPainter(image)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setTransform(transform)
+            if kind == "rect":
+                _, _, src_img, rects = plan
+                for dst_rect, src_rect in rects:
+                    painter.drawImage(dst_rect, src_img, src_rect)
+            else:  # kind == "paths"
+                for b_int, path in plan[1]:
+                    painter.fillPath(path, QColor(b_int, b_int, b_int))
+            painter.end()
+        image.reinterpretAsFormat(QImage.Format.Format_Indexed8)
+        image.setColorTable(self._color_table or _IDENTITY_GRAY_ALPHA_TABLE)
         return image
 
     def _render_overview(self, viewport: QSize, dpr: float) -> None:
@@ -141,8 +454,8 @@ class CachedMeshItem(pg.PColorMeshItem):
         if rect.width() <= 0 or rect.height() <= 0:
             return
         limit = self.OVERVIEW_MAX_PX / dpr
-        w = int(min(limit, max(64, 2 * viewport.width())))
-        h = int(min(limit, max(64, 2 * viewport.height())))
+        w = int(min(limit, max(64, viewport.width())))
+        h = int(min(limit, max(64, viewport.height())))
         transform = QTransform.fromScale(w / rect.width(), h / rect.height())
         transform.translate(-rect.left(), -rect.top())
         self._overview = (self._render(QSize(w, h), dpr, transform), QRectF(rect))
@@ -151,25 +464,25 @@ class CachedMeshItem(pg.PColorMeshItem):
         if self._last_view is None or self.qpicture is None or self.scene() is None:
             return
         transform, viewport, dpr = self._last_view
-        mx, my = int(viewport.width() * self.MARGIN), int(viewport.height() * self.MARGIN)
-        shifted = transform * QTransform.fromTranslate(mx, my)
-        image = self._render(QSize(viewport.width() + 2 * mx, viewport.height() + 2 * my), dpr, shifted)
         inverse, ok = transform.inverted()
         if not ok:
             return
-        device = QRectF(-mx, -my, viewport.width() + 2 * mx, viewport.height() + 2 * my)
-        self._detail = (image, inverse.mapRect(device), QTransform(transform), QPointF(-mx, -my))
+        mx, my = int(viewport.width() * self.MARGIN), int(viewport.height() * self.MARGIN)
+        shifted = transform * QTransform.fromTranslate(mx, my)
+        image = self._render(QSize(viewport.width() + 2 * mx, viewport.height() + 2 * my), dpr, shifted)
+        self._detail = (image, inverse, QTransform(transform), QPointF(-mx, -my))
         self.update()
 
     def paint(self, painter, opt, widget):
         if self.z is None:
             return
-        if self.qpicture is None:
-            self.qpicture = self._drawPicture()
         if self._exportOpts is not False or widget is None:
-            painter.drawPicture(0, 0, self.qpicture)  # exports: draw the exact cells
+            self._paint_exact(painter)  # exports: draw the exact cells
             return
-        if self._picture_used is not self.qpicture:  # new data, levels or colours
+        if self.qpicture is None:
+            self._ensure_plan()
+            self.qpicture = self._render_plan[1] if self._render_plan[0] == "picture" else QPicture()
+        if self._picture_used is not self.qpicture:  # new data or levels
             self._picture_used = self.qpicture
             self._overview = self._detail = None
         transform = painter.transform()
@@ -183,12 +496,46 @@ class CachedMeshItem(pg.PColorMeshItem):
             painter.drawImage(detail[3], detail[0])  # pixel-exact for this view
             painter.restore()
             return
-        if self._overview is None:
-            self._render_overview(viewport, dpr)
-        if self._overview is not None:
-            painter.drawImage(self._overview[1], self._overview[0])
         if detail is not None:
-            painter.drawImage(detail[1], detail[0])
+            detail_img, detail_inv, _, offset = detail
+            # Map detail_img logical pixels -> old viewport -> item -> current viewport.
+            # Drawing through this relative device transform preserves orientation under
+            # Y-up plot coordinates and inverted X/Y viewboxes alike (no vertical/horizontal flip).
+            rel = QTransform.fromTranslate(offset.x(), offset.y()) * detail_inv * transform
+            detail_dpr = detail_img.devicePixelRatio() or 1.0
+            detail_logical = QRectF(
+                0.0,
+                0.0,
+                detail_img.width() / detail_dpr,
+                detail_img.height() / detail_dpr,
+            )
+            detail_view_rect = rel.mapRect(detail_logical)
+            viewport_rect = QRectF(0.0, 0.0, float(viewport.width()), float(viewport.height()))
+            if not detail_view_rect.contains(viewport_rect):
+                if self._overview is None:
+                    self._render_overview(viewport, dpr)
+                if self._overview is not None:
+                    painter.save()
+                    if detail_view_rect.width() > 2.0 and detail_view_rect.height() > 2.0:
+                        clip_outside = QPainterPath()
+                        clip_outside.addRect(viewport_rect)
+                        inner = QPainterPath()
+                        inner.addRect(detail_view_rect.adjusted(0.5, 0.5, -0.5, -0.5))
+                        clip_outside = clip_outside.subtracted(inner)
+                        painter.resetTransform()
+                        painter.setClipPath(clip_outside, Qt.ClipOperation.IntersectClip)
+                        painter.setTransform(transform)
+                    painter.drawImage(self._overview[1], self._overview[0])
+                    painter.restore()
+            painter.save()
+            painter.setTransform(rel)
+            painter.drawImage(QPointF(0.0, 0.0), detail_img)
+            painter.restore()
+        else:
+            if self._overview is None:
+                self._render_overview(viewport, dpr)
+            if self._overview is not None:
+                painter.drawImage(self._overview[1], self._overview[0])
         self._detail_timer.start()  # sharpen once the view has stopped moving
 
 
@@ -227,6 +574,13 @@ class OffSpecularThread(QThread):
                 self.failed.emit(self.token, str(error))
 
 
+class _CompactPlotWidget(pg.PlotWidget):
+    """PlotWidget with a compact preferred sizeHint so side-panel scroll areas do not inflate."""
+
+    def sizeHint(self) -> QSize:
+        return QSize(180, 120)
+
+
 class OffSpecularView(QWidget):
     """Heatmap of Y-integrated detector intensity versus X pixel and scan point."""
 
@@ -245,10 +599,14 @@ class OffSpecularView(QWidget):
         self._sel_x = 0
         self._crosshair_placed = False
         self._roi_items: list[pg.PlotDataItem] = []
-        self._alpha_items: list[pg.ImageItem] = []
+        self._alpha_items: list[pg.GraphicsObject] = []
         self._alpha_geom: dict | None = None
+        self._th_geom: dict | None = None
         self._cal_message = ""
         self._colorbar_on_strips = False
+        self._applied_cmap_key: tuple[bool, str] | None = None
+        self._colorbar_items_rebuilt = True
+        self._last_tick_key = None
         self.session_source_paths = lambda: []  # every loaded file; set by the main window
         self._cut_values: np.ndarray | None = None  # what the map shows (asymmetry: low counts blanked)
         self._init_ui()
@@ -256,21 +614,24 @@ class OffSpecularView(QWidget):
 
     # ------------------------------------------------------------------ layout
     def _init_ui(self) -> None:
+        self.setMinimumSize(0, 0)
         main = QVBoxLayout(self)
         main.setContentsMargins(10, 10, 10, 10)
         main.setSpacing(8)
 
-        bar = QHBoxLayout()
-        bar.setSpacing(8)
-        bar.addWidget(QLabel("Spin:"))
-        self.combo_spin = QComboBox()
+        bar = FlowContainer(margin=0, h_spacing=8, v_spacing=6)
+        self.combo_spin = configure_compact_combo(QComboBox(), min_chars=14)
         self.combo_spin.addItem("All Frames", "all")
-        self.combo_spin.addItem("u — Spin Up (F=1)", "up")
-        self.combo_spin.addItem("d — Spin Down (F=0)", "down")
+        self.combo_spin.addItem("u — Spin Up (Flipper OFF / 1)", "up")
+        self.combo_spin.addItem("d — Spin Down (Flipper ON / 0)", "down")
+        self.combo_spin.addItem("u + d — Sum of channels", "sum")
         self.combo_spin.addItem("Spin asymmetry (u−d)/(u+d)", "asym")
+        fit_combo_popup(self.combo_spin)
         self.combo_spin.currentIndexChanged.connect(self._on_spin_changed)
-        bar.addWidget(self.combo_spin)
+        bar.addWidget(make_flow_group(QLabel("Spin:"), self.combo_spin, spacing=6))
+
         self.spin_min_counts = QSpinBox()
+        self.spin_min_counts.setMinimumWidth(0)
         self.spin_min_counts.setRange(0, 1_000_000)
         self.spin_min_counts.setValue(10)
         self.spin_min_counts.setPrefix("u+d ≥ ")
@@ -282,17 +643,17 @@ class OffSpecularView(QWidget):
         self.spin_min_counts.valueChanged.connect(self._redraw)
         bar.addWidget(self.spin_min_counts)
 
-        bar.addWidget(QLabel("Integrate Y:"))
-        self.combo_y_source = QComboBox()
+        self.combo_y_source = configure_compact_combo(QComboBox(), min_chars=12)
         self.combo_y_source.addItem("Full detector height", "full")
         self.combo_y_source.addItem("Scan ROI Y range", "roi")
         self.combo_y_source.addItem("Custom Y range", "custom")
+        fit_combo_popup(self.combo_y_source)
         self.combo_y_source.setToolTip("Rows of each detector image summed for every X pixel")
         self.combo_y_source.currentIndexChanged.connect(self._on_y_source_changed)
-        bar.addWidget(self.combo_y_source)
+        bar.addWidget(make_flow_group(QLabel("Integrate Y:"), self.combo_y_source, spacing=6))
+
         # The row spinboxes always show the Y window being integrated. Editing
         # them switches to "Custom Y range" (e.g. to exclude noisy detector edges).
-        bar.addWidget(QLabel("Rows:"))
         self.spin_y0 = QSpinBox()
         self.spin_y1 = QSpinBox()
         for spin, tip in ((self.spin_y0, "First detector Y row integrated (inclusive)"),
@@ -302,30 +663,31 @@ class OffSpecularView(QWidget):
             spin.setKeyboardTracking(False)
             spin.setToolTip(tip + ". Editing switches to Custom Y range.")
             spin.valueChanged.connect(self._on_row_spin_changed)
-            bar.addWidget(spin)
+        bar.addWidget(make_flow_group(QLabel("Rows:"), self.spin_y0, spacing=6))
+        bar.addWidget(self.spin_y1)
         self._row_timer = QTimer(self)
         self._row_timer.setSingleShot(True)
         self._row_timer.setInterval(350)  # wait for arrow-key/click bursts before recomputing
         self._row_timer.timeout.connect(self._request_compute)
 
-        bar.addWidget(QLabel("Normalize:"))
-        self.combo_norm = QComboBox()
+        self.combo_norm = configure_compact_combo(QComboBox(), min_chars=11)
         self.combo_norm.addItem("Raw counts", "raw")
         self.combo_norm.addItem("Counts / s", "time")
         self.combo_norm.addItem("Counts / Monitor1", "monitor")
+        fit_combo_popup(self.combo_norm)
         self.combo_norm.currentIndexChanged.connect(self._redraw)
-        bar.addWidget(self.combo_norm)
+        bar.addWidget(make_flow_group(QLabel("Normalize:"), self.combo_norm, spacing=6))
 
-        bar.addWidget(QLabel("Axes:"))
-        self.combo_y_axis = QComboBox()
-        self.combo_y_axis.addItem("X pixel vs Point", "point")
+        self.combo_y_axis = configure_compact_combo(QComboBox(), min_chars=10)
         self.combo_y_axis.addItem("X pixel vs θ", "th")
+        self.combo_y_axis.addItem("X pixel vs Point", "point")
         self.combo_y_axis.addItem("α_i vs α_f", "alpha")
         self.combo_y_axis.addItem("Qx vs Qz", "q")
+        fit_combo_popup(self.combo_y_axis)
         self.combo_y_axis.setToolTip("α_i vs α_f and Qx vs Qz use this scan's angle calibration "
                                      "(right-hand panel); Qx–Qz also uses λ")
         self.combo_y_axis.currentIndexChanged.connect(self._on_axes_changed)
-        bar.addWidget(self.combo_y_axis)
+        bar.addWidget(make_flow_group(QLabel("Axes:"), self.combo_y_axis, spacing=6))
 
         self.chk_log = QCheckBox("Log Scale")
         self.chk_log.setChecked(True)
@@ -336,13 +698,12 @@ class OffSpecularView(QWidget):
         self.chk_show_roi.toggled.connect(self._draw_roi_overlay)
         bar.addWidget(self.chk_show_roi)
 
-        bar.addWidget(QLabel("Colormap:"))
-        self.combo_cmap = QComboBox()
+        self.combo_cmap = configure_compact_combo(QComboBox(), min_chars=7)
         self.combo_cmap.addItems(["turbo", "viridis", "inferno", "plasma", "cividis", "gray", "magma"])
+        fit_combo_popup(self.combo_cmap)
         self.combo_cmap.currentTextChanged.connect(self._on_cmap_changed)
-        bar.addWidget(self.combo_cmap)
-        bar.addStretch(1)
-        main.addLayout(bar)
+        bar.addWidget(make_flow_group(QLabel("Colormap:"), self.combo_cmap, spacing=6))
+        main.addWidget(bar)
 
         # Only problems and caveats are shown here (hidden otherwise); the settings
         # above already describe what the map shows.
@@ -354,13 +715,17 @@ class OffSpecularView(QWidget):
         main.addWidget(self.lbl_notice)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setChildrenCollapsible(True)
+        splitter.setMinimumSize(0, 0)
+        splitter.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
 
         left = QWidget()
+        left.setMinimumSize(0, 0)
+        left.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.setSpacing(6)
-        tools = QHBoxLayout()
-        tools.setSpacing(6)
+        tools = FlowContainer(margin=0, h_spacing=6, v_spacing=4)
         # Icon-only map tools (names in tooltips) to leave room for the readout.
         self.btn_pan = _tool_button("Pan: drag to move the map")
         self.btn_box_zoom = _tool_button("Box zoom: drag a rectangle to zoom")
@@ -373,8 +738,8 @@ class OffSpecularView(QWidget):
         self.mouse_group.addButton(self.btn_box_zoom)
         self.btn_pan.clicked.connect(lambda: self.plot.getViewBox().setMouseMode(pg.ViewBox.PanMode))
         self.btn_box_zoom.clicked.connect(lambda: self.plot.getViewBox().setMouseMode(pg.ViewBox.RectMode))
-        self.btn_crosshair = _tool_button("Crosshair: click the map to drop it, drag its centre to move "
-                                          "the cuts, click elsewhere to jump; toggle off to remove")
+        self.btn_crosshair = _tool_button("Cut lines / crosshair: drop draggable horizontal & vertical cut "
+                                          "lines on the map; click to jump or toggle off to remove")
         self.btn_crosshair.setCheckable(True)
         self.btn_crosshair.toggled.connect(self._on_crosshair_toggled)
         tools.addWidget(self.btn_crosshair)
@@ -388,34 +753,46 @@ class OffSpecularView(QWidget):
         self.btn_export_png.clicked.connect(self.export_image)
         for btn in (self.btn_zoom_in, self.btn_zoom_out, self.btn_fit, self.btn_export_png):
             tools.addWidget(btn)
-        tools.addSpacing(8)
         self.lbl_coords = QLabel("")
         self.lbl_coords.setStyleSheet("color: #64748b; font-size: 11px;")
         self.lbl_coords.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         _fixed_width_text(self.lbl_coords)
-        tools.addWidget(self.lbl_coords, 1)
+        tools.addWidget(self.lbl_coords)
         self.progress = QProgressBar()
-        self.progress.setFixedWidth(160)
+        self.progress.setMinimumWidth(0)
+        self.progress.setMaximumWidth(160)
         self.progress.setTextVisible(False)
         self.progress.setToolTip("Integrating detector frames")
         self.progress.setVisible(False)
         tools.addWidget(self.progress)
-        left_layout.addLayout(tools)
+        left_layout.addWidget(tools)
 
         self.plot = pg.PlotWidget()
+        self.plot.setMinimumSize(0, 0)
+        self.plot.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
         self.plot.getViewBox().setMouseMode(pg.ViewBox.PanMode)
         self.plot.getViewBox().setCursor(QCursor(Qt.CursorShape.CrossCursor))
         self.plot.setLabel("bottom", "Detector X pixel")
-        self.plot.setLabel("left", "Point")
+        self.plot.setLabel("left", "θ (°)")
         self.img_item = pg.ImageItem()
         self.img_item.setColorMap(get_safe_colormap("turbo"))
         self.plot.addItem(self.img_item)
         self.colorbar = pg.ColorBarItem(values=(0, 1), colorMap=get_safe_colormap("turbo"), interactive=True, width=14)
         self.colorbar.setImageItem(self.img_item, insert_in=self.plot.getPlotItem())
-        # Crosshair: guide lines follow one draggable centre marker; hidden until dropped.
-        guide = pg.mkPen("#ffffff", width=1, style=Qt.PenStyle.DashLine)
-        self.line_row = pg.InfiniteLine(angle=0, movable=False, pen=guide)
-        self.line_x = pg.InfiniteLine(angle=90, movable=False, pen=guide)
+        # Draggable cut lines linked to the 1D cut plots, plus a shared crosshair intersection marker.
+        hover_pen = pg.mkPen("#facc15", width=2.5)
+        self.line_row = pg.InfiniteLine(
+            angle=0,
+            movable=True,
+            pen=pg.mkPen("#38bdf8", width=1.5, style=Qt.PenStyle.DashLine),
+            hoverPen=hover_pen,
+        )
+        self.line_x = pg.InfiniteLine(
+            angle=90,
+            movable=True,
+            pen=pg.mkPen("#f43f5e", width=1.5, style=Qt.PenStyle.DashLine),
+            hoverPen=hover_pen,
+        )
         self.crosshair = pg.TargetItem(pos=(0, 0), size=16, symbol="crosshair", movable=True,
                                        pen=pg.mkPen("#ffffff", width=2), hoverPen=pg.mkPen("#facc15", width=2),
                                        brush=pg.mkBrush(0, 0, 0, 0))
@@ -423,6 +800,8 @@ class OffSpecularView(QWidget):
             item.setZValue(z)
             item.setVisible(False)
             self.plot.addItem(item)
+        self.line_row.sigPositionChanged.connect(self._on_line_row_moved)
+        self.line_x.sigPositionChanged.connect(self._on_line_x_moved)
         self.crosshair.sigPositionChanged.connect(self._on_crosshair_moved)
         self.plot.scene().sigMouseMoved.connect(self._on_mouse_moved)
         self.plot.scene().sigMouseClicked.connect(self._on_map_clicked)
@@ -433,23 +812,46 @@ class OffSpecularView(QWidget):
         splitter.addWidget(left)
 
         right = QWidget()
+        right.setMinimumSize(0, 0)
         right_layout = QVBoxLayout(right)
         right_layout.setContentsMargins(0, 0, 0, 0)
         right_layout.setSpacing(8)
         right_layout.addWidget(self._build_calibration_panel())
         group = QGroupBox("Cuts through the map")
+        group.setMinimumSize(0, 0)
         group_layout = QVBoxLayout(group)
+        cut_bar = FlowLayout(margin=0, h_spacing=6, v_spacing=4)
+        self.btn_drop_cuts = QPushButton("Drop Cut Lines")
+        self.btn_drop_cuts.setCheckable(True)
+        self.btn_drop_cuts.setToolTip(
+            "Drop or remove linked draggable horizontal and vertical cut lines on the 2D map"
+        )
+        self.btn_drop_cuts.toggled.connect(self._on_drop_cuts_toggled)
+        self.btn_cut_h = QPushButton("Horizontal")
+        self.btn_cut_h.setCheckable(True)
+        self.btn_cut_h.setToolTip("Show or hide the draggable horizontal cut line on the 2D map")
+        self.btn_cut_h.toggled.connect(self._on_single_cut_toggled)
+        self.btn_cut_v = QPushButton("Vertical")
+        self.btn_cut_v.setCheckable(True)
+        self.btn_cut_v.setToolTip("Show or hide the draggable vertical cut line on the 2D map")
+        self.btn_cut_v.toggled.connect(self._on_single_cut_toggled)
+        for btn in (self.btn_drop_cuts, self.btn_cut_h, self.btn_cut_v):
+            btn.setStyleSheet("QPushButton { padding: 4px 8px; }")
+            cut_bar.addWidget(btn)
+        group_layout.addLayout(cut_bar)
         self.lbl_row_cut = QLabel("Horizontal cut (selected point):")
         _fixed_width_text(self.lbl_row_cut)
         group_layout.addWidget(self.lbl_row_cut)
-        self.plot_row = pg.PlotWidget()
+        self.plot_row = _CompactPlotWidget()
+        self.plot_row.setMinimumHeight(110)
         self.plot_row.setLabel("bottom", "Detector X pixel")
-        group_layout.addWidget(self.plot_row)
+        group_layout.addWidget(self.plot_row, 1)
         self.lbl_col_cut = QLabel("Vertical cut (selected X pixel):")
         _fixed_width_text(self.lbl_col_cut)
         group_layout.addWidget(self.lbl_col_cut)
-        self.plot_col = pg.PlotWidget()
-        group_layout.addWidget(self.plot_col)
+        self.plot_col = _CompactPlotWidget()
+        self.plot_col.setMinimumHeight(110)
+        group_layout.addWidget(self.plot_col, 1)
         self.lbl_cut_hint = QLabel(CUT_HINT)
         self.lbl_cut_hint.setStyleSheet("color: #64748b; font-size: 11px;")
         self.lbl_cut_hint.setWordWrap(True)
@@ -464,50 +866,149 @@ class OffSpecularView(QWidget):
         self._row_curve = self.plot_row.plot([], [], connect="finite")
         self._col_curve = self.plot_col.plot([], [], connect="finite")
         right_layout.addWidget(group, 1)
-        splitter.addWidget(right)
+
+        right_scroll = QScrollArea()
+        right_scroll.setWidgetResizable(True)
+        right_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        right_scroll.setMinimumSize(0, 0)
+        right_scroll.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
+        right_scroll.setWidget(right)
+        splitter.addWidget(right_scroll)
+        splitter.setStretchFactor(0, 2)
+        splitter.setStretchFactor(1, 1)
         splitter.setSizes([760, 340])
         main.addWidget(splitter, 1)
 
     def _build_calibration_panel(self) -> QGroupBox:
         group = self.cal_group = QGroupBox("Angle calibration (α_i, α_f) — this scan")
-        grid = QGridLayout(group)
-        grid.setHorizontalSpacing(6)
+        group.setMinimumSize(0, 0)
+        outer = QVBoxLayout(group)
+        outer.setSpacing(6)
+
+        # Mode toggle at the top of the calibration card: Direct-beam fit vs pySAred geometry.
+        mode_row = FlowLayout(margin=0, h_spacing=6, v_spacing=4)
+        self.btn_mode_direct_beam = QPushButton("Direct-beam fit")
+        self.btn_mode_direct_beam.setCheckable(True)
+        self.btn_mode_direct_beam.setChecked(True)
+        self.btn_mode_direct_beam.setToolTip(
+            "Linear pixel-to-angle calibration fitted from the transmitted direct-beam streak (°/px)"
+        )
+        self.btn_mode_pysared = QPushButton("pySAred geometry")
+        self.btn_mode_pysared.setCheckable(True)
+        self.btn_mode_pysared.setToolTip(
+            "Flat-detector arctan geometry using manual sample–detector distance L and detector width (pySAred convention)"
+        )
+        self.cal_mode_group = QButtonGroup(self)
+        self.cal_mode_group.setExclusive(True)
+        self.cal_mode_group.addButton(self.btn_mode_direct_beam, 0)
+        self.cal_mode_group.addButton(self.btn_mode_pysared, 1)
+        for btn in (self.btn_mode_direct_beam, self.btn_mode_pysared):
+            btn.setStyleSheet("QPushButton { padding: 4px 8px; }")
+            btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            mode_row.addWidget(btn)
+        self.btn_mode_direct_beam.clicked.connect(lambda: self._on_cal_mode_changed("direct_beam"))
+        self.btn_mode_pysared.clicked.connect(lambda: self._on_cal_mode_changed("pysared"))
+        outer.addLayout(mode_row)
+
+        # Mode-specific controls in a QStackedWidget (2 rows per page so toggling never jumps layout).
+        self.cal_mode_stack = QStackedWidget()
+        self.cal_mode_stack.setMinimumSize(0, 0)
+
+        page_db = QWidget()
+        db_grid = QGridLayout(page_db)
+        db_grid.setContentsMargins(0, 0, 0, 0)
+        db_grid.setHorizontalSpacing(6)
         self.spin_dpp = QDoubleSpinBox()
+        self.spin_dpp.setMinimumWidth(65)
+        self.spin_dpp.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         self.spin_dpp.setDecimals(6)
         self.spin_dpp.setRange(0.0, 1.0)
         self.spin_dpp.setSingleStep(0.00001)
         self.spin_dpp.setSuffix(" °/px")
         self.spin_dpp.setSpecialValueText("not set")
+        self.spin_dpp.setKeyboardTracking(False)
         self.spin_dpp.setToolTip("Exit-angle step per detector X pixel (from the direct-beam fit; editable)")
-        self.spin_x0 = QDoubleSpinBox()
-        self.spin_x0.setDecimals(1)
-        self.spin_x0.setRange(0.0, 4096.0)
-        self.spin_x0.setSuffix(" px")
-        self.spin_x0.setToolTip("Pixel of exit angle 2θ − θ (from the specular peak; editable)")
-        for spin in (self.spin_dpp, self.spin_x0):
-            spin.setKeyboardTracking(False)
-        self.chk_af_increases = QCheckBox("α_f increases with X")
-        self.chk_af_increases.setToolTip("Direction of the exit angle along displayed X (set by the fit)")
         self.spin_dpp.valueChanged.connect(lambda v: self._on_calibration_edited(deg_per_pixel=v))
-        self.spin_x0.valueChanged.connect(lambda v: self._on_calibration_edited(x0=v))
-        self.chk_af_increases.toggled.connect(lambda on: self._on_calibration_edited(sign=1 if on else -1))
         self.btn_fit_db = QPushButton("Fit Direct Beam")
         self.btn_fit_db.setToolTip("Refit °/pixel from the direct-beam streak and x₀ from the specular peak "
                                    "(discards manual values for this scan)")
         self.btn_fit_db.clicked.connect(self._refit_calibration)
-        self.chk_show_db = QCheckBox("Show fit / reference lines")
-        self.chk_show_db.setToolTip("Pixel axes: fitted direct-beam line. α axes: α_f = α_i (specular), "
-                                    "α_f = −α_i (direct beam) and the ROI; untick for a clean α map")
-        self.chk_show_db.setChecked(True)
-        self.chk_show_db.toggled.connect(self._draw_roi_overlay)
-        grid.addWidget(QLabel("Scale:"), 0, 0)
-        grid.addWidget(self.spin_dpp, 0, 1)
-        grid.addWidget(QLabel("x₀:"), 0, 2)
-        grid.addWidget(self.spin_x0, 0, 3)
-        grid.addWidget(self.chk_af_increases, 1, 0, 1, 2)
-        grid.addWidget(self.btn_fit_db, 1, 2, 1, 2)
-        grid.addWidget(self.chk_show_db, 2, 0, 1, 2)
+        self.lbl_distance = QLabel("—")
+        _fixed_width_text(self.lbl_distance)
+        self.lbl_distance.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.lbl_distance.setToolTip(
+            "Check value only: sample-to-detector distance L = p / tan(Δ) implied by the "
+            "calibrated °/pixel scale Δ assuming nominal pixel pitch p = 300 mm / nx "
+            "(full readout width). Not used in any angle (α_f) or Q conversion.")
+        db_grid.addWidget(QLabel("Scale:"), 0, 0)
+        db_grid.addWidget(self.spin_dpp, 0, 1)
+        db_grid.addWidget(self.btn_fit_db, 0, 2, 1, 2)
+        db_grid.addWidget(QLabel("Distance:"), 1, 0)
+        db_grid.addWidget(self.lbl_distance, 1, 1, 1, 3)
+        db_grid.setColumnStretch(1, 1)
+        db_grid.setColumnStretch(3, 1)
+        self.cal_mode_stack.addWidget(page_db)
+
+        page_ps = QWidget()
+        ps_grid = QGridLayout(page_ps)
+        ps_grid.setContentsMargins(0, 0, 0, 0)
+        ps_grid.setHorizontalSpacing(6)
+        self.spin_distance_mm = QDoubleSpinBox()
+        self.spin_distance_mm.setMinimumWidth(65)
+        self.spin_distance_mm.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        self.spin_distance_mm.setDecimals(1)
+        self.spin_distance_mm.setRange(10.0, 50000.0)
+        self.spin_distance_mm.setSingleStep(10.0)
+        self.spin_distance_mm.setValue(PYSARED_DEFAULT_DISTANCE_MM)
+        self.spin_distance_mm.setSuffix(" mm")
+        self.spin_distance_mm.setKeyboardTracking(False)
+        self.spin_distance_mm.setToolTip("Sample-to-detector distance L used in pySAred flat-detector arctan geometry")
+        self.spin_distance_mm.valueChanged.connect(lambda v: self._on_calibration_edited(distance_mm=v))
+        self.spin_det_width_mm = QDoubleSpinBox()
+        self.spin_det_width_mm.setMinimumWidth(65)
+        self.spin_det_width_mm.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        self.spin_det_width_mm.setDecimals(1)
+        self.spin_det_width_mm.setRange(1.0, 5000.0)
+        self.spin_det_width_mm.setSingleStep(1.0)
+        self.spin_det_width_mm.setValue(DETECTOR_WIDTH_MM)
+        self.spin_det_width_mm.setSuffix(" mm")
+        self.spin_det_width_mm.setKeyboardTracking(False)
+        self.spin_det_width_mm.setToolTip("Active detector readout width along X (pixel pitch p = width / nx)")
+        self.spin_det_width_mm.valueChanged.connect(lambda v: self._on_calibration_edited(detector_width_mm=v))
+        self.lbl_effective_scale = QLabel("—")
+        _fixed_width_text(self.lbl_effective_scale)
+        self.lbl_effective_scale.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.lbl_effective_scale.setToolTip(
+            "Effective small-angle scale degrees(arctan((width / nx) / L)) at the detector normal (x₀); "
+            "actual exit angles use the full flat-detector arctan mapping."
+        )
+        ps_grid.addWidget(QLabel("Distance L:"), 0, 0)
+        ps_grid.addWidget(self.spin_distance_mm, 0, 1)
+        ps_grid.addWidget(QLabel("Width:"), 0, 2)
+        ps_grid.addWidget(self.spin_det_width_mm, 0, 3)
+        ps_grid.addWidget(QLabel("Eff. scale:"), 1, 0)
+        ps_grid.addWidget(self.lbl_effective_scale, 1, 1, 1, 3)
+        ps_grid.setColumnStretch(1, 1)
+        ps_grid.setColumnStretch(3, 1)
+        self.cal_mode_stack.addWidget(page_ps)
+
+        outer.addWidget(self.cal_mode_stack)
+
+        # Shared parameters across both calibration modes: x₀, λ, direction sign, and reference lines.
+        shared = QGridLayout()
+        shared.setHorizontalSpacing(6)
+        self.spin_x0 = QDoubleSpinBox()
+        self.spin_x0.setMinimumWidth(65)
+        self.spin_x0.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        self.spin_x0.setDecimals(1)
+        self.spin_x0.setRange(0.0, 4096.0)
+        self.spin_x0.setSuffix(" px")
+        self.spin_x0.setKeyboardTracking(False)
+        self.spin_x0.setToolTip("Pixel of exit angle 2θ − θ (from the specular peak; editable)")
+        self.spin_x0.valueChanged.connect(lambda v: self._on_calibration_edited(x0=v))
         self.spin_wavelength = QDoubleSpinBox()
+        self.spin_wavelength.setMinimumWidth(65)
+        self.spin_wavelength.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         self.spin_wavelength.setRange(0.1, 50.0)
         self.spin_wavelength.setDecimals(3)
         self.spin_wavelength.setSingleStep(0.01)
@@ -516,12 +1017,69 @@ class OffSpecularView(QWidget):
         self.spin_wavelength.setKeyboardTracking(False)
         self.spin_wavelength.setToolTip("Neutron wavelength used for Qx and Qz")
         self.spin_wavelength.valueChanged.connect(self._on_wavelength_changed)
-        grid.addWidget(QLabel("λ:"), 2, 2)
-        grid.addWidget(self.spin_wavelength, 2, 3)
-        grid.setColumnStretch(1, 1)
-        grid.setColumnStretch(3, 1)
+        shared.addWidget(QLabel("x₀:"), 0, 0)
+        shared.addWidget(self.spin_x0, 0, 1)
+        shared.addWidget(QLabel("λ:"), 0, 2)
+        shared.addWidget(self.spin_wavelength, 0, 3)
+        shared.setColumnStretch(1, 1)
+        shared.setColumnStretch(3, 1)
+        outer.addLayout(shared)
+
+        checks_flow = FlowLayout(margin=0, h_spacing=8, v_spacing=4)
+        self.chk_af_increases = QCheckBox("α_f increases with X")
+        self.chk_af_increases.setToolTip("Direction of the exit angle along displayed X")
+        self.chk_af_increases.toggled.connect(lambda on: self._on_calibration_edited(sign=1 if on else -1))
+        self.chk_show_db = QCheckBox("Show fit / reference lines")
+        self.chk_show_db.setToolTip("Pixel axes: fitted direct-beam line. α axes: α_f = α_i (specular), "
+                                    "α_f = −α_i (direct beam) and the ROI; untick for a clean α map")
+        self.chk_show_db.setChecked(True)
+        self.chk_show_db.toggled.connect(self._draw_roi_overlay)
+        checks_flow.addWidget(self.chk_af_increases)
+        checks_flow.addWidget(self.chk_show_db)
+        outer.addLayout(checks_flow)
+
         self._set_cal_status("Calibrated automatically from the direct beam when the map is computed.")
         return group
+
+    def _detector_nx(self) -> int:
+        if self._map is not None:
+            return int(self._map.counts.shape[1])
+        if self.scan_data is not None and self.scan_data.detector_shape:
+            return int(self.scan_data.detector_shape[1])
+        return 1024
+
+    def _pixel_pitch(self, width_mm: float = DETECTOR_WIDTH_MM) -> float | None:
+        """Displayed-X pixel spacing (mm) from the detector width, or None without detector data."""
+        if self._map is not None:
+            nx = self._map.counts.shape[1]
+        elif self.scan_data is not None and self.scan_data.detector_shape:
+            nx = self.scan_data.detector_shape[1]
+        else:
+            return None
+        return pixel_pitch_mm(nx, width_mm)
+
+    def _show_calibration(self, cal: AngleCalibration | None) -> None:
+        """Status tooltip and distance / effective-scale readouts for this scan's calibration."""
+        if cal is None:
+            self.lbl_distance.setText("—")
+            self.lbl_effective_scale.setText("—")
+            return
+        width = cal.detector_width_mm if cal.mode == "pysared" else DETECTOR_WIDTH_MM
+        pitch = self._pixel_pitch(width)
+        if pitch is None:
+            self.lbl_distance.setText("—")
+            self.lbl_effective_scale.setText("—")
+            return
+        nx = self._detector_nx()
+        if cal.mode == "pysared":
+            self.lbl_effective_scale.setText(
+                f"{cal.deg_per_pixel:.5f} °/px  ({cal.detector_width_mm:g} mm / {nx} px)"
+            )
+            self.lbl_distance.setText(f"{cal.sample_detector_distance_mm:.0f} mm  (pySAred geometry)")
+        else:
+            self.lbl_distance.setText(f"{cal.distance_mm(pitch):.0f} mm  (from {DETECTOR_WIDTH_MM:g} mm / {nx} px)")
+            self.lbl_effective_scale.setText(f"{cal.deg_per_pixel:.5f} °/px")
+        self._set_cal_status(cal.describe(pitch))
 
     def _set_cal_status(self, text: str) -> None:
         """Calibration details stay available on hover without cluttering the panel."""
@@ -532,7 +1090,9 @@ class OffSpecularView(QWidget):
         for widget in (self.combo_spin, self.combo_y_source, self.combo_norm, self.combo_y_axis,
                        self.btn_export_png):
             widget.setEnabled(enabled)
-        for widget in (self.spin_y0, self.spin_y1, self.btn_crosshair, self.spin_dpp, self.spin_x0,
+        for widget in (self.spin_y0, self.spin_y1, self.btn_crosshair, self.btn_drop_cuts,
+                       self.btn_cut_h, self.btn_cut_v, self.btn_mode_direct_beam, self.btn_mode_pysared,
+                       self.spin_dpp, self.spin_distance_mm, self.spin_det_width_mm, self.spin_x0,
                        self.chk_af_increases, self.btn_fit_db, self.chk_show_db, self.spin_wavelength):
             widget.setEnabled(enabled)
 
@@ -544,6 +1104,10 @@ class OffSpecularView(QWidget):
         self._map = None
         self._norm = None
         self._pending_key = None
+        self._crosshair_placed = False
+        self._set_cut_buttons(False, False)
+        for item in (self.crosshair, self.line_row, self.line_x):
+            item.setVisible(False)
         self.img_item.clear()
         self._clear_alpha_items()
         self._clear_roi_overlay()
@@ -591,6 +1155,7 @@ class OffSpecularView(QWidget):
         # (laggy pan/zoom/crosshair) and hide the data. The cut plots keep theirs.
         self.plot.showGrid(x=False, y=False)
         self._apply_no_data_background()
+        self._last_tick_key = None
         self._update_y_ticks()
         self._update_cuts()
 
@@ -783,17 +1348,21 @@ class OffSpecularView(QWidget):
             kw = dict(exposure=exposure,
                       monitor=None if monitor is None else np.asarray(monitor.data, dtype=float),
                       monitor_variance=None if monitor is None else monitor.variance)
-            if spin == "asym":
+            if spin in ("asym", "sum"):
                 th, tth = self._variable("th"), self._variable("tth")
+                label_name = "Spin asymmetry" if spin == "asym" else "Sum of channels"
                 if flipper is None or th is None or tth is None:
-                    self._show_unavailable("Spin asymmetry needs Flipper1, θ and 2θ channels.")
+                    self._show_unavailable(f"{label_name} needs Flipper1, θ and 2θ channels.")
                     return
                 up, down = pair_spin_frames(th, tth, flipper, self._map.written)
                 if up.size == 0:
-                    self._show_unavailable("Spin asymmetry: no u/d frame pairs at matching θ and 2θ.")
+                    self._show_unavailable(f"{label_name}: no u/d frame pairs at matching θ and 2θ.")
                     return
-                norm = spin_asymmetry(self._map.counts, up, down, mode,
-                                      min_counts=self.spin_min_counts.value(), **kw)
+                if spin == "asym":
+                    norm = spin_asymmetry(self._map.counts, up, down, mode,
+                                          min_counts=self.spin_min_counts.value(), **kw)
+                else:
+                    norm = sum_spin_frames(self._map.counts, up, down, mode, **kw)
             else:
                 frames = select_frames(self._map.n_frames, flipper, spin)
                 norm = normalize_map(self._map.counts, frames, mode, **kw)
@@ -827,15 +1396,25 @@ class OffSpecularView(QWidget):
             alpha_note = self._draw_alpha(display)
             if alpha_note is None:
                 return
+        elif self._theta_mode():
+            alpha_note = self._draw_theta(display)
+            if alpha_note is None:
+                return
         else:
             self._clear_alpha_items()
             self.img_item.setImage(display.T, autoLevels=False)
             self.img_item.setRect(0, 0, self._map.nx, len(frames))
-            if self._colorbar_on_strips:  # re-link only when coming back from the α view
+            if self._colorbar_on_strips:  # re-link only when coming back from mesh/strip views
                 self.colorbar.setImageItem(self.img_item)
                 self._colorbar_on_strips = False
+                self._colorbar_items_rebuilt = True
+        cmap = self._current_colormap()
+        cmap_key = (asym, "__rdbu_r__" if asym else self.combo_cmap.currentText())
         self.colorbar.setLevels((lo, hi))
-        self.colorbar.setColorMap(self._current_colormap())
+        if self._colorbar_items_rebuilt or cmap_key != self._applied_cmap_key:
+            self.colorbar.setColorMap(cmap)
+            self._applied_cmap_key = cmap_key
+            self._colorbar_items_rebuilt = False
         label = f"log₁₀({norm.units})" if self._log_active() else norm.units
         axis = getattr(self.colorbar, "axis", None)
         if axis is not None:
@@ -855,6 +1434,8 @@ class OffSpecularView(QWidget):
         if self._crosshair_placed:
             # Keep the crosshair on the same map cell (also across axis modes).
             self._place_crosshair(*self._cell_center(self._sel_row, self._sel_x))
+        elif self.btn_cut_h.isChecked() or self.btn_cut_v.isChecked():
+            self._place_crosshair(*self._default_cut_pos())
 
     def _apply_no_data_background(self) -> None:
         # Neutral slate behind the map: blank (log-omitted / excluded) pixels stay
@@ -866,6 +1447,8 @@ class OffSpecularView(QWidget):
         self.img_item.clear()
         self._clear_alpha_items()
         self._clear_roi_overlay()
+        for item in (self.crosshair, self.line_row, self.line_x):
+            item.setVisible(False)
         self._clear_cuts()
         self.lbl_coords.setText("")
         self._set_notice(message)
@@ -879,11 +1462,13 @@ class OffSpecularView(QWidget):
 
     def _current_colormap(self) -> pg.ColorMap:
         if self._asym_mode():
-            try:  # diverging map centred on zero asymmetry
-                return pg.colormap.getFromMatplotlib("RdBu_r")
-            except Exception:
-                return get_safe_colormap("cividis")
-        return get_safe_colormap(self.combo_cmap.currentText())
+            return _diverging_rdbu_r()
+        name = self.combo_cmap.currentText()
+        cmap = _CMAP_CACHE.get(name)
+        if cmap is None:
+            cmap = get_safe_colormap(name)
+            _CMAP_CACHE[name] = cmap
+        return cmap
 
     def _on_spin_changed(self) -> None:
         asym = self._asym_mode()
@@ -894,21 +1479,33 @@ class OffSpecularView(QWidget):
 
     def _on_cmap_changed(self, name: str) -> None:
         self.colorbar.setColorMap(self._current_colormap())
+        asym = self._asym_mode()
+        self._applied_cmap_key = (asym, "__rdbu_r__" if asym else self.combo_cmap.currentText())
 
     def _row_label(self, row: int) -> str:
         frame = int(self._norm.frame_indices[row])
-        th = self._variable("th")
-        if self.combo_y_axis.currentData() == "th" and th is not None and frame < len(th):
-            return f"{th[frame]:.3f}"
         return str(frame)
 
     def _update_y_ticks(self) -> None:
         axis = self.plot.getPlotItem().getAxis("left")
         col_axis = self.plot_col.getPlotItem().getAxis("bottom")
         if self._norm is None or self._norm.frame_indices.size == 0:
-            axis.setTicks(None)
-            col_axis.setTicks(None)
+            if self._last_tick_key is not None:
+                axis.setTicks(None)
+                col_axis.setTicks(None)
+                self._last_tick_key = None
             return
+        mode = self.combo_y_axis.currentData()
+        frames = self._norm.frame_indices
+        if mode == "point":
+            step = max(1, int(np.ceil(frames.size / 12)))
+            tick_sig = tuple(int(frames[r]) for r in range(0, frames.size, step))
+            tick_key = (mode, frames.size, tick_sig, self.is_dark_mode)
+        else:
+            tick_key = (mode, self.is_dark_mode)
+        if tick_key == self._last_tick_key:
+            return
+        self._last_tick_key = tick_key
         if self._alpha_mode():
             axis.setTicks(None)
             col_axis.setTicks(None)
@@ -923,17 +1520,23 @@ class OffSpecularView(QWidget):
                 self.plot_row.setLabel("bottom", "α_f (°)")
                 self.plot_col.setLabel("bottom", "α_i (°)")
             return
+        if self._theta_mode():
+            axis.setTicks(None)
+            col_axis.setTicks(None)
+            self.plot.setLabel("bottom", "Detector X pixel")
+            self.plot.setLabel("left", "θ (°)")
+            self.plot_row.setLabel("bottom", "Detector X pixel")
+            self.plot_col.setLabel("bottom", "θ (°)")
+            return
         self.plot.setLabel("bottom", "Detector X pixel")
         self.plot_row.setLabel("bottom", "Detector X pixel")
-        n = self._norm.frame_indices.size
-        use_th = self.combo_y_axis.currentData() == "th" and self._variable("th") is not None
-        self.plot.setLabel("left", "θ (°)" if use_th else "Point (frame index)")
-        step = max(1, int(np.ceil(n / 12)))
+        n = frames.size
+        self.plot.setLabel("left", "Point (frame index)")
         major = [(row + 0.5, self._row_label(row)) for row in range(0, n, step)]
         minor = [(row + 0.5, "") for row in range(n) if row % step]
         axis.setTicks([major, minor])
         col_axis.setTicks([major, minor])
-        self.plot_col.setLabel("bottom", "θ (°)" if use_th else "Point (frame index)")
+        self.plot_col.setLabel("bottom", "Point (frame index)")
 
     def _clear_roi_overlay(self) -> None:
         for item in self._roi_items:
@@ -953,6 +1556,9 @@ class OffSpecularView(QWidget):
             return
         if self._alpha_mode():
             self._draw_alpha_overlay()
+            return
+        if self._theta_mode():
+            self._draw_theta_overlay()
             return
         cal = getattr(self.scan_data, "angle_calibration", None)
         tth = self._variable("tth")
@@ -983,19 +1589,137 @@ class OffSpecularView(QWidget):
             self.plot.addItem(item)
             self._roi_items.append(item)
 
+    def _draw_theta_overlay(self) -> None:
+        g = self._th_geom
+        if g is None:
+            return
+        rows, theta, strips = g["rows"], g["theta"], g["strips"]
+        sel_frames = self._norm.frame_indices[rows]
+        cal = getattr(self.scan_data, "angle_calibration", None)
+        tth = self._variable("tth")
+        if self.chk_show_db.isChecked() and cal is not None and cal.fit is not None and tth is not None:
+            ok = sel_frames < tth.size
+            xs = cal.fit.position_at(tth[sel_frames[ok]])
+            ys = theta[ok]
+            order = np.argsort(ys, kind="stable")
+            xs, ys = xs[order], ys[order]
+            inside = (xs >= 0) & (xs <= self._map.nx)
+            self._add_overlay(xs[inside], ys[inside], "#e879f9", connect="finite")
+        if not self.chk_show_roi.isChecked():
+            return
+        bounds = self._scan_roi_bounds()
+        if len(bounds) == 1:
+            x_lo, x_hi = min(bounds[0][0], bounds[0][1]), max(bounds[0][0], bounds[0][1])
+            y0, y1 = float(strips[:, 0].min()), float(strips[:, 1].max())
+            for xb in (x_lo, x_hi):
+                self._add_overlay([xb, xb], [y0, y1], "#facc15")
+        else:
+            per_row = np.array([bounds[min(int(f), len(bounds) - 1)] for f in sel_frames], dtype=float)
+            ys = strips.reshape(-1)
+            for col in (0, 1):
+                xb = np.minimum(per_row[:, 0], per_row[:, 1]) if col == 0 else np.maximum(per_row[:, 0], per_row[:, 1])
+                self._add_overlay(np.repeat(xb, 2), ys, "#facc15")
+
     # ------------------------------------------------------------- crosshair
     def _map_ready(self) -> bool:
         ready = self._norm is not None and self._map is not None and self._norm.frame_indices.size > 0
-        return ready and (not self._alpha_mode() or self._alpha_geom is not None)
+        if not ready:
+            return False
+        if self._alpha_mode():
+            return self._alpha_geom is not None
+        if self._theta_mode():
+            return self._th_geom is not None
+        return True
 
-    def _on_crosshair_toggled(self, checked: bool) -> None:
-        if not checked:
+    def _cut_line_flags(self) -> tuple[bool, bool]:
+        """(show_horizontal_line, show_vertical_line) on the 2D map."""
+        return self.btn_cut_h.isChecked(), self.btn_cut_v.isChecked()
+
+    def _cut_curve_flags(self) -> tuple[bool, bool]:
+        """(show_row_plot_curve, show_col_plot_curve) matching the active cut lines."""
+        show_h, show_v = self._cut_line_flags()
+        if self._alpha_mode() and not self._q_mode():
+            # In α_i vs α_f: vertical line (x = α_i) drives plot_row (vs α_f);
+            # horizontal line (y = α_f) drives plot_col (vs α_i).
+            return show_v, show_h
+        return show_h, show_v
+
+    def _set_cut_buttons(self, h_on: bool, v_on: bool) -> None:
+        for btn, state in (
+            (self.btn_cut_h, h_on),
+            (self.btn_cut_v, v_on),
+            (self.btn_drop_cuts, h_on and v_on),
+            (self.btn_crosshair, h_on or v_on),
+        ):
+            btn.blockSignals(True)
+            btn.setChecked(state)
+            btn.blockSignals(False)
+
+    def _sync_cut_visibility(self) -> None:
+        show_h, show_v = self._cut_line_flags()
+        placed = self._crosshair_placed and self._map_ready()
+        self.line_row.setVisible(placed and show_h)
+        self.line_x.setVisible(placed and show_v)
+        self.crosshair.setVisible(placed and show_h and show_v)
+
+    def _update_cut_line_styles(self) -> None:
+        """Colour-match each cut line on the map to the 1D cut plot it drives."""
+        row_color = "#38bdf8"
+        col_color = "#f43f5e"
+        if self._alpha_mode() and not self._q_mode():
+            h_color, v_color = col_color, row_color
+        else:
+            h_color, v_color = row_color, col_color
+        self.line_row.setPen(pg.mkPen(h_color, width=1.5, style=Qt.PenStyle.DashLine))
+        self.line_x.setPen(pg.mkPen(v_color, width=1.5, style=Qt.PenStyle.DashLine))
+
+    def _default_cut_pos(self) -> tuple[float, float]:
+        """Useful default drop position: specular x0 (or ROI centre) at mid-scan row."""
+        if self._alpha_mode() and self._alpha_geom is not None:
+            rows = self._alpha_geom["rows"]
+            row = int(rows[rows.size // 2])
+        elif self._theta_mode() and self._th_geom is not None:
+            rows = self._th_geom["rows"]
+            row = int(rows[rows.size // 2])
+        else:
+            n = self._norm.frame_indices.size if self._norm is not None else 1
+            row = max(0, n // 2)
+        cal = getattr(self.scan_data, "angle_calibration", None) if self.scan_data is not None else None
+        nx = self._map.nx if self._map is not None else 1
+        if cal is not None and 0.0 <= cal.x0 < nx:
+            x = int(min(max(round(cal.x0), 0), nx - 1))
+        else:
+            bounds = self._scan_roi_bounds()
+            x_mid = 0.5 * (bounds[0][0] + bounds[0][1]) if bounds else nx / 2.0
+            x = int(min(max(round(x_mid), 0), nx - 1))
+        return self._cell_center(row, x)
+
+    def _apply_cut_selection(self, h_on: bool, v_on: bool) -> None:
+        self._set_cut_buttons(h_on, v_on)
+        if not (h_on or v_on):
             self._crosshair_placed = False
             for item in (self.crosshair, self.line_row, self.line_x):
                 item.setVisible(False)
             self._clear_cuts()
+            return
+        if not self._map_ready():
+            self.lbl_cut_hint.setText("Click the map to drop the cut lines once loaded.")
+            return
+        if not self._crosshair_placed:
+            self._place_crosshair(*self._default_cut_pos())
         else:
-            self.lbl_cut_hint.setText("Click the map to drop the crosshair.")
+            self._sync_cut_visibility()
+            self._update_cut_line_styles()
+            self._update_cuts()
+
+    def _on_crosshair_toggled(self, checked: bool) -> None:
+        self._apply_cut_selection(checked, checked)
+
+    def _on_drop_cuts_toggled(self, checked: bool) -> None:
+        self._apply_cut_selection(checked, checked)
+
+    def _on_single_cut_toggled(self, _checked: bool) -> None:
+        self._apply_cut_selection(self.btn_cut_h.isChecked(), self.btn_cut_v.isChecked())
 
     def _on_map_clicked(self, event) -> None:
         if not self.btn_crosshair.isChecked() or not self._map_ready():
@@ -1012,11 +1736,35 @@ class OffSpecularView(QWidget):
             event.accept()
 
     def _place_crosshair(self, x: float, y: float) -> None:
+        if not (self.btn_cut_h.isChecked() or self.btn_cut_v.isChecked()):
+            self._set_cut_buttons(True, True)
         self._crosshair_placed = True
-        for item in (self.crosshair, self.line_row, self.line_x):
-            item.setVisible(True)
+        self._sync_cut_visibility()
+        self._update_cut_line_styles()
+        self.crosshair.blockSignals(True)
         self.crosshair.setPos((x, y))
+        self.crosshair.blockSignals(False)
         self._on_crosshair_moved(force=True)
+
+    def _on_line_row_moved(self) -> None:
+        if not self._crosshair_placed or not self._map_ready():
+            return
+        x = float(self.crosshair.pos().x())
+        y = float(self.line_row.value())
+        self.crosshair.blockSignals(True)
+        self.crosshair.setPos((x, y))
+        self.crosshair.blockSignals(False)
+        self._on_crosshair_moved()
+
+    def _on_line_x_moved(self) -> None:
+        if not self._crosshair_placed or not self._map_ready():
+            return
+        x = float(self.line_x.value())
+        y = float(self.crosshair.pos().y())
+        self.crosshair.blockSignals(True)
+        self.crosshair.setPos((x, y))
+        self.crosshair.blockSignals(False)
+        self._on_crosshair_moved()
 
     def _on_crosshair_moved(self, *_, force: bool = False) -> None:
         if not self._crosshair_placed or not self._map_ready():
@@ -1029,13 +1777,27 @@ class OffSpecularView(QWidget):
             self.crosshair.blockSignals(True)
             self.crosshair.setPos((x, y))
             self.crosshair.blockSignals(False)
+        self.line_x.blockSignals(True)
         self.line_x.setValue(x)
+        self.line_x.blockSignals(False)
+        self.line_row.blockSignals(True)
         self.line_row.setValue(y)
+        self.line_row.blockSignals(False)
         if self._alpha_mode():
             self._cross_alpha = (x, y)
             row, col = self._alpha_cut_cell(x, y)
             self._sel_row, self._sel_x = row, col
             self._update_cuts()
+            return
+        if self._theta_mode():
+            g = self._th_geom
+            col = int(np.clip(np.floor(x), 0, self._map.nx - 1))
+            dist = np.abs(g["theta"] - y)
+            k = int(dist.size - 1 - np.argmin(dist[::-1]))
+            row = int(g["rows"][k])
+            if force or (row, col) != (self._sel_row, self._sel_x):
+                self._sel_row, self._sel_x = row, col
+                self._update_cuts()
             return
         row, col = int(y), int(x)
         if force or (row, col) != (self._sel_row, self._sel_x):
@@ -1067,6 +1829,9 @@ class OffSpecularView(QWidget):
             # runs along Qx, constant-Qx cut along Qz.
             spans = (((self.plot_row, x0, x1), (self.plot_col, y0, y1)) if self._q_mode()
                      else ((self.plot_row, y0, y1), (self.plot_col, x0, x1)))
+        elif self._theta_mode():
+            x0, x1, y0, y1 = self._map_extent()
+            spans = ((self.plot_row, x0, x1), (self.plot_col, y0, y1))
         else:
             spans = ((self.plot_row, 0, self._map.nx), (self.plot_col, 0, self._norm.frame_indices.size))
         for plot, start, stop in spans:
@@ -1078,6 +1843,10 @@ class OffSpecularView(QWidget):
 
     def _update_cuts(self) -> None:
         if not self._crosshair_placed or not self._map_ready():
+            self._clear_cuts()
+            return
+        row_active, col_active = self._cut_curve_flags()
+        if not (row_active or col_active):
             self._clear_cuts()
             return
         row = min(self._sel_row, self._norm.frame_indices.size - 1)
@@ -1093,15 +1862,30 @@ class OffSpecularView(QWidget):
         if self._alpha_mode():
             self._update_alpha_cuts(positive)
             return
-        self._row_curve.setData(np.arange(self._map.nx) + 0.5, positive(self._cut_values[row]))
-        col_vals = self._cut_values[:, x]
-        self._col_curve.setData(np.arange(col_vals.size) + 0.5, positive(col_vals))
-        for curve in (self._row_curve, self._col_curve):
-            curve.setVisible(True)
         frame = int(self._norm.frame_indices[row])
-        self.lbl_row_cut.setText(f"Horizontal cut — point {frame} ({self._describe_frame(frame)}):")
-        self.lbl_col_cut.setText(f"Vertical cut — X pixel {x}:")
-        self.lbl_cut_hint.setText("Drag the crosshair centre to move the cuts; click elsewhere to jump.")
+        if row_active:
+            self._row_curve.setData(np.arange(self._map.nx) + 0.5, positive(self._cut_values[row]))
+            self._row_curve.setVisible(True)
+            self.lbl_row_cut.setText(f"Horizontal cut — point {frame} ({self._describe_frame(frame)}):")
+        else:
+            self._row_curve.setData([], [])
+            self._row_curve.setVisible(False)
+            self.lbl_row_cut.setText("Horizontal cut (toggle Horizontal above):")
+        if col_active:
+            if self._theta_mode():
+                g = self._th_geom
+                order = np.argsort(g["theta"], kind="stable")
+                self._col_curve.setData(g["theta"][order], positive(self._cut_values[g["rows"][order], x]))
+            else:
+                col_vals = self._cut_values[:, x]
+                self._col_curve.setData(np.arange(col_vals.size) + 0.5, positive(col_vals))
+            self._col_curve.setVisible(True)
+            self.lbl_col_cut.setText(f"Vertical cut — X pixel {x}:")
+        else:
+            self._col_curve.setData([], [])
+            self._col_curve.setVisible(False)
+            self.lbl_col_cut.setText("Vertical cut (toggle Vertical above):")
+        self.lbl_cut_hint.setText("Drag the cut lines or crosshair on the map to move cuts; click to jump.")
 
     def _angle_decimals(self, name: str) -> int:
         """Decimals matching the scan's resolution in an angle channel (its finest step)."""
@@ -1120,9 +1904,14 @@ class OffSpecularView(QWidget):
             values = self._variable(name)
             if values is not None and frame < len(values):
                 parts.append(f"{label} = {values[frame]:.{self._angle_decimals(name)}f}°")
-        flipper = self._variable("Flipper1")
-        if flipper is not None and frame < len(flipper):
-            parts.append({0.0: "d", 1.0: "u"}.get(float(flipper[frame]), "?"))
+        if isinstance(self._norm, SummedSpinMap):
+            parts.append("u+d")
+        elif isinstance(self._norm, AsymmetryMap):
+            parts.append("u/d")
+        else:
+            flipper = self._variable("Flipper1")
+            if flipper is not None and frame < len(flipper):
+                parts.append({0.0: "d", 1.0: "u"}.get(float(flipper[frame]), "?"))
         return ", ".join(parts)
 
     def _format_value(self, row: int, x: int) -> str:
@@ -1166,7 +1955,7 @@ class OffSpecularView(QWidget):
             if self._q_mode():
                 lam = self.spin_wavelength.value()
                 qx, qz = q_from_angles(th[frame], af, lam)
-                dq = 2 * np.pi / lam * np.radians(cal.deg_per_pixel)  # Qz step per pixel
+                dq = qz_step_per_pixel(cal.deg_per_pixel, lam)
                 parts.append(f"Qx {qx * QX_SCALE:.3g}×10⁻³")
                 parts.append(f"Qz {qz:.{_decimals_for_step(dq)}f} Å⁻¹")
         parts.append(f"X {x}")
@@ -1208,12 +1997,11 @@ class OffSpecularView(QWidget):
         frames = norm.frame_indices
         rows = np.arange(frames.size)
         coords: dict[str, np.ndarray] = {}
-        th = self._variable("th")
-        if axes == "th" and th is not None:
-            theta = np.full(frames.size, np.nan)
-            ok = frames < th.size
-            theta[ok] = th[frames[ok]]
-            coords["Theta (deg)"] = theta
+        if axes == "th":
+            if self._th_geom is None:
+                raise ValueError(self.lbl_notice.text() or "The θ view is not available for these settings")
+            rows = self._th_geom["rows"]
+            coords["Theta (deg)"] = self._th_geom["theta"]
         if self._alpha_mode():
             geom = self._alpha_geom
             if geom is None:
@@ -1227,15 +2015,21 @@ class OffSpecularView(QWidget):
             else:
                 coords["AlphaI (deg)"], coords["AlphaF (deg)"] = geom["alpha_i"], alpha_f
         asym = isinstance(norm, AsymmetryMap)
+        summed = isinstance(norm, SummedSpinMap)
+        paired = asym or summed
         columns, data = map_table(frames[rows], norm.values[rows], norm.standard_uncertainty[rows], coords,
-                                  partner_indices=norm.partner_indices[rows] if asym else None)
+                                  partner_indices=norm.partner_indices[rows] if paired else None)
         y0, y1 = omap.y_bounds
+        spin_note = ""
+        if asym:
+            spin_note = " (Frame = u frame, PartnerFrame = paired d frame)"
+        elif summed:
+            spin_note = " (Frame = u frame, PartnerFrame = paired d frame; pooled u + d exposure)"
         header = [
             f"Off-specular map: {self.combo_y_axis.currentText()}; detector frames integrated along Y, "
-            "displayed X pixel (90 deg CW + mirrored, as in the 2D Detector tab).",
+            "displayed X pixel (90 deg CW + mirrored, as in the Detector Image tab).",
             f"Source: {self.scan_data.file_path}",
-            f"Spin: {self.combo_spin.currentText()}"
-            + (" (Frame = u frame, PartnerFrame = paired d frame)" if asym else ""),
+            f"Spin: {self.combo_spin.currentText()}" + spin_note,
             f"Integrated Y rows: {'per-frame tracked ROI within ' if omap.y_varies else ''}[{y0}, {y1})",
             f"Normalization: {self.combo_norm.currentText()}; Value units: {norm.units}",
             "StdUncertainty is first-order 1 sigma (docs/normalization.md, docs/off_specular.md).",
@@ -1243,9 +2037,24 @@ class OffSpecularView(QWidget):
         ]
         if self._alpha_mode():
             cal = self._alpha_geom["cal"]
-            header.append(f"Angle calibration: {cal.deg_per_pixel!r} deg/pixel ({cal.deg_per_pixel_source}), "
-                          f"x0 = {cal.x0!r} px, alpha_f {'increases' if cal.sign > 0 else 'decreases'} with X; "
-                          "coordinates are pixel centres")
+            if cal.mode == "pysared":
+                pitch_ps = pixel_pitch_mm(omap.nx, cal.detector_width_mm)
+                header.append(
+                    f"Angle calibration: pySAred geometry (L = {cal.sample_detector_distance_mm!r} mm, "
+                    f"detector width = {cal.detector_width_mm!r} mm, pixel = {pitch_ps!r} mm, "
+                    f"effective {cal.deg_per_pixel!r} deg/pixel at x0), "
+                    f"x0 = {cal.x0!r} px, alpha_f {'increases' if cal.sign > 0 else 'decreases'} with X; "
+                    "coordinates are pixel centres"
+                )
+            else:
+                header.append(f"Angle calibration: {cal.deg_per_pixel!r} deg/pixel ({cal.deg_per_pixel_source}), "
+                              f"x0 = {cal.x0!r} px, alpha_f {'increases' if cal.sign > 0 else 'decreases'} with X; "
+                              "coordinates are pixel centres")
+                pitch = self._pixel_pitch()
+                if pitch is not None:
+                    header.append(f"Implied sample-detector distance: {cal.distance_mm(pitch):.1f} mm "
+                                  f"(pixel {pitch!r} mm = {DETECTOR_WIDTH_MM:g} mm detector width; "
+                                  "derived from deg/pixel, not used in the conversion)")
             if self._q_mode():
                 header.append(f"Wavelength: {self.spin_wavelength.value()!r} Angstrom; "
                               "Qx = (2pi/lambda)(cos af - cos ai), Qz = (2pi/lambda)(sin af + sin ai)")
@@ -1280,7 +2089,10 @@ class OffSpecularView(QWidget):
         QMessageBox.information(self, "Export Succeeded", f"Exported {count:,} map cells to {target.name}.")
         return target
 
-    # ------------------------------------------------------------- α_i / α_f
+    # ------------------------------------------------------------- α_i / α_f & θ
+    def _theta_mode(self) -> bool:
+        return self.combo_y_axis.currentData() == "th"
+
     def _alpha_mode(self) -> bool:
         """Angle-space views (α_i–α_f and Qx–Qz) share the calibrated strip geometry."""
         return self.combo_y_axis.currentData() in ("alpha", "q")
@@ -1317,9 +2129,7 @@ class OffSpecularView(QWidget):
         g = self._alpha_geom
         cal = g["cal"]
         lam = self.spin_wavelength.value()
-        k0 = 2 * np.pi / lam
         qx = qx_view / QX_SCALE
-        ai = np.radians(g["alpha_i"])
         _, af_cross = self._from_view(qx_view, qz)
         side = 1.0 if af_cross >= 0 else -1.0
 
@@ -1336,20 +2146,30 @@ class OffSpecularView(QWidget):
                 vals.append(self._cut_values[g["rows"][j], px])
             return np.array(xs_q, dtype=float).reshape(-1, 2), np.array(vals, dtype=float)
 
-        with np.errstate(invalid="ignore"):
-            af_const_qz = np.degrees(np.arcsin(qz / k0 - np.sin(ai)))
-            af_const_qx = side * np.degrees(np.arccos(qx / k0 + np.cos(ai)))
-        q_rows, v_rows = sample(af_const_qz)
-        order = np.argsort(q_rows[:, 0])
-        self._row_curve.setData(q_rows[order, 0] * QX_SCALE, positive(v_rows[order]))
-        q_cols, v_cols = sample(af_const_qx)
-        order = np.argsort(q_cols[:, 1])
-        self._col_curve.setData(q_cols[order, 1], positive(v_cols[order]))
-        for curve in (self._row_curve, self._col_curve):
-            curve.setVisible(True)
-        self.lbl_row_cut.setText(f"Cut at constant Qz = {qz:.4f} Å⁻¹ ({v_rows.size} points):")
-        self.lbl_col_cut.setText(f"Cut at constant Qx = {qx_view:.3g}×10⁻³ Å⁻¹ ({v_cols.size} points):")
-        self.lbl_cut_hint.setText("Drag the crosshair centre to move the cuts; click elsewhere to jump.")
+        row_active, col_active = self._cut_curve_flags()
+        if row_active:
+            af_const_qz = constant_qz_alpha_f(g["alpha_i"], qz, lam)
+            q_rows, v_rows = sample(af_const_qz)
+            order = np.argsort(q_rows[:, 0])
+            self._row_curve.setData(q_rows[order, 0] * QX_SCALE, positive(v_rows[order]))
+            self._row_curve.setVisible(True)
+            self.lbl_row_cut.setText(f"Cut at constant Qz = {qz:.4f} Å⁻¹ ({v_rows.size} points):")
+        else:
+            self._row_curve.setData([], [])
+            self._row_curve.setVisible(False)
+            self.lbl_row_cut.setText("Horizontal cut at constant Qz (toggle Horizontal above):")
+        if col_active:
+            af_const_qx = constant_qx_alpha_f(g["alpha_i"], qx, lam, side=side)
+            q_cols, v_cols = sample(af_const_qx)
+            order = np.argsort(q_cols[:, 1])
+            self._col_curve.setData(q_cols[order, 1], positive(v_cols[order]))
+            self._col_curve.setVisible(True)
+            self.lbl_col_cut.setText(f"Cut at constant Qx = {qx_view:.3g}×10⁻³ Å⁻¹ ({v_cols.size} points):")
+        else:
+            self._col_curve.setData([], [])
+            self._col_curve.setVisible(False)
+            self.lbl_col_cut.setText("Vertical cut at constant Qx (toggle Vertical above):")
+        self.lbl_cut_hint.setText("Drag the cut lines or crosshair on the map to move cuts; click to jump.")
 
     def _on_axes_changed(self) -> None:
         self._redraw()
@@ -1370,8 +2190,13 @@ class OffSpecularView(QWidget):
             self._cal_message = "No 2θ channel: angle calibration unavailable."
             return None
         try:
-            scan.angle_calibration = calibrate(self._map.counts, tth, self._roi_x_ranges(),
-                                               y_rows=self._map.y_bounds)
+            scan.angle_calibration = calibrate(
+                self._map.counts,
+                tth,
+                self._roi_x_ranges(),
+                y_rows=self._map.y_bounds,
+                written=self._map.written,
+            )
         except CalibrationError as error:
             self._cal_message = str(error)
         return scan.angle_calibration
@@ -1394,21 +2219,48 @@ class OffSpecularView(QWidget):
 
     def _sync_cal_controls(self) -> None:
         cal = getattr(self.scan_data, "angle_calibration", None) if self.scan_data is not None else None
-        widgets = (self.spin_dpp, self.spin_x0, self.chk_af_increases)
+        widgets = (
+            self.btn_mode_direct_beam,
+            self.btn_mode_pysared,
+            self.spin_dpp,
+            self.spin_distance_mm,
+            self.spin_det_width_mm,
+            self.spin_x0,
+            self.chk_af_increases,
+        )
         for widget in widgets:
             widget.blockSignals(True)
         if self.scan_data is not None and self.scan_data.detector_shape:
             self.spin_x0.setMaximum(float(self.scan_data.detector_shape[1]))
         if cal is not None:
+            is_pysared = cal.mode == "pysared"
+            self.btn_mode_pysared.setChecked(is_pysared)
+            self.btn_mode_direct_beam.setChecked(not is_pysared)
+            self.cal_mode_stack.setCurrentIndex(1 if is_pysared else 0)
             self.spin_dpp.setValue(cal.deg_per_pixel)
+            self.spin_distance_mm.setValue(cal.sample_detector_distance_mm)
+            self.spin_det_width_mm.setValue(cal.detector_width_mm)
             self.spin_x0.setValue(cal.x0)
             self.chk_af_increases.setChecked(cal.sign > 0)
-            self._set_cal_status(cal.describe())
+            self._show_calibration(cal)
         else:
+            self.btn_mode_direct_beam.setChecked(True)
+            self.btn_mode_pysared.setChecked(False)
+            self.cal_mode_stack.setCurrentIndex(0)
+            self._show_calibration(None)
             self.spin_dpp.setValue(0.0)
+            self.spin_distance_mm.setValue(PYSARED_DEFAULT_DISTANCE_MM)
+            self.spin_det_width_mm.setValue(DETECTOR_WIDTH_MM)
             if self._map is not None:
                 try:
-                    self.spin_x0.setValue(specular_center(self._map.counts, self._roi_x_ranges()))
+                    self.spin_x0.setValue(
+                        specular_center(
+                            self._map.counts,
+                            self._roi_x_ranges(),
+                            tth=self._variable("tth"),
+                            written=self._map.written,
+                        )
+                    )
                 except CalibrationError:
                     self.spin_x0.setValue(float(np.mean(self._roi_x_ranges()[0])))
             self.chk_af_increases.setChecked(False)
@@ -1417,14 +2269,81 @@ class OffSpecularView(QWidget):
         for widget in widgets:
             widget.blockSignals(False)
 
-    def _on_calibration_edited(self, *, deg_per_pixel=None, x0=None, sign=None) -> None:
+    def _on_cal_mode_changed(self, mode: str) -> None:
+        """Switch this scan's calibration between direct-beam fit and pySAred manual geometry."""
+        is_pysared = mode == "pysared"
+        self.cal_mode_stack.setCurrentIndex(1 if is_pysared else 0)
+        scan = self.scan_data
+        if scan is None:
+            return
+        nx = self._detector_nx()
+        cal = scan.angle_calibration
+        try:
+            if is_pysared:
+                if cal is None:
+                    cal = AngleCalibration.from_pysared(
+                        distance_mm=self.spin_distance_mm.value(),
+                        x0=self.spin_x0.value(),
+                        sign=1 if self.chk_af_increases.isChecked() else -1,
+                        detector_width_mm=self.spin_det_width_mm.value(),
+                        nx=nx,
+                    )
+                else:
+                    cal = cal.with_mode("pysared", nx=nx)
+            else:
+                if cal is not None:
+                    cal = cal.with_mode("direct_beam", nx=nx)
+                else:
+                    cal = self._ensure_calibration()
+        except ValueError as error:
+            self._set_notice(f"Calibration mode not changed: {error}")
+            self._sync_cal_controls()
+            return
+        scan.angle_calibration = cal
+        self._sync_cal_controls()
+        self._redraw()
+
+    def _on_calibration_edited(
+        self,
+        *,
+        deg_per_pixel=None,
+        x0=None,
+        sign=None,
+        distance_mm=None,
+        detector_width_mm=None,
+    ) -> None:
         """Manual override for this scan only; only the edited quantity changes."""
         scan = self.scan_data
         if scan is None:
             return
         cal = scan.angle_calibration
+        nx = self._detector_nx()
+        in_pysared = (
+            self.btn_mode_pysared.isChecked()
+            or distance_mm is not None
+            or detector_width_mm is not None
+        )
         try:
-            if cal is None:
+            if in_pysared:
+                if cal is None:
+                    cal = AngleCalibration.from_pysared(
+                        distance_mm=self.spin_distance_mm.value() if distance_mm is None else distance_mm,
+                        detector_width_mm=(
+                            self.spin_det_width_mm.value() if detector_width_mm is None else detector_width_mm
+                        ),
+                        x0=self.spin_x0.value() if x0 is None else x0,
+                        sign=(1 if self.chk_af_increases.isChecked() else -1) if sign is None else sign,
+                        nx=nx,
+                    )
+                else:
+                    cal = cal.with_pysared(
+                        distance_mm=distance_mm,
+                        detector_width_mm=detector_width_mm,
+                        x0=x0,
+                        sign=sign,
+                        nx=nx,
+                    )
+            elif cal is None:
                 dpp = self.spin_dpp.value()
                 if dpp <= 0:
                     return
@@ -1439,14 +2358,96 @@ class OffSpecularView(QWidget):
             self._set_notice(f"Calibration not changed: {error}")
             return
         scan.angle_calibration = cal
-        self._set_cal_status(cal.describe())
+        self._sync_cal_controls()
         self._redraw()
 
     def _clear_alpha_items(self) -> None:
-        for item in self._alpha_items:
-            self.plot.removeItem(item)
+        if len(self._alpha_items) > 1:
+            self.plot.setUpdatesEnabled(False)
+            try:
+                for item in self._alpha_items:
+                    self.plot.removeItem(item)
+            finally:
+                self.plot.setUpdatesEnabled(True)
+        else:
+            for item in self._alpha_items:
+                self.plot.removeItem(item)
         self._alpha_items = []
         self._alpha_geom = None
+        self._th_geom = None
+
+    def _draw_theta(self, display: np.ndarray) -> str | None:
+        """Draw each frame at its measured θ as an exact PColorMesh strip (no uniform-row kink)."""
+        flipper = self._variable("Flipper1")
+        if (self.combo_spin.currentData() == "all" and flipper is not None
+                and np.any(flipper == 0) and np.any(flipper == 1)):
+            self._show_unavailable("X pixel vs θ: choose one spin state (u or d), their sum (u + d), "
+                                   "or the spin asymmetry; both states share the same angles and would overlap.")
+            return None
+        th = self._variable("th")
+        if th is None:
+            self._show_unavailable("X pixel vs θ needs a θ (th) channel.")
+            return None
+        frames = self._norm.frame_indices
+        ok = frames < th.size
+        ok[ok] &= np.isfinite(th[frames[ok]])
+        written = self._map.written
+        if written is not None:
+            ok &= written[frames]
+        rows = np.flatnonzero(ok)
+        if rows.size == 0:
+            self._show_unavailable("X pixel vs θ: no measured frames with valid θ angles.")
+            return None
+        if self.img_item.image is not None:
+            self.img_item.clear()
+        theta = th[frames[rows]]
+        n = rows.size
+        nx = self._map.nx
+        prev_th = self._th_geom
+        can_reuse_mesh = (
+            len(self._alpha_items) == 1
+            and isinstance(self._alpha_items[0], CachedMeshItem)
+        )
+        same_th_geom = (
+            can_reuse_mesh
+            and prev_th is not None
+            and prev_th["theta"].shape == theta.shape
+            and np.array_equal(prev_th["theta"], theta)
+            and self._alpha_items[0].z is not None
+            and self._alpha_items[0].z.shape == (2 * n - 1, nx)
+        )
+        strips = prev_th["strips"] if same_th_geom else alpha_i_strip_edges(theta)
+        Z = np.full((2 * n - 1, nx), np.nan)
+        Z[0::2] = display[rows]
+        if same_th_geom:
+            mesh = self._alpha_items[0]
+            mesh.setData(None, None, Z, autoLevels=False)
+            self._colorbar_items_rebuilt = False
+        else:
+            x_edges = np.arange(nx + 1, dtype=float)
+            X = np.broadcast_to(x_edges[None, :], (2 * n, nx + 1)).copy()
+            Y = np.broadcast_to(strips.reshape(-1, 1), (2 * n, nx + 1)).copy()
+            if can_reuse_mesh:
+                mesh = self._alpha_items[0]
+                mesh.setData(X, Y, Z, autoLevels=False)
+                self._colorbar_items_rebuilt = False
+            else:
+                self._clear_alpha_items()
+                mesh = CachedMeshItem(X, Y, Z, colorMap=self._current_colormap(), enableAutoLevels=False)
+                self.plot.addItem(mesh)
+                self._alpha_items = [mesh]
+                self.colorbar.setImageItem(self._alpha_items)
+                self._colorbar_on_strips = True
+                self._colorbar_items_rebuilt = True
+        self._alpha_geom = None
+        self._th_geom = dict(
+            rows=rows,
+            theta=theta,
+            strips=strips,
+            extent=(0.0, float(nx), float(strips[:, 0].min()), float(strips[:, 1].max())),
+        )
+        skipped = frames.size - rows.size
+        return f"X pixel vs θ: {skipped} unwritten/invalid frame(s) omitted." if skipped else ""
 
     def _draw_alpha(self, display: np.ndarray) -> str | None:
         """Draw each frame as its own α_i strip of exact pixel cells. Returns a notice,
@@ -1460,7 +2461,7 @@ class OffSpecularView(QWidget):
         flipper = self._variable("Flipper1")
         if (self.combo_spin.currentData() == "all" and flipper is not None
                 and np.any(flipper == 0) and np.any(flipper == 1)):
-            self._show_unavailable(f"{name}: choose one spin state (u or d) or the spin asymmetry; "
+            self._show_unavailable(f"{name}: choose one spin state (u or d), their sum (u + d), or the spin asymmetry; "
                                    "both states share the same angles and would overlap.")
             return None
         th, tth = self._variable("th"), self._variable("tth")
@@ -1477,41 +2478,116 @@ class OffSpecularView(QWidget):
         if rows.size == 0:
             self._show_unavailable(f"{name}: no measured frames with valid angles.")
             return None
-        self.img_item.clear()
-        self._clear_alpha_items()
+        if self.img_item.image is not None:
+            self.img_item.clear()
         sel = frames[rows]
         alpha_i = th[sel]
         base = tth[sel] - th[sel]
-        strips = alpha_i_strip_edges(alpha_i)
-        edges = alpha_f_offsets(self._map.nx, cal, edges=True)
+        prev_geom = self._alpha_geom
+        same_angles = (
+            prev_geom is not None
+            and prev_geom["alpha_i"].shape == alpha_i.shape
+            and np.array_equal(prev_geom["alpha_i"], alpha_i)
+            and np.array_equal(prev_geom["base"], base)
+            and prev_geom["cal"] == cal
+            and prev_geom.get("nx") == self._map.nx
+        )
+        strips = prev_geom["strips"] if same_angles else alpha_i_strip_edges(alpha_i)
+        edges = prev_geom["edges"] if same_angles else alpha_f_offsets(self._map.nx, cal, edges=True)
         span = abs(edges[-1] - edges[0])
-        geom = dict(rows=rows, alpha_i=alpha_i, base=base, strips=strips, cal=cal,
-                    af_lo=float(base.min() + edges.min()), af_hi=float(base.max() + edges.max()))
-        items = []
+        edges_min = float(edges.min())
+        geom = dict(
+            rows=rows,
+            alpha_i=alpha_i,
+            base=base,
+            strips=strips,
+            edges=edges,
+            cal=cal,
+            nx=self._map.nx,
+            af_lo=float(base.min() + edges_min),
+            af_hi=float(base.max() + float(edges.max())),
+        )
         if self._q_mode():
             # Exact cells: every pixel's four (α_i, α_f) corners mapped to (Qx, Qz). One mesh;
             # the NaN rows between strips keep points separate (no interpolation).
+            lam = self.spin_wavelength.value()
+            geom["wavelength"] = lam
             n = rows.size
-            ai_corners = np.broadcast_to(strips.reshape(-1, 1), (2 * n, edges.size))  # strip lo/hi edges
-            af_corners = np.repeat(base, 2)[:, None] + edges[None, :]  # pixel edges at each strip's 2θ − θ
-            X, Y = self._to_view(ai_corners, af_corners)
             Z = np.full((2 * n - 1, self._map.nx), np.nan)
             Z[0::2] = display[rows]
-            mesh = CachedMeshItem(X, Y, Z, enableAutoLevels=False)
-            self.plot.addItem(mesh)
-            items.append(mesh)
-            geom["extent"] = (float(np.nanmin(X)), float(np.nanmax(X)), float(np.nanmin(Y)), float(np.nanmax(Y)))
+            can_reuse_mesh = (
+                len(self._alpha_items) == 1
+                and isinstance(self._alpha_items[0], CachedMeshItem)
+            )
+            same_q_geom = (
+                can_reuse_mesh
+                and same_angles
+                and prev_geom.get("wavelength") == lam
+                and "extent" in prev_geom
+                and self._alpha_items[0].z is not None
+                and self._alpha_items[0].z.shape == Z.shape
+            )
+            if same_q_geom:
+                mesh = self._alpha_items[0]
+                mesh.setData(None, None, Z, autoLevels=False)
+                geom["extent"] = prev_geom["extent"]
+                self._colorbar_items_rebuilt = False
+            else:
+                ai_corners = np.broadcast_to(strips.reshape(-1, 1), (2 * n, edges.size))  # strip lo/hi edges
+                af_corners = np.repeat(base, 2)[:, None] + edges[None, :]  # pixel edges at each strip's 2θ − θ
+                X, Y = self._to_view(ai_corners, af_corners)
+                geom["extent"] = (float(np.nanmin(X)), float(np.nanmax(X)), float(np.nanmin(Y)), float(np.nanmax(Y)))
+                if can_reuse_mesh:
+                    mesh = self._alpha_items[0]
+                    mesh.setData(X, Y, Z, autoLevels=False)
+                    self._colorbar_items_rebuilt = False
+                else:
+                    self._clear_alpha_items()
+                    mesh = CachedMeshItem(X, Y, Z, colorMap=self._current_colormap(), enableAutoLevels=False)
+                    self.plot.addItem(mesh)
+                    self._alpha_items = [mesh]
+                    self.colorbar.setImageItem(self._alpha_items)
+                    self._colorbar_on_strips = True
+                    self._colorbar_items_rebuilt = True
         else:
-            for k, r in enumerate(rows):
-                values = display[r] if cal.sign > 0 else display[r][::-1]  # image runs to increasing α_f
-                item = pg.ImageItem(values[None, :], autoLevels=False)
-                item.setRect(strips[k, 0], base[k] + edges.min(), strips[k, 1] - strips[k, 0], span)
-                self.plot.addItem(item)
-                items.append(item)
-        self._alpha_items = items
+            can_reuse_strips = (
+                len(self._alpha_items) == rows.size
+                and rows.size > 0
+                and isinstance(self._alpha_items[0], pg.ImageItem)
+            )
+            if can_reuse_strips:
+                self.plot.setUpdatesEnabled(False)
+                try:
+                    for k, r in enumerate(rows):
+                        values = display[r] if cal.sign > 0 else display[r][::-1]
+                        item = self._alpha_items[k]
+                        item.setImage(values[None, :], autoLevels=False)
+                        if not same_angles:
+                            item.setRect(strips[k, 0], base[k] + edges_min, strips[k, 1] - strips[k, 0], span)
+                finally:
+                    self.plot.setUpdatesEnabled(True)
+                self._colorbar_items_rebuilt = False
+            else:
+                self._clear_alpha_items()
+                items = []
+                cmap = self._current_colormap()
+                self.plot.setUpdatesEnabled(False)
+                try:
+                    for k, r in enumerate(rows):
+                        values = display[r] if cal.sign > 0 else display[r][::-1]  # image runs to increasing α_f
+                        item = pg.ImageItem(values[None, :], autoLevels=False)
+                        item.setColorMap(cmap)
+                        item.setRect(strips[k, 0], base[k] + edges_min, strips[k, 1] - strips[k, 0], span)
+                        self.plot.addItem(item)
+                        items.append(item)
+                finally:
+                    self.plot.setUpdatesEnabled(True)
+                self._alpha_items = items
+                self.colorbar.setImageItem(items)
+                self._colorbar_on_strips = True
+                self._colorbar_items_rebuilt = True
+        self._th_geom = None
         self._alpha_geom = geom
-        self.colorbar.setImageItem(items)
-        self._colorbar_on_strips = True
         skipped = frames.size - rows.size
         return f"{name}: {skipped} unwritten/invalid frame(s) omitted." if skipped else ""
 
@@ -1521,6 +2597,8 @@ class OffSpecularView(QWidget):
             if "extent" in g:
                 return g["extent"]
             return float(g["strips"][:, 0].min()), float(g["strips"][:, 1].max()), g["af_lo"], g["af_hi"]
+        if self._theta_mode() and self._th_geom is not None:
+            return self._th_geom["extent"]
         n_rows = self._norm.frame_indices.size if self._norm is not None else 1
         nx = self._map.nx if self._map is not None else 1
         return 0.0, float(nx), 0.0, float(n_rows)
@@ -1528,7 +2606,10 @@ class OffSpecularView(QWidget):
     def _pixel_for_alpha(self, k: int, alpha_f: float) -> int | None:
         g = self._alpha_geom
         cal = g["cal"]
-        px = int(np.floor(cal.x0 + cal.sign * (alpha_f - g["base"][k]) / cal.deg_per_pixel))
+        x_coord = pixel_for_alpha_f_offset(alpha_f - g["base"][k], self._map.nx, cal)
+        if not np.isfinite(x_coord):
+            return None
+        px = int(np.floor(x_coord))
         return px if 0 <= px < self._map.nx else None
 
     def _cell_at(self, xv: float, yv: float):
@@ -1544,6 +2625,16 @@ class OffSpecularView(QWidget):
             k = int(inside[-1])  # strips at repeated θ overlap; the last drawn is visible
             px = self._pixel_for_alpha(k, yv)
             return None if px is None else (int(g["rows"][k]), px)
+        if self._theta_mode():
+            g = self._th_geom
+            x = int(np.floor(xv))
+            if not (0 <= x < self._map.nx):
+                return None
+            inside = np.flatnonzero((g["strips"][:, 0] <= yv) & (yv < g["strips"][:, 1]))
+            if inside.size == 0:
+                return None
+            k = int(inside[-1])
+            return int(g["rows"][k]), x
         row, x = int(np.floor(yv)), int(np.floor(xv))
         if 0 <= x < self._map.nx and 0 <= row < self._norm.frame_indices.size:
             return row, x
@@ -1561,8 +2652,12 @@ class OffSpecularView(QWidget):
         px = self._pixel_for_alpha(k, yv)
         if px is None:
             cal = g["cal"]
-            px = int(np.clip(np.floor(cal.x0 + cal.sign * (yv - g["base"][k]) / cal.deg_per_pixel),
-                             0, self._map.nx - 1))
+            offset = yv - g["base"][k]
+            x_coord = pixel_for_alpha_f_offset(offset, self._map.nx, cal)
+            if np.isfinite(x_coord):
+                px = int(np.clip(np.floor(x_coord), 0, self._map.nx - 1))
+            else:
+                px = (self._map.nx - 1) if (cal.sign * offset > 0) else 0
         return int(g["rows"][k]), px
 
     def _cell_center(self, row: int, x: int) -> tuple[float, float]:
@@ -1576,6 +2671,10 @@ class OffSpecularView(QWidget):
             ai, af = g["alpha_i"][k], g["base"][k] + alpha_f_offsets(self._map.nx, g["cal"])[x]
             vx, vy = self._to_view(ai, af)
             return float(vx), float(vy)
+        if self._theta_mode() and self._th_geom is not None:
+            g = self._th_geom
+            k = int(np.argmin(np.abs(g["rows"] - row)))
+            return x + 0.5, float(g["theta"][k])
         return x + 0.5, row + 0.5
 
     def _update_alpha_cuts(self, positive) -> None:
@@ -1585,25 +2684,36 @@ class OffSpecularView(QWidget):
         if self._q_mode():
             self._update_q_cuts(positive, *view)
             return
+        row_active, col_active = self._cut_curve_flags()
         xv, yv = (float(v) for v in self._from_view(*view))
         k = self._nearest_strip(xv)
         row = int(g["rows"][k])
         cal = g["cal"]
-        self._row_curve.setData(g["base"][k] + alpha_f_offsets(self._map.nx, cal),
-                                positive(self._cut_values[row]))
-        col = np.full(g["rows"].size, np.nan)
-        for j in range(g["rows"].size):
-            px = self._pixel_for_alpha(j, yv)
-            if px is not None:
-                col[j] = self._cut_values[g["rows"][j], px]
-        order = np.argsort(g["alpha_i"], kind="stable")
-        self._col_curve.setData(g["alpha_i"][order], positive(col[order]))
-        for curve in (self._row_curve, self._col_curve):
-            curve.setVisible(True)
-        frame = int(self._norm.frame_indices[row])
-        self.lbl_row_cut.setText(f"Cut at α_i = {g['alpha_i'][k]:.4f}° — point {frame} ({self._describe_frame(frame)}):")
-        self.lbl_col_cut.setText(f"Cut at constant α_f = {yv:.4f}°:")
-        self.lbl_cut_hint.setText("Drag the crosshair centre to move the cuts; click elsewhere to jump.")
+        if row_active:
+            self._row_curve.setData(g["base"][k] + alpha_f_offsets(self._map.nx, cal),
+                                    positive(self._cut_values[row]))
+            self._row_curve.setVisible(True)
+            frame = int(self._norm.frame_indices[row])
+            self.lbl_row_cut.setText(f"Cut at α_i = {g['alpha_i'][k]:.4f}° — point {frame} ({self._describe_frame(frame)}):")
+        else:
+            self._row_curve.setData([], [])
+            self._row_curve.setVisible(False)
+            self.lbl_row_cut.setText("Vertical cut at α_i (toggle Vertical above):")
+        if col_active:
+            col = np.full(g["rows"].size, np.nan)
+            for j in range(g["rows"].size):
+                px = self._pixel_for_alpha(j, yv)
+                if px is not None:
+                    col[j] = self._cut_values[g["rows"][j], px]
+            order = np.argsort(g["alpha_i"], kind="stable")
+            self._col_curve.setData(g["alpha_i"][order], positive(col[order]))
+            self._col_curve.setVisible(True)
+            self.lbl_col_cut.setText(f"Cut at constant α_f = {yv:.4f}°:")
+        else:
+            self._col_curve.setData([], [])
+            self._col_curve.setVisible(False)
+            self.lbl_col_cut.setText("Horizontal cut at constant α_f (toggle Horizontal above):")
+        self.lbl_cut_hint.setText("Drag the cut lines or crosshair on the map to move cuts; click to jump.")
 
     def _draw_alpha_overlay(self) -> None:
         g = self._alpha_geom
@@ -1621,13 +2731,15 @@ class OffSpecularView(QWidget):
             return
         bounds = self._scan_roi_bounds()
         frames = self._norm.frame_indices[g["rows"]]
-        for col in (0, 1):
-            xs, ys = [], []
-            for k, f in enumerate(frames):
-                b = bounds[0] if len(bounds) == 1 else bounds[min(int(f), len(bounds) - 1)]
-                xb = min(b[0], b[1]) if col == 0 else max(b[0], b[1])
-                af = g["base"][k] + cal.sign * (xb - cal.x0) * cal.deg_per_pixel
-                vx, vy = self._to_view([g["strips"][k, 0], g["strips"][k, 1]], [af, af])
-                xs += list(vx)
-                ys += list(vy)
-            self._add_overlay(xs, ys, "#facc15", connect="pairs")
+        if len(bounds) == 1:
+            x_lo = np.full(frames.size, min(bounds[0][0], bounds[0][1]), dtype=float)
+            x_hi = np.full(frames.size, max(bounds[0][0], bounds[0][1]), dtype=float)
+        else:
+            per_row = np.array([bounds[min(int(f), len(bounds) - 1)] for f in frames], dtype=float)
+            x_lo = np.minimum(per_row[:, 0], per_row[:, 1])
+            x_hi = np.maximum(per_row[:, 0], per_row[:, 1])
+        ai_pairs = g["strips"].reshape(-1)
+        for xb in (x_lo, x_hi):
+            af = g["base"] + alpha_f_offset_for_pixel(xb, self._map.nx, cal)
+            vx, vy = self._to_view(ai_pairs, np.repeat(af, 2))
+            self._add_overlay(vx, vy, "#facc15", connect="pairs")

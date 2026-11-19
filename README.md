@@ -33,13 +33,13 @@ inspection and check files in **Loaded Scans** to compare them on the chart.
 | --- | --- |
 | **File Hierarchy** | Browse datasets and attributes; preview data as plots, images, tables or text. |
 | **Scan Charts** | Plot selected channels, compare scans, separate spin states, normalize counts and display uncertainties. |
-| **2D Detector** | Browse detector frames, define or track an ROI, inspect profiles and apply ROI counts to the chart. |
-| **Off-Specular** | Heatmap of every detector frame integrated along Y (full height, scan ROI or custom rows), shown as X pixel versus scan point, α_i versus α_f or Qx versus Qz, with spin selection or spin asymmetry, normalization and crosshair cuts. |
+| **Detector Image** | Browse detector frames (or pooled u + d pairs), define or track an ROI, inspect profiles and apply ROI counts to the chart. |
+| **2D Map** | Heatmap of every detector frame integrated along Y (full height, scan ROI or custom rows), shown as X pixel versus θ (default) or scan point, α_i versus α_f or Qx versus Qz, with spin selection, pooled u + d sum or spin asymmetry, normalization and crosshair cuts. |
 | **Metadata & Motors** | View experiment details, sample environment and instrument positions. |
 
 Chart processing includes angle-to-Q conversion, time or monitor normalization,
 and selectable **1σ–6σ** uncertainty bounds, defaulting to **2σ**. Spin separation
-uses Flipper OFF/0 for **d/down** and ON/1 for **u/up**.
+uses Flipper ON/0 for **d/down** and OFF/1 for **u/up**.
 
 **Chart Display Options** controls spin colormaps, a shared shade range, lines,
 markers, axis fonts, legend visibility and waterfall offsets.

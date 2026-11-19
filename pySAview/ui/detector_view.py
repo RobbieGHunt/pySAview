@@ -6,19 +6,21 @@ from pathlib import Path
 from typing import Any
 import numpy as np
 import pyqtgraph as pg
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QSize, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QCursor
 from PyQt6.QtWidgets import (
     QApplication,
     QButtonGroup,
     QCheckBox,
     QComboBox,
-    QGroupBox,
     QFileDialog,
-    QMessageBox,
+    QFrame,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
+    QMessageBox,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QSlider,
     QSpinBox,
@@ -28,13 +30,28 @@ from PyQt6.QtWidgets import (
 )
 
 from pySAview.core.models import ScanData
+from pySAview.core.off_specular import _written_frames, pair_spin_frames
 from pySAview.core.roi_record import ROIRecord, save_roi, load_roi
 from pySAview.core.nexus_reader import NexusReader
 from pySAview.core.scan_calculations import integrate_roi_2d
 from pySAview.core.roi import pixel_bounds
 from pySAview.ui import icons
+from pySAview.ui.flow_layout import (
+    FlowContainer,
+    FlowLayout,
+    configure_compact_combo,
+    fit_combo_popup,
+    make_flow_group,
+)
 from pySAview.ui.plot_tools import export_plot_image, install_context_export, tool_button
 from pySAview.ui.theme import apply_plot_theme, get_safe_colormap
+
+
+class _CompactPlotWidget(pg.PlotWidget):
+    """PlotWidget with a compact preferred sizeHint so side-panel scroll areas do not inflate."""
+
+    def sizeHint(self) -> QSize:
+        return QSize(180, 120)
 
 
 class DetectorView(QWidget):
@@ -51,8 +68,12 @@ class DetectorView(QWidget):
         self.is_dark_mode: bool = False
         self._current_frame_idx: int = 0
         self._total_frames: int = 0
-        self._current_frame_data: np.ndarray | None = None
+        self._frame_data: np.ndarray | None = None
+        self._frame_dirty: bool = False
+        self._frame_total_counts: float | None = None
+        self._loaded_cmap_name: str = "turbo"
         self._filtered_indices: list[int] = []
+        self._paired_frames: dict[int, int] = {}
         self._current_filtered_pos: int = 0
 
         # Animation timer for scan play
@@ -71,48 +92,49 @@ class DetectorView(QWidget):
         self._init_ui()
 
     def _init_ui(self) -> None:
+        self.setMinimumSize(0, 0)
         main_layout = QVBoxLayout(self)
         main_layout.setContentsMargins(10, 10, 10, 10)
         main_layout.setSpacing(8)
 
         # ---------------- Top Controls / Scrubber Bar ----------------
-        ctrl_bar = QHBoxLayout()
-        ctrl_bar.setSpacing(8)
+        ctrl_bar = FlowContainer(margin=0, h_spacing=8, v_spacing=6)
 
         self.btn_play = tool_button("Play / pause through the frames")
         self.btn_play.setIcon(icons.get_icon("play", is_dark=self.is_dark_mode))
         self.btn_play.clicked.connect(self._toggle_play)
-        ctrl_bar.addWidget(self.btn_play)
 
         self.btn_prev = tool_button("Previous frame")
         self.btn_prev.setIcon(icons.get_icon("chevron_left", is_dark=self.is_dark_mode))
         self.btn_prev.clicked.connect(self._step_backward)
-        ctrl_bar.addWidget(self.btn_prev)
 
         self.btn_next = tool_button("Next frame")
         self.btn_next.setIcon(icons.get_icon("chevron_right", is_dark=self.is_dark_mode))
         self.btn_next.clicked.connect(self._step_forward)
-        ctrl_bar.addWidget(self.btn_next)
+        for btn in (self.btn_play, self.btn_prev, self.btn_next):
+            ctrl_bar.addWidget(btn)
 
-        ctrl_bar.addWidget(QLabel("Spin:"))
-        self.combo_spin_filter = QComboBox()
+        self.combo_spin_filter = configure_compact_combo(QComboBox(), min_chars=14)
         self.combo_spin_filter.addItem("All Frames", "all")
-        self.combo_spin_filter.addItem("u — Spin Up (F=1)", "up")
-        self.combo_spin_filter.addItem("d — Spin Down (F=0)", "down")
+        self.combo_spin_filter.addItem("u — Spin Up (Flipper OFF / 1)", "up")
+        self.combo_spin_filter.addItem("d — Spin Down (Flipper ON / 0)", "down")
+        self.combo_spin_filter.addItem("u + d — Sum of channels", "sum")
+        fit_combo_popup(self.combo_spin_filter)
         self.combo_spin_filter.currentIndexChanged.connect(self._on_spin_filter_changed)
-        ctrl_bar.addWidget(self.combo_spin_filter)
+        ctrl_bar.addWidget(make_flow_group(QLabel("Spin:"), self.combo_spin_filter, spacing=6))
 
-        ctrl_bar.addWidget(QLabel("Step:"))
         self.spin_step = QSpinBox()
         self.spin_step.setRange(0, 0)
         self.spin_step.setFixedWidth(70)
         self.spin_step.valueChanged.connect(self._on_step_spin_changed)
-        ctrl_bar.addWidget(self.spin_step)
 
         self.slider_step = QSlider(Qt.Orientation.Horizontal)
         self.slider_step.setRange(0, 0)
+        self.slider_step.setMinimumWidth(40)
         self.slider_step.valueChanged.connect(self._on_slider_changed)
-        ctrl_bar.addWidget(self.slider_step, 1)
+        ctrl_bar.addWidget(
+            make_flow_group(QLabel("Step:"), self.spin_step, self.slider_step, spacing=6, expanding=True)
+        )
 
         self.chk_log_img = QCheckBox("Log Scale")
         self.chk_log_img.setChecked(True)
@@ -124,27 +146,31 @@ class DetectorView(QWidget):
         self.chk_show_roi.toggled.connect(self._toggle_roi_visibility)
         ctrl_bar.addWidget(self.chk_show_roi)
 
-        ctrl_bar.addWidget(QLabel("Colormap:"))
-        self.combo_cmap = QComboBox()
+        self.combo_cmap = configure_compact_combo(QComboBox(), min_chars=8)
         self.combo_cmap.addItems(["turbo", "viridis", "inferno", "plasma", "cividis", "gray", "magma"])
         self.combo_cmap.setCurrentText("turbo")
+        fit_combo_popup(self.combo_cmap)
         self.combo_cmap.currentTextChanged.connect(self._on_cmap_changed)
-        ctrl_bar.addWidget(self.combo_cmap)
+        ctrl_bar.addWidget(make_flow_group(QLabel("Colormap:"), self.combo_cmap, spacing=6))
 
-        main_layout.addLayout(ctrl_bar)
+        main_layout.addWidget(ctrl_bar)
 
         # ---------------- Central Splitter: 2D Image + ROI Controls & 1D Profiles ----------------
         splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setChildrenCollapsible(True)
+        splitter.setMinimumSize(0, 0)
+        splitter.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
 
         # Left / Center: 2D Detector Image
         img_container = QWidget()
+        img_container.setMinimumSize(0, 0)
+        img_container.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
         img_layout = QVBoxLayout(img_container)
         img_layout.setContentsMargins(0, 0, 0, 0)
         img_layout.setSpacing(6)
 
         # Interactive 2D Image Toolbar
-        img_toolbar = QHBoxLayout()
-        img_toolbar.setSpacing(6)
+        img_toolbar = FlowContainer(margin=0, h_spacing=6, v_spacing=4)
 
         # Icon-only tools, matching the Scan Charts and Off-Specular toolbars.
         self.btn_img_pan = tool_button("Pan: drag to move the detector image", checkable=True)
@@ -163,16 +189,22 @@ class DetectorView(QWidget):
         self.btn_img_reset.clicked.connect(self._img_reset_view)
         self.btn_img_export = tool_button("Export the frame as a PNG or SVG image")
         self.btn_img_export.clicked.connect(self.export_image)
-        for btn in (self.btn_img_pan, self.btn_img_box_zoom, self.btn_img_zoom_in, self.btn_img_zoom_out,
-                    self.btn_img_reset, self.btn_img_export):
+        for btn in (
+            self.btn_img_pan,
+            self.btn_img_box_zoom,
+            self.btn_img_zoom_in,
+            self.btn_img_zoom_out,
+            self.btn_img_reset,
+            self.btn_img_export,
+        ):
             img_toolbar.addWidget(btn)
-        img_toolbar.addSpacing(8)
 
         # Per-frame angles, spin and counts (the step itself is in the controls above).
         self.lbl_frame_info = QLabel("")
         self.lbl_frame_info.setStyleSheet("color: #64748b; font-size: 11px;")
+        self.lbl_frame_info.setMinimumWidth(0)
         self.lbl_frame_info.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
-        img_toolbar.addWidget(self.lbl_frame_info, 1)
+        img_toolbar.addWidget(self.lbl_frame_info)
 
         self.lbl_img_coords = QLabel("Pixel: (X: ----, Y: ----)  |  Counts: --------")
         self.lbl_img_coords.setStyleSheet("color: #64748b; font-size: 11px;")
@@ -180,9 +212,11 @@ class DetectorView(QWidget):
         self.lbl_img_coords.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         img_toolbar.addWidget(self.lbl_img_coords)
 
-        img_layout.addLayout(img_toolbar)
+        img_layout.addWidget(img_toolbar)
 
         self.plot_2d = pg.PlotWidget()
+        self.plot_2d.setMinimumSize(0, 0)
+        self.plot_2d.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
         self.plot_2d.setAspectLocked(True)
         self.plot_2d.showGrid(x=False, y=False)
         self.plot_2d.getViewBox().setMouseMode(pg.ViewBox.PanMode)
@@ -193,17 +227,19 @@ class DetectorView(QWidget):
         self.plot_2d.addItem(self.img_item)
 
         apply_plot_theme(self.plot_2d, self.is_dark_mode)
-        img_layout.addWidget(self.plot_2d)
+        img_layout.addWidget(self.plot_2d, 1)
         splitter.addWidget(img_container)
 
-        # Right: Interactive ROI Definition & 1D Cuts
+        # Right: Interactive ROI Definition & 1D Cuts (scrollable when compressed)
         sidebar_container = QWidget()
+        sidebar_container.setMinimumSize(0, 0)
         sidebar_layout = QVBoxLayout(sidebar_container)
         sidebar_layout.setContentsMargins(0, 0, 0, 0)
         sidebar_layout.setSpacing(10)
 
         # 1. Interactive ROI Definition Card
         roi_ctrl_group = QGroupBox("Define Region of Interest (ROI)")
+        roi_ctrl_group.setMinimumSize(0, 0)
         roi_ctrl_layout = QVBoxLayout(roi_ctrl_group)
         roi_ctrl_layout.setSpacing(8)
 
@@ -214,12 +250,16 @@ class DetectorView(QWidget):
         vbox_x = QVBoxLayout()
         vbox_x.addWidget(QLabel("X Min:"))
         self.spin_x0 = QSpinBox()
+        self.spin_x0.setMinimumWidth(55)
+        self.spin_x0.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         self.spin_x0.setRange(0, 1023)
         self.spin_x0.valueChanged.connect(self._on_spin_roi_changed)
         vbox_x.addWidget(self.spin_x0)
 
         vbox_x.addWidget(QLabel("X Max:"))
         self.spin_x1 = QSpinBox()
+        self.spin_x1.setMinimumWidth(55)
+        self.spin_x1.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         self.spin_x1.setRange(0, 1024)
         self.spin_x1.valueChanged.connect(self._on_spin_roi_changed)
         vbox_x.addWidget(self.spin_x1)
@@ -229,12 +269,16 @@ class DetectorView(QWidget):
         vbox_y = QVBoxLayout()
         vbox_y.addWidget(QLabel("Y Min:"))
         self.spin_y0 = QSpinBox()
+        self.spin_y0.setMinimumWidth(55)
+        self.spin_y0.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         self.spin_y0.setRange(0, 1023)
         self.spin_y0.valueChanged.connect(self._on_spin_roi_changed)
         vbox_y.addWidget(self.spin_y0)
 
         vbox_y.addWidget(QLabel("Y Max:"))
         self.spin_y1 = QSpinBox()
+        self.spin_y1.setMinimumWidth(55)
+        self.spin_y1.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         self.spin_y1.setRange(0, 1024)
         self.spin_y1.valueChanged.connect(self._on_spin_roi_changed)
         vbox_y.addWidget(self.spin_y1)
@@ -243,12 +287,12 @@ class DetectorView(QWidget):
         roi_ctrl_layout.addLayout(inputs_grid)
 
         # Action buttons for ROI
-        btns_row = QHBoxLayout()
+        btns_row = FlowLayout(margin=0, h_spacing=6, v_spacing=6)
         self.btn_apply_roi = QPushButton("Apply ROI to Scan Chart")
         self.btn_apply_roi.setIcon(icons.get_icon("chart", is_dark=self.is_dark_mode))
         self.btn_apply_roi.setStyleSheet("font-weight: 700; color: #0284c7;")
         self.btn_apply_roi.clicked.connect(self._apply_roi_to_scan_chart)
-        btns_row.addWidget(self.btn_apply_roi, 1)
+        btns_row.addWidget(self.btn_apply_roi)
 
         self.btn_auto_fit = QPushButton("Auto-Fit ROI")
         self.btn_auto_fit.setIcon(icons.get_icon("sparkles", is_dark=self.is_dark_mode))
@@ -262,7 +306,8 @@ class DetectorView(QWidget):
         self.btn_reset_roi.clicked.connect(self._reset_to_file_roi)
         btns_row.addWidget(self.btn_reset_roi)
         roi_ctrl_layout.addLayout(btns_row)
-        sidecar_row = QHBoxLayout()
+
+        sidecar_row = FlowLayout(margin=0, h_spacing=6, v_spacing=6)
         self.btn_save_roi = QPushButton("Save ROI…")
         self.btn_load_roi = QPushButton("Load ROI…")
         self.btn_save_roi.clicked.connect(self._save_roi_definition)
@@ -273,27 +318,40 @@ class DetectorView(QWidget):
         roi_ctrl_layout.addLayout(sidecar_row)
 
         self.lbl_roi_status = QLabel("Drag yellow box on detector to adjust ROI.")
+        self.lbl_roi_status.setWordWrap(True)
+        self.lbl_roi_status.setMinimumWidth(0)
+        self.lbl_roi_status.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         self.lbl_roi_status.setStyleSheet("color: #64748b; font-size: 11px;")
         roi_ctrl_layout.addWidget(self.lbl_roi_status)
 
         self.lbl_roi_metrics = QLabel("ROI Counts: --")
         self.lbl_roi_metrics.setWordWrap(True)
+        self.lbl_roi_metrics.setMinimumWidth(0)
+        self.lbl_roi_metrics.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         roi_ctrl_layout.addWidget(self.lbl_roi_metrics)
 
         sidebar_layout.addWidget(roi_ctrl_group)
 
         # 2. 1D Horizontal Cut
-        sidebar_layout.addWidget(QLabel("Horizontal Profile (X-Cut through ROI):"))
-        self.plot_x_cut = pg.PlotWidget()
+        lbl_x_cut = QLabel("Horizontal Profile (X-Cut through ROI):")
+        lbl_x_cut.setMinimumWidth(0)
+        lbl_x_cut.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        sidebar_layout.addWidget(lbl_x_cut)
+        self.plot_x_cut = _CompactPlotWidget()
         self.plot_x_cut.showGrid(x=True, y=True, alpha=0.3)
+        self.plot_x_cut.setMinimumHeight(100)
         self.plot_x_cut.setMaximumHeight(160)
         apply_plot_theme(self.plot_x_cut, self.is_dark_mode)
         sidebar_layout.addWidget(self.plot_x_cut)
 
         # 3. 1D Vertical Cut
-        sidebar_layout.addWidget(QLabel("Vertical Profile (Y-Cut through ROI):"))
-        self.plot_y_cut = pg.PlotWidget()
+        lbl_y_cut = QLabel("Vertical Profile (Y-Cut through ROI):")
+        lbl_y_cut.setMinimumWidth(0)
+        lbl_y_cut.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        sidebar_layout.addWidget(lbl_y_cut)
+        self.plot_y_cut = _CompactPlotWidget()
         self.plot_y_cut.showGrid(x=True, y=True, alpha=0.3)
+        self.plot_y_cut.setMinimumHeight(100)
         self.plot_y_cut.setMaximumHeight(160)
         apply_plot_theme(self.plot_y_cut, self.is_dark_mode)
         sidebar_layout.addWidget(self.plot_y_cut)
@@ -302,10 +360,43 @@ class DetectorView(QWidget):
             install_context_export(widget, (lambda k=kind: self._default_export_name(k)), self._source_paths)
 
         sidebar_layout.addStretch()
-        splitter.addWidget(sidebar_container)
+
+        sidebar_scroll = QScrollArea()
+        sidebar_scroll.setWidgetResizable(True)
+        sidebar_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        sidebar_scroll.setMinimumSize(0, 0)
+        sidebar_scroll.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
+        sidebar_scroll.setWidget(sidebar_container)
+        splitter.addWidget(sidebar_scroll)
+        splitter.setStretchFactor(0, 2)
+        splitter.setStretchFactor(1, 1)
         splitter.setSizes([680, 360])
 
         main_layout.addWidget(splitter, 1)
+
+    @property
+    def _current_frame_data(self) -> np.ndarray | None:
+        if self._frame_dirty:
+            self._ensure_frame_loaded()
+        return self._frame_data
+
+    @_current_frame_data.setter
+    def _current_frame_data(self, value: np.ndarray | None) -> None:
+        self._frame_data = value
+        self._frame_dirty = False
+        self._frame_total_counts = None
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        if self._frame_dirty:
+            self._ensure_frame_loaded()
+
+    def _ensure_frame_loaded(self) -> None:
+        if not self._frame_dirty:
+            return
+        self._frame_dirty = False
+        if 0 <= self._current_filtered_pos < len(self._filtered_indices):
+            self._load_frame(self._filtered_indices[self._current_filtered_pos])
 
     def set_data(self, reader: NexusReader, scan_data: ScanData) -> None:
         """Assign reader and scan data to detector view."""
@@ -313,6 +404,9 @@ class DetectorView(QWidget):
         self.scan_data = scan_data
 
         if not scan_data.has_detector_2d or scan_data.detector_shape is None:
+            self._frame_data = None
+            self._frame_dirty = False
+            self._frame_total_counts = None
             self.lbl_frame_info.setText("No 2D detector data found in this NeXus file.")
             self.slider_step.setEnabled(False)
             self.spin_step.setEnabled(False)
@@ -377,7 +471,7 @@ class DetectorView(QWidget):
         self._sync_spinboxes_from_bounds(pos_x, pos_x + size_x, pos_y, pos_y + size_y)
 
         self._update_spin_filter_options()
-        self._update_filtered_indices(reset_pos=True)
+        self._update_filtered_indices(reset_pos=True, defer_if_hidden=True)
 
     def _update_spin_filter_options(self) -> None:
         has_flipper = (
@@ -390,7 +484,8 @@ class DetectorView(QWidget):
     def _on_spin_filter_changed(self) -> None:
         self._update_filtered_indices(reset_pos=False)
 
-    def _update_filtered_indices(self, reset_pos: bool = False) -> None:
+    def _update_filtered_indices(self, reset_pos: bool = False, *, defer_if_hidden: bool = False) -> None:
+        self._paired_frames = {}
         if self.scan_data is None or self._total_frames <= 0:
             self._filtered_indices = []
             self.slider_step.setRange(0, 0)
@@ -407,8 +502,42 @@ class DetectorView(QWidget):
         elif mode == "down":
             f_data = flipper.data
             self._filtered_indices = [i for i in range(min(self._total_frames, len(f_data))) if float(f_data[i]) == 0]
+        elif mode == "sum":
+            f_data = np.asarray(flipper.data, dtype=float)[:self._total_frames]
+            th_var = self.scan_data.variables.get("th")
+            tth_var = self.scan_data.variables.get("tth")
+            written = None
+            if (self.reader is not None and self.scan_data.detector_path
+                    and self.scan_data.detector_path in self.reader.file):
+                written = _written_frames(self.reader.file[self.scan_data.detector_path])
+            if th_var is not None and tth_var is not None:
+                ups, downs = pair_spin_frames(
+                    th_var.data[:self._total_frames], tth_var.data[:self._total_frames], f_data, written,
+                )
+            else:
+                ups_raw = np.flatnonzero(f_data == 1)
+                downs_raw = np.flatnonzero(f_data == 0)
+                n_p = min(ups_raw.size, downs_raw.size)
+                ups, downs = ups_raw[:n_p], downs_raw[:n_p]
+            self._paired_frames = {int(u): int(d) for u, d in zip(ups, downs)}
+            self._filtered_indices = [int(u) for u in ups]
 
         if not self._filtered_indices:
+            if mode == "sum":
+                self._current_frame_data = None
+                self.img_item.clear()
+                self.plot_x_cut.clear()
+                self.plot_y_cut.clear()
+                self.slider_step.blockSignals(True)
+                self.spin_step.blockSignals(True)
+                self.slider_step.setRange(0, 0)
+                self.spin_step.setRange(0, 0)
+                self.slider_step.setValue(0)
+                self.spin_step.setValue(0)
+                self.slider_step.blockSignals(False)
+                self.spin_step.blockSignals(False)
+                self.lbl_frame_info.setText("No matching u/d frame pairs found to sum.")
+                return
             self._filtered_indices = list(range(self._total_frames))
 
         n_filt = len(self._filtered_indices)
@@ -436,6 +565,12 @@ class DetectorView(QWidget):
         self.spin_step.blockSignals(False)
 
         raw_idx = self._filtered_indices[self._current_filtered_pos]
+        if defer_if_hidden and not self.isVisible():
+            self._current_frame_idx = raw_idx
+            self._frame_data = None
+            self._frame_total_counts = None
+            self._frame_dirty = True
+            return
         self._load_frame(raw_idx)
 
     def _source_paths(self) -> list[str]:
@@ -444,7 +579,12 @@ class DetectorView(QWidget):
 
     def _default_export_name(self, kind: str) -> str:
         stem = Path(self.scan_data.file_path).stem if self.scan_data is not None and self.scan_data.file_path else "scan"
-        return f"{stem}_{kind}{self._current_frame_idx:04d}.png" if kind == "frame" else f"{stem}_{kind}.png"
+        if kind == "frame":
+            partner = self._paired_frames.get(self._current_frame_idx) if self.combo_spin_filter.currentData() == "sum" else None
+            if partner is not None:
+                return f"{stem}_frame{self._current_frame_idx:04d}_{partner:04d}_sum.png"
+            return f"{stem}_{kind}{self._current_frame_idx:04d}.png"
+        return f"{stem}_{kind}.png"
 
     def export_image(self) -> Path | None:
         """Save the displayed frame (with ROI box) as PNG or SVG."""
@@ -547,6 +687,7 @@ class DetectorView(QWidget):
             self._load_frame(self._filtered_indices[val])
 
     def _on_cmap_changed(self, cmap_name: str) -> None:
+        self._loaded_cmap_name = cmap_name
         cm = get_safe_colormap(cmap_name)
         self.img_item.setColorMap(cm)
 
@@ -555,7 +696,9 @@ class DetectorView(QWidget):
             self._roi_rect_item.setVisible(visible)
 
     def _refresh_current_frame(self) -> None:
-        self._load_frame(self._current_frame_idx)
+        if self._frame_dirty or self._frame_data is None:
+            return
+        self._render_current_frame(total_counts=self._frame_total_counts)
 
     def _get_current_roi_bounds(self) -> tuple[float, float, float, float]:
         if self._roi_rect_item is None:
@@ -795,12 +938,23 @@ class DetectorView(QWidget):
         cur_roi = rois[self._current_frame_idx] if 0 <= self._current_frame_idx < len(rois) else initial_roi
         self._emit_roi(counts, cur_roi)
 
-    def _update_profiles_and_counts(self, x0: float, x1: float, y0: float, y1: float) -> None:
-        if self._current_frame_data is None:
+    def _update_profiles_and_counts(
+        self,
+        x0: float,
+        x1: float,
+        y0: float,
+        y1: float,
+        *,
+        total_counts: float | None = None,
+    ) -> None:
+        frame = self._current_frame_data
+        if frame is None:
             return
 
-        frame = self._current_frame_data
-        total_counts = float(np.sum(frame))
+        if total_counts is None:
+            total_counts = self._frame_total_counts
+        if total_counts is None:
+            total_counts = float(np.sum(frame))
         roi_counts, x_profile, y_profile = integrate_roi_2d(frame, (x0, x1, y0, y1))
 
         pct = (roi_counts / total_counts * 100.0) if total_counts > 0 else 0.0
@@ -828,25 +982,60 @@ class DetectorView(QWidget):
         self.plot_y_cut.setLabel("bottom", "Y Pixel", color="#f1f5f9" if self.is_dark_mode else "#0f172a")
         self.plot_y_cut.setLabel("left", "Counts", color="#f1f5f9" if self.is_dark_mode else "#0f172a")
 
+    def _render_current_frame(
+        self,
+        *,
+        raw_combined: np.ndarray | None = None,
+        total_counts: float | None = None,
+    ) -> None:
+        frame = self._frame_data
+        if frame is None:
+            return
+
+        # In pyqtgraph ImageItem displays array with transposed axis mapping, so raw_combined == frame.T.
+        img_src = raw_combined if raw_combined is not None else frame.T
+        if self.chk_log_img.isChecked():
+            img_display = np.log10(np.maximum(img_src, 1.0))
+        else:
+            img_display = img_src
+
+        self.img_item.setImage(img_display)
+        cmap_name = self.combo_cmap.currentText()
+        if cmap_name != self._loaded_cmap_name:
+            self._loaded_cmap_name = cmap_name
+            self.img_item.setColorMap(get_safe_colormap(cmap_name))
+
+        x0, x1, y0, y1 = self._get_current_roi_bounds()
+        self._update_profiles_and_counts(x0, x1, y0, y1, total_counts=total_counts)
+
     def _load_frame(self, frame_idx: int) -> None:
         if self.reader is None or self.scan_data is None:
             return
 
+        self._frame_dirty = False
         self._current_frame_idx = frame_idx
+        partner_idx = self._paired_frames.get(frame_idx) if self.combo_spin_filter.currentData() == "sum" else None
         try:
             raw_frame = self.reader.read_detector_frame(frame_idx)
+            partner_raw = self.reader.read_detector_frame(partner_idx) if partner_idx is not None else None
         except Exception:
             raw_frame = None
+            partner_raw = None
 
-        if raw_frame is None:
+        if raw_frame is None or (partner_idx is not None and partner_raw is None):
             return
 
-        # Rotate 90 degrees clockwise and mirror horizontally as requested:
-        # np.fliplr(np.rot90(raw_frame, -1)) is equivalent to raw_frame.T
-        frame_rot = np.rot90(raw_frame, -1)
-        frame_mir = np.fliplr(frame_rot)
-        frame = np.asarray(frame_mir, dtype=float)
-        self._current_frame_data = frame
+        if partner_raw is not None:
+            raw_combined = np.asarray(raw_frame, dtype=float) + np.asarray(partner_raw, dtype=float)
+        else:
+            raw_combined = np.asarray(raw_frame, dtype=float)
+
+        # Rotate 90 degrees clockwise and mirror horizontally:
+        # np.fliplr(np.rot90(raw_combined, -1)) is identical to raw_combined.T (zero-copy view).
+        frame = raw_combined.T
+        total_counts = float(np.sum(raw_combined))
+        self._frame_data = frame
+        self._frame_total_counts = total_counts
 
         # If auto-fit is active, update displayed ROI box to current frame's fitted position
         if self._auto_fit_active and self._per_frame_rois is not None and frame_idx < len(self._per_frame_rois):
@@ -867,26 +1056,13 @@ class DetectorView(QWidget):
         th_val = self.scan_data.variables["th"].data[frame_idx] if "th" in self.scan_data.variables else 0.0
         tth_val = self.scan_data.variables["tth"].data[frame_idx] if "tth" in self.scan_data.variables else 0.0
         flip_val = self.scan_data.variables["Flipper1"].data[frame_idx] if "Flipper1" in self.scan_data.variables else np.nan
-        total_counts = float(np.sum(frame))
 
-        spin_str = {0: "d (F=0)", 1: "u (F=1)"}.get(flip_val, "spin ?")
-        self.lbl_frame_info.setText(
-            f"Frame {frame_idx}   θ {th_val:.4f}°   2θ {tth_val:.4f}°   {spin_str}   {total_counts:,.0f} counts")
+        if partner_idx is not None:
+            self.lbl_frame_info.setText(
+                f"Frames {frame_idx}+{partner_idx}   θ {th_val:.4f}°   2θ {tth_val:.4f}°   u+d (sum)   {total_counts:,.0f} counts")
+        else:
+            spin_str = {0: "d (ON)", 1: "u (OFF)"}.get(flip_val, "spin ?")
+            self.lbl_frame_info.setText(
+                f"Frame {frame_idx}   θ {th_val:.4f}°   2θ {tth_val:.4f}°   {spin_str}   {total_counts:,.0f} counts")
 
-        # Prepare 2D Image
-        img_display = frame
-        if self.chk_log_img.isChecked():
-            img_display = np.log10(np.maximum(img_display, 1.0))
-
-        # In pyqtgraph ImageItem displays array with transposed axis mapping
-        self.img_item.setImage(img_display.T)
-        cm = get_safe_colormap(self.combo_cmap.currentText())
-        self.img_item.setColorMap(cm)
-
-        # Compute ROI integration & 1D profiles on the frame
-        x0, x1, y0, y1 = self._get_current_roi_bounds()
-        self._update_profiles_and_counts(x0, x1, y0, y1)
-
-        apply_plot_theme(self.plot_2d, self.is_dark_mode)
-        apply_plot_theme(self.plot_x_cut, self.is_dark_mode)
-        apply_plot_theme(self.plot_y_cut, self.is_dark_mode)
+        self._render_current_frame(raw_combined=raw_combined, total_counts=total_counts)

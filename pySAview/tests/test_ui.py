@@ -30,8 +30,8 @@ def test_window_tabs_and_loading(main_window: MainWindow):
     tab_titles = [main_window.tabs.tabText(i) for i in range(5)]
     assert "File Hierarchy" in tab_titles[0]
     assert "Scan Charts" in tab_titles[1]
-    assert "2D Detector" in tab_titles[2]
-    assert "Off-Specular" in tab_titles[3]
+    assert "Detector Image" in tab_titles[2]
+    assert "2D Map" in tab_titles[3]
     assert "Metadata & Motors" in tab_titles[4]
 
     assert main_window.current_file_path is not None
@@ -306,28 +306,28 @@ def test_multi_file_loading_and_overlay(main_window: MainWindow):
 
 def test_spin_filter_in_detector_view(main_window: MainWindow):
     det = main_window.view_detector
-    assert det.combo_spin_filter.count() == 3
+    assert det.combo_spin_filter.count() == 4
     assert det.combo_spin_filter.isEnabled() is True
 
     total = det._total_frames
     assert total > 0
 
-    # Test Spin Up (F=1)
+    # Test Spin Up (Flipper OFF / 1)
     idx_up = det.combo_spin_filter.findData("up")
     det.combo_spin_filter.setCurrentIndex(idx_up)
     assert len(det._filtered_indices) == total // 2
     assert all(det.scan_data.variables["Flipper1"].data[i] == 1 for i in det._filtered_indices)
-    assert "u (F=1)" in det.lbl_frame_info.text()
+    assert "u (OFF)" in det.lbl_frame_info.text()
     det.btn_next.click()
     assert det._current_filtered_pos == 1
-    assert "u (F=1)" in det.lbl_frame_info.text()
+    assert "u (OFF)" in det.lbl_frame_info.text()
 
-    # Test Spin Down (F=0)
+    # Test Spin Down (Flipper ON / 0)
     idx_down = det.combo_spin_filter.findData("down")
     det.combo_spin_filter.setCurrentIndex(idx_down)
     assert len(det._filtered_indices) == total // 2
     assert all(det.scan_data.variables["Flipper1"].data[i] == 0 for i in det._filtered_indices)
-    assert "d (F=0)" in det.lbl_frame_info.text()
+    assert "d (ON)" in det.lbl_frame_info.text()
 
     # Test All Frames
     idx_all = det.combo_spin_filter.findData("all")
@@ -429,6 +429,282 @@ def test_file_hierarchy_tree_minimization(main_window: MainWindow):
     assert hier.is_tree_minimized is False
     assert not hier.tree_expanded_container.isHidden()
     assert hier.tree_minimized_container.isHidden()
+
+
+def test_flipper_labels_and_detector_sum_mode(main_window: MainWindow):
+    import numpy as np
+
+    # 1. Flipper ON = spin d (0), Flipper OFF = spin u (1) across all three spin selectors
+    charts = main_window.view_charts
+    det = main_window.view_detector
+    offspec = main_window.view_offspec
+
+    assert "Flipper ON" in charts.combo_spin.itemText(charts.combo_spin.findData("flipper0"))
+    assert "Flipper OFF" in charts.combo_spin.itemText(charts.combo_spin.findData("flipper1"))
+    assert "Flipper OFF" in det.combo_spin_filter.itemText(det.combo_spin_filter.findData("up"))
+    assert "Flipper ON" in det.combo_spin_filter.itemText(det.combo_spin_filter.findData("down"))
+    assert "Flipper OFF" in offspec.combo_spin.itemText(offspec.combo_spin.findData("up"))
+    assert "Flipper ON" in offspec.combo_spin.itemText(offspec.combo_spin.findData("down"))
+
+    # Frame 0 in 005572.nxs has Flipper1 == 1 -> u (OFF); Frame 1 has Flipper1 == 0 -> d (ON)
+    det.combo_spin_filter.setCurrentIndex(det.combo_spin_filter.findData("all"))
+    det.spin_step.setValue(0)
+    frame_0 = det._current_frame_data.copy()
+    assert "u (OFF)" in det.lbl_frame_info.text()
+    det.spin_step.setValue(1)
+    frame_1 = det._current_frame_data.copy()
+    assert "d (ON)" in det.lbl_frame_info.text()
+
+    # 2. Sum of spin channels (u + d) in Detector Image
+    idx_sum = det.combo_spin_filter.findData("sum")
+    assert idx_sum >= 0
+    det.combo_spin_filter.setCurrentIndex(idx_sum)
+    assert det.slider_step.maximum() == 150  # 151 paired (θ, 2θ) steps
+    det.spin_step.setValue(0)
+    assert "Frames 0+1" in det.lbl_frame_info.text()
+    assert "u+d (sum)" in det.lbl_frame_info.text()
+    np.testing.assert_array_equal(det._current_frame_data, frame_0 + frame_1)
+
+
+def test_scan_charts_log_toolbar_buttons(qtbot, main_window: MainWindow):
+    main_window.tabs.setCurrentWidget(main_window.view_charts)
+    main_window.show()
+    qtbot.wait(10)
+
+    charts = main_window.view_charts
+    plot_item = charts.plot_widget.getPlotItem()
+
+    # Clear text labels, no icons, checkable, preserved tooltips & accessible names
+    for btn, label in ((charts.btn_tool_log_y, "Log Y"), (charts.btn_tool_log_x, "Log X")):
+        assert btn.text() == label
+        assert btn.icon().isNull()
+        assert btn.isCheckable() is True
+        assert label in btn.toolTip()
+        assert btn.accessibleName() == label
+        # Flush with adjacent toolbar buttons and wide enough to never clip text
+        assert btn.height() == charts.btn_pan.height()
+        assert btn.width() >= btn.sizeHint().width()
+        assert btn.width() >= btn.fontMetrics().horizontalAdvance(label) + 16
+        assert btn.height() >= btn.fontMetrics().height() + 4
+
+    # Initial states: Log Y on, Log X off
+    assert charts.btn_tool_log_y.isChecked() is True
+    assert charts.btn_tool_log_x.isChecked() is False
+    assert plot_item.getAxis("left").logMode is True
+    assert plot_item.getAxis("bottom").logMode is False
+
+    # Toggling Log Y button updates checkbox, plot log mode, and keeps button width stable
+    w_y_checked = charts.btn_tool_log_y.width()
+    charts.btn_tool_log_y.click()
+    assert charts.btn_tool_log_y.isChecked() is False
+    assert charts.chk_log_y.isChecked() is False
+    assert plot_item.getAxis("left").logMode is False
+    assert charts.btn_tool_log_y.width() == w_y_checked
+
+    charts.chk_log_y.setChecked(True)
+    assert charts.btn_tool_log_y.isChecked() is True
+    assert plot_item.getAxis("left").logMode is True
+
+    # Toggling Log X button updates checkbox, plot log mode, and keeps button width stable
+    w_x_unchecked = charts.btn_tool_log_x.width()
+    charts.btn_tool_log_x.click()
+    assert charts.btn_tool_log_x.isChecked() is True
+    assert charts.chk_log_x.isChecked() is True
+    assert plot_item.getAxis("bottom").logMode is True
+    assert charts.btn_tool_log_x.width() == w_x_unchecked
+
+    charts.btn_tool_log_x.click()
+    assert charts.btn_tool_log_x.isChecked() is False
+    assert charts.chk_log_x.isChecked() is False
+    assert plot_item.getAxis("bottom").logMode is False
+
+    # Light & dark themes keep text labels, keep icon null, and preserve obvious checked/unchecked contrast
+    for dark in (False, True):
+        main_window.act_dark_mode.setChecked(dark)
+        qtbot.wait(10)
+        for btn, label in ((charts.btn_tool_log_y, "Log Y"), (charts.btn_tool_log_x, "Log X")):
+            assert btn.text() == label
+            assert btn.icon().isNull()
+        # Log Y is checked and Log X is unchecked: rendered center fill colors must clearly differ
+        img_checked = charts.btn_tool_log_y.grab().toImage()
+        img_unchecked = charts.btn_tool_log_x.grab().toImage()
+        bg_checked = img_checked.pixelColor(4, img_checked.height() // 2)
+        bg_unchecked = img_unchecked.pixelColor(4, img_unchecked.height() // 2)
+        color_dist = (
+            abs(bg_checked.red() - bg_unchecked.red())
+            + abs(bg_checked.green() - bg_unchecked.green())
+            + abs(bg_checked.blue() - bg_unchecked.blue())
+        )
+        assert color_dist > 150
+    main_window.act_dark_mode.setChecked(False)
+
+
+def test_window_unrestricted_compression_empty_and_loaded(qtbot, qapp, example_nxs_path: Path):
+    """MainWindow launches at 1300x860 and compresses freely horizontally & vertically across all tabs."""
+    win = MainWindow()
+    qtbot.addWidget(win)
+    win.show()
+    qapp.processEvents()
+
+    try:
+        # 1. Default launch size is 1300x860 with tiny minimum size floor
+        assert (win.width(), win.height()) == (1300, 860)
+        assert win.minimumSize().width() <= 250
+        assert win.minimumSize().height() <= 200
+        assert win.minimumSizeHint().width() <= 250
+        assert win.minimumSizeHint().height() <= 200
+
+        # 2. Empty window compresses cleanly across all 5 tabs with sidebar expanded, minimized, and re-expanded
+        for minimized in (False, True, False):
+            win.session_files_view.set_minimized(minimized)
+            qapp.processEvents()
+            for tab_idx in range(win.tabs.count()):
+                win.tabs.setCurrentIndex(tab_idx)
+                for target_w, target_h in ((320, 240), (500, 350)):
+                    win.resize(target_w, target_h)
+                    qapp.processEvents()
+                    assert (win.width(), win.height()) == (target_w, target_h)
+        assert win.session_files_view.minimumWidth() == 0
+
+        # 3. Loaded scan (005572.nxs) + long status text + tree minimize/expand cycle + dark mode
+        win.resize(1300, 860)
+        assert win.load_file(example_nxs_path)
+        win.status_bar.showMessage("LongStatusTextWithoutSpaces_" * 20)
+        win.tabs.setCurrentIndex(0)
+        qapp.processEvents()
+        win.view_hierarchy.set_tree_minimized(True)
+        qapp.processEvents()
+        assert win.view_hierarchy.left_widget.maximumWidth() == 34
+        win.view_hierarchy.set_tree_minimized(False)
+        qapp.processEvents()
+        assert win.view_hierarchy.left_widget.minimumWidth() == 0
+
+        for dark in (False, True):
+            win.act_dark_mode.setChecked(dark)
+            qapp.processEvents()
+            assert win.minimumSize().width() <= 250
+            assert win.minimumSize().height() <= 200
+            assert win.minimumSizeHint().width() <= 250
+            assert win.minimumSizeHint().height() <= 200
+            for tab_idx in range(win.tabs.count()):
+                win.tabs.setCurrentIndex(tab_idx)
+                for target_w, target_h in ((320, 240), (500, 350)):
+                    win.resize(target_w, target_h)
+                    qapp.processEvents()
+                    assert (win.width(), win.height()) == (target_w, target_h)
+        win.act_dark_mode.setChecked(False)
+
+        # 4. Restoring to 1300x860 keeps primary plots and cut plots comfortably visible
+        win.resize(1300, 860)
+        win.tabs.setCurrentIndex(2)
+        qapp.processEvents()
+        det = win.view_detector
+        assert det.plot_2d.width() > 300 and det.plot_2d.height() > 200
+        assert det.plot_x_cut.height() >= 100 and det.plot_y_cut.height() >= 100
+        assert det.lbl_img_coords.minimumWidth() == 290 and det.lbl_img_coords.maximumWidth() == 290
+
+        win.tabs.setCurrentIndex(3)
+        qapp.processEvents()
+        off = win.view_offspec
+        assert off.plot.width() > 300 and off.plot.height() > 200
+        assert off.plot_row.height() >= 110 and off.plot_col.height() >= 110
+    finally:
+        win.view_offspec.shutdown()
+        win.close()
+
+
+def test_flow_layout_wraps_control_bars_without_overlap(qtbot, qapp, main_window: MainWindow):
+    """Wide top control bars and plot toolbars wrap smoothly with zero sibling overlap across sizes."""
+    from PyQt6.QtWidgets import (
+        QAbstractScrollArea,
+        QComboBox,
+        QScrollBar,
+        QSpinBox,
+        QSplitterHandle,
+        QTabBar,
+        QWidget,
+    )
+    from pySAview.ui.flow_layout import FlowContainer
+
+    def assert_no_sibling_overlaps(root: QWidget) -> None:
+        def walk(parent: QWidget) -> None:
+            if isinstance(parent, (QAbstractScrollArea, QSpinBox, QComboBox, QTabBar)):
+                return
+            kids = []
+            for child in parent.children():
+                if not isinstance(child, QWidget):
+                    continue
+                if isinstance(child, (QSplitterHandle, QScrollBar, QTabBar)):
+                    continue
+                if child.objectName().startswith("qt_"):
+                    continue
+                if child.isHidden() or not child.isVisible():
+                    continue
+                rect = child.geometry()
+                if rect.width() <= 0 or rect.height() <= 0:
+                    continue
+                kids.append((child, rect))
+            for a in range(len(kids)):
+                for b in range(a + 1, len(kids)):
+                    inter = kids[a][1].intersected(kids[b][1])
+                    assert not (inter.width() > 1 and inter.height() > 1), (
+                        f"Overlap inside {type(parent).__name__}: "
+                        f"{type(kids[a][0]).__name__} {kids[a][1]} vs "
+                        f"{type(kids[b][0]).__name__} {kids[b][1]}"
+                    )
+            for child, _ in kids:
+                walk(child)
+
+        walk(root)
+
+    main_window.show()
+    qapp.processEvents()
+
+    try:
+        # Compact combo boxes must not bloat minimumSizeHint horizontally
+        for combo in (
+            main_window.combo_active_file,
+            main_window.view_detector.combo_spin_filter,
+            main_window.view_detector.combo_cmap,
+            main_window.view_offspec.combo_spin,
+            main_window.view_offspec.combo_y_source,
+            main_window.view_offspec.combo_norm,
+            main_window.view_offspec.combo_y_axis,
+            main_window.view_offspec.combo_cmap,
+        ):
+            assert combo.sizeAdjustPolicy() == QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+            assert combo.minimumSizeHint().width() < 300
+
+        # Toggle optional asymmetry spinbox visible so FlowLayout wrapping is exercised with it too
+        main_window.view_offspec.spin_min_counts.setVisible(True)
+
+        # Top control bars in DetectorView & OffSpecularView wrap onto more rows as width narrows
+        for tab_idx in (2, 3):
+            main_window.tabs.setCurrentIndex(tab_idx)
+            view = main_window.tabs.widget(tab_idx)
+            top_bar = view.layout().itemAt(0).widget()
+            assert isinstance(top_bar, FlowContainer)
+            heights = {}
+            for width, height in ((1600, 860), (500, 350)):
+                main_window.resize(width, height)
+                qapp.processEvents()
+                heights[width] = top_bar.height()
+            assert heights[500] > heights[1600]
+
+        # Full sibling-overlap sweep across ALL 5 tabs at normal, intermediate, and compressed sizes
+        # (catches toolbar-over-plot overlap AND toolbar-button pileup when narrow)
+        for width, height in ((1300, 860), (600, 450), (500, 350), (400, 420), (320, 380), (320, 240)):
+            main_window.resize(width, height)
+            for tab_idx in range(main_window.tabs.count()):
+                main_window.tabs.setCurrentIndex(tab_idx)
+                qapp.processEvents()
+                assert_no_sibling_overlaps(main_window.tabs.widget(tab_idx))
+    finally:
+        main_window.view_offspec.shutdown()
+        main_window.close()
+
+
+
 
 
 

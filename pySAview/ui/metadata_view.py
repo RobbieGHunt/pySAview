@@ -4,11 +4,13 @@ from __future__ import annotations
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
+    QFrame,
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
     QLabel,
     QLineEdit,
+    QScrollArea,
     QSizePolicy,
     QSplitter,
     QTableWidget,
@@ -30,58 +32,80 @@ class MetadataView(QWidget):
         self._init_ui()
 
     def _init_ui(self) -> None:
+        self.setMinimumSize(0, 0)
         main_layout = QVBoxLayout(self)
         main_layout.setContentsMargins(8, 8, 8, 8)
         main_layout.setSpacing(10)
 
         splitter = QSplitter(Qt.Orientation.Vertical)
+        splitter.setChildrenCollapsible(True)
+        splitter.setMinimumSize(0, 0)
+        splitter.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
 
         # ---------------- Top Cards: Experiment & Sample ----------------
         top_widget = QWidget()
+        top_widget.setMinimumSize(0, 0)
         top_layout = QHBoxLayout(top_widget)
         top_layout.setContentsMargins(0, 0, 0, 0)
         top_layout.setSpacing(10)
 
         # Card 1: Experiment Details
         grp_exp = QGroupBox("Experiment & Scan Details")
+        grp_exp.setMinimumSize(0, 0)
         exp_layout = QVBoxLayout(grp_exp)
         exp_layout.setSpacing(6)
         self.lbl_exp_details = QLabel("No file loaded.")
         self.lbl_exp_details.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.lbl_exp_details.setWordWrap(True)
+        self.lbl_exp_details.setMinimumWidth(0)
         self.lbl_exp_details.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         exp_layout.addWidget(self.lbl_exp_details)
         top_layout.addWidget(grp_exp, 1)
 
         # Card 2: Sample & Environment
         grp_sample = QGroupBox("Sample & Environment")
+        grp_sample.setMinimumSize(0, 0)
         sample_layout = QVBoxLayout(grp_sample)
         sample_layout.setSpacing(6)
         self.lbl_sample_details = QLabel("No sample metadata available.")
         self.lbl_sample_details.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.lbl_sample_details.setWordWrap(True)
+        self.lbl_sample_details.setMinimumWidth(0)
         self.lbl_sample_details.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         sample_layout.addWidget(self.lbl_sample_details)
         top_layout.addWidget(grp_sample, 1)
 
-        splitter.addWidget(top_widget)
+        top_scroll = QScrollArea()
+        top_scroll.setWidgetResizable(True)
+        top_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        top_scroll.setMinimumSize(0, 0)
+        top_scroll.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
+        top_scroll.setWidget(top_widget)
+        splitter.addWidget(top_scroll)
 
         # ---------------- Bottom: Motor Positions Table ----------------
         bottom_widget = QWidget()
+        bottom_widget.setMinimumSize(0, 0)
+        bottom_widget.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
         bottom_layout = QVBoxLayout(bottom_widget)
         bottom_layout.setContentsMargins(0, 0, 0, 0)
         bottom_layout.setSpacing(6)
 
         header_row = QHBoxLayout()
-        header_row.addWidget(QLabel("<b>SUPERADAM Motors & Positioners:</b>"))
+        lbl_motors = QLabel("<b>SUPERADAM Motors & Positioners:</b>")
+        lbl_motors.setMinimumWidth(0)
+        lbl_motors.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        header_row.addWidget(lbl_motors, 1)
 
         self.filter_motor = QLineEdit()
+        self.filter_motor.setMinimumWidth(0)
         self.filter_motor.setPlaceholderText("Filter motors by name...")
         self.filter_motor.textChanged.connect(self._filter_motors)
-        header_row.addWidget(self.filter_motor)
+        header_row.addWidget(self.filter_motor, 1)
         bottom_layout.addLayout(header_row)
 
         self.table_motors = QTableWidget(0, 5)
+        self.table_motors.setMinimumSize(0, 0)
         self.table_motors.setHorizontalHeaderLabels([
             "Motor Name", "Current Value", "Target Value", "Offset Value", "Units"
         ])
@@ -93,6 +117,8 @@ class MetadataView(QWidget):
         bottom_layout.addWidget(self.table_motors, 1)
 
         splitter.addWidget(bottom_widget)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 2)
         splitter.setSizes([220, 500])
 
         main_layout.addWidget(splitter, 1)

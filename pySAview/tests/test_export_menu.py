@@ -154,8 +154,11 @@ def test_right_click_export_is_guarded_on_every_plot(window, dialogs, tmp_path):
 def test_toolbars_are_icon_only(window):
     charts = window.view_charts
     for btn in (charts.btn_pan, charts.btn_box_zoom, charts.btn_zoom_in, charts.btn_zoom_out,
-                charts.btn_reset_view, charts.btn_tool_log_y, charts.btn_tool_log_x, charts.btn_export_plot):
+                charts.btn_reset_view, charts.btn_export_plot):
         assert btn.text() == "" and btn.toolTip() and btn.size() == window.view_offspec.btn_fit.size()
+    for btn, label in ((charts.btn_tool_log_y, "Log Y"), (charts.btn_tool_log_x, "Log X")):
+        assert btn.text() == label and btn.icon().isNull() and btn.toolTip()
+        assert btn.height() == window.view_offspec.btn_fit.height()
     assert charts.btn_toggle_q.text() == "" and not charts.btn_toggle_q.icon().isNull()
     assert charts.btn_toggle_q.accessibleName() in ("X axis: θ", "X axis: Q")
     assert not hasattr(charts, "btn_export_csv")

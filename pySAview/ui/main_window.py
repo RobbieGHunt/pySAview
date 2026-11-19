@@ -27,7 +27,7 @@ from PyQt6.QtWidgets import (
 
 from pySAview.core.nexus_reader import NexusReader
 from pySAview.core.models import ScanData, ScanMetadata
-from pySAview.ui.file_loading import FileLoadThread
+from pySAview.ui.file_loading import FileLoadThread, warm_scipy_stats_async
 from pySAview.ui import icons
 from pySAview.ui.preferences import restore_preferences, save_preferences
 from pySAview.ui.detector_view import DetectorView
@@ -52,6 +52,7 @@ class MainWindow(QMainWindow):
         self._load_token = 0
         self._load_dialog = None
         self._closing = False
+        self._warmup_scheduled = False
         self.loaded_readers: dict[str, NexusReader] = {}
         self.loaded_scans: dict[str, Any] = {}
         self.active_file_path: Path | None = None
@@ -74,13 +75,24 @@ class MainWindow(QMainWindow):
     def _init_ui(self) -> None:
         # Central Horizontal Splitter: Session Files Sidebar on Left, Tabbed Views on Right
         self.session_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.session_splitter.setChildrenCollapsible(True)
+        self.session_splitter.setMinimumSize(0, 0)
+        self.session_splitter.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
         self.setCentralWidget(self.session_splitter)
 
         self.session_files_view = SessionFilesView()
         self.session_splitter.addWidget(self.session_files_view)
 
         self.tabs = QTabWidget()
+        self.tabs.setMinimumSize(0, 0)
+        self.tabs.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
+        self.tabs.setUsesScrollButtons(True)
+        self.tabs.tabBar().setExpanding(False)
+        self.tabs.tabBar().setUsesScrollButtons(True)
+        self.tabs.tabBar().setMinimumWidth(0)
         self.session_splitter.addWidget(self.tabs)
+        self.session_splitter.setStretchFactor(0, 1)
+        self.session_splitter.setStretchFactor(1, 4)
         self.session_splitter.setSizes([280, 1020])
 
         self.view_hierarchy = FileStructureView()
@@ -94,8 +106,8 @@ class MainWindow(QMainWindow):
 
         self.tabs.addTab(self.view_hierarchy, "File Hierarchy")
         self.tabs.addTab(self.view_charts, "Scan Charts")
-        self.tabs.addTab(self.view_detector, "2D Detector")
-        self.tabs.addTab(self.view_offspec, "Off-Specular")
+        self.tabs.addTab(self.view_detector, "Detector Image")
+        self.tabs.addTab(self.view_offspec, "2D Map")
         self.tabs.addTab(self.view_metadata, "Metadata & Motors")
 
         # Connect session files view signals
@@ -116,6 +128,8 @@ class MainWindow(QMainWindow):
 
         # Status Bar
         self.status_bar = QStatusBar()
+        self.status_bar.setMinimumWidth(0)
+        self.status_bar.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         self.setStatusBar(self.status_bar)
         self.status_bar.showMessage("Ready. Open one or more NeXus (.nxs) files to begin.")
 
@@ -189,12 +203,12 @@ class MainWindow(QMainWindow):
         act_tab1.triggered.connect(lambda: self.tabs.setCurrentIndex(1))
         menu_view.addAction(act_tab1)
 
-        act_tab2 = QAction("2D Detector Tab", self)
+        act_tab2 = QAction("Detector Image Tab", self)
         act_tab2.setShortcut(QKeySequence("Ctrl+3"))
         act_tab2.triggered.connect(lambda: self.tabs.setCurrentIndex(2))
         menu_view.addAction(act_tab2)
 
-        act_tab3 = QAction("Off-Specular Tab", self)
+        act_tab3 = QAction("2D Map Tab", self)
         act_tab3.setShortcut(QKeySequence("Ctrl+4"))
         act_tab3.triggered.connect(lambda: self.tabs.setCurrentIndex(3))
         menu_view.addAction(act_tab3)
@@ -269,6 +283,8 @@ class MainWindow(QMainWindow):
     def _create_toolbar(self) -> None:
         toolbar = QToolBar("Main Controls")
         toolbar.setMovable(False)
+        toolbar.setMinimumSize(0, 0)
+        toolbar.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         self.addToolBar(toolbar)
 
         toolbar.addAction(self.act_toggle_sidebar)
@@ -285,9 +301,9 @@ class MainWindow(QMainWindow):
         toolbar.addWidget(lbl_active)
 
         self.combo_active_file = QComboBox()
-        self.combo_active_file.setMinimumWidth(260)
-        self.combo_active_file.setMinimumContentsLength(24)
         self.combo_active_file.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.combo_active_file.setMinimumContentsLength(6)
+        self.combo_active_file.setMinimumWidth(0)
         self.combo_active_file.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.combo_active_file.currentIndexChanged.connect(self._on_active_file_combo_changed)
         toolbar.addWidget(self.combo_active_file)
@@ -330,7 +346,18 @@ class MainWindow(QMainWindow):
         self.is_dark_mode = checked
         self._apply_app_theme()
 
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        if not self._warmup_scheduled:
+            self._warmup_scheduled = True
+            QTimer.singleShot(50, self._warm_stats_if_visible)
+
+    def _warm_stats_if_visible(self) -> None:
+        if not self._closing and self.isVisible():
+            warm_scipy_stats_async()
+
     def _on_action_open(self) -> None:
+        warm_scipy_stats_async()
         start_dir = self.last_load_directory if Path(self.last_load_directory).is_dir() else str(Path.home())
         file_paths, _ = QFileDialog.getOpenFileNames(
             self,
@@ -343,6 +370,7 @@ class MainWindow(QMainWindow):
             self.start_load_files([Path(p) for p in file_paths], clear_existing=True)
 
     def _on_action_add(self) -> None:
+        warm_scipy_stats_async()
         start_dir = self.last_load_directory if Path(self.last_load_directory).is_dir() else str(Path.home())
         file_paths, _ = QFileDialog.getOpenFileNames(
             self,
@@ -453,6 +481,8 @@ class MainWindow(QMainWindow):
             key = scan.file_path
             previous = self.loaded_readers.get(key)
             if previous is not None:
+                if self.view_hierarchy.reader is previous:
+                    self.view_hierarchy.close()
                 previous.close()
             self.loaded_readers[key] = reader
             self.loaded_scans[key] = scan
@@ -489,11 +519,11 @@ class MainWindow(QMainWindow):
             self._update_file_combo()
             job.accepted = [path for path in job.accepted if str(path) in self.loaded_scans]
             if job.accepted:
+                self.tabs.setCurrentIndex(1)
                 if self.active_file_path is None or self.active_file_path == job.initial_active:
                     self.set_active_file(job.accepted[0])
                 elif self.active_file_path in job.accepted:
                     self.set_active_file(self.active_file_path)
-                self.tabs.setCurrentIndex(1)
             self.view_charts._refresh_axis_combos()
             self.view_charts._update_plot()
             state = "Cancelled" if job.cancelled.is_set() else "Finished"
@@ -516,10 +546,14 @@ class MainWindow(QMainWindow):
             return False
 
         key = str(target)
+        prev_defer = getattr(self.view_charts, "_defer_plot", False)
         try:
-            if key in self.loaded_readers:
+            previous = self.loaded_readers.get(key)
+            if previous is not None:
+                if self.view_hierarchy.reader is previous:
+                    self.view_hierarchy.close()
                 try:
-                    self.loaded_readers[key].close()
+                    previous.close()
                 except Exception:
                     pass
             reader = NexusReader(target)
@@ -527,25 +561,39 @@ class MainWindow(QMainWindow):
             scan_data = reader.parse_scan()
             self.loaded_scans[key] = scan_data
 
-            # Add to multi-dataset scan plot view
+            self.view_charts._defer_plot = True
+            # Add to multi-dataset scan plot view (single render after activation/overlay sync)
             self.view_charts.add_scan(scan_data, make_checked=True, make_active=make_active)
 
-            # Add to global session files sidebar
-            self.session_files_view.add_file(scan_data, is_checked=True, make_active=make_active)
+            # Add to global session files sidebar without duplicate set_active_file / plot redraws
+            self.session_files_view.blockSignals(True)
+            try:
+                self.session_files_view.add_file(scan_data, is_checked=True, make_active=False)
+            finally:
+                self.session_files_view.blockSignals(False)
+
+            if getattr(self.view_charts, "_has_explicit_overlay_keys", False):
+                self.view_charts.set_overlay_keys(self.session_files_view.get_checked_keys())
 
             # Update toolbar dropdown
             self._update_file_combo()
 
-            if make_active or self.active_file_path is None:
-                self.set_active_file(target)
-
-            # Focus charts tab on initial open
+            # Focus charts tab on initial open before activating views so hidden tabs stay lazy
             if self.tabs.currentIndex() == 0 and scan_data.variables:
                 self.tabs.setCurrentIndex(1)
+
+            if make_active or self.active_file_path is None or (previous is not None and self.active_file_path == target):
+                self.set_active_file(target)
+
+            self.view_charts._defer_plot = prev_defer
+            if not prev_defer:
+                self.view_charts._refresh_axis_combos()
+                self.view_charts._update_plot()
 
             self.last_load_directory = str(target.parent)
             return True
         except Exception as e:
+            self.view_charts._defer_plot = prev_defer
             QMessageBox.critical(self, "Error Loading File", f"Failed to load NeXus file:\n{target.name}\n\n{e}")
             return False
 
@@ -554,27 +602,23 @@ class MainWindow(QMainWindow):
         if not paths:
             return
 
-        if clear_existing:
-            for r in self.loaded_readers.values():
-                try:
-                    r.close()
-                except Exception:
-                    pass
-            self.loaded_readers.clear()
-            self.loaded_scans.clear()
-            self.active_file_path = None
-            self.session_files_view.clear_all()
-            self.view_charts.clear_scans()
-
+        prev_defer = getattr(self.view_charts, "_defer_plot", False)
+        self.view_charts._defer_plot = True
         first_loaded: Path | None = None
-        for p in paths:
-            target = Path(p).resolve()
-            if self.load_file(target, make_active=(first_loaded is None)):
-                if first_loaded is None:
-                    first_loaded = target
+        try:
+            if clear_existing:
+                self._clear_workspace()
+            for p in paths:
+                target = Path(p).resolve()
+                if self.load_file(target, make_active=(first_loaded is None)):
+                    if first_loaded is None:
+                        first_loaded = target
+        finally:
+            self.view_charts._defer_plot = prev_defer
 
-        if first_loaded is not None:
-            self.set_active_file(first_loaded)
+        if not prev_defer:
+            self.view_charts._refresh_axis_combos()
+            self.view_charts._update_plot()
 
     def set_active_file(self, path: Path | str) -> None:
         """Set the active file for hierarchy, 2D detector, and metadata inspection."""
@@ -587,8 +631,8 @@ class MainWindow(QMainWindow):
         reader = self.loaded_readers[key]
         scan_data = self.loaded_scans[key]
 
-        # Update views
-        self.view_hierarchy.set_file(target)
+        # Update views (share the already-open read-only reader with File Hierarchy)
+        self.view_hierarchy.set_reader(reader, owned=False)
         self.view_detector.set_data(reader, scan_data)
         self.view_offspec.set_data(scan_data)
         self.view_metadata.set_data(scan_data)
@@ -623,8 +667,11 @@ class MainWindow(QMainWindow):
         self.cancel_loading()
         key = str(self.active_file_path)
         if key in self.loaded_readers:
+            closing_reader = self.loaded_readers[key]
+            if self.view_hierarchy.reader is closing_reader:
+                self.view_hierarchy.close()
             try:
-                self.loaded_readers[key].close()
+                closing_reader.close()
             except Exception:
                 pass
             del self.loaded_readers[key]
@@ -641,6 +688,7 @@ class MainWindow(QMainWindow):
             self.set_active_file(Path(next_key))
         else:
             self.active_file_path = None
+            self.view_hierarchy.close()
             self.view_hierarchy.tree.clear()
             self.view_offspec.set_data(None)
             self.setWindowTitle("SuperADAM NeXus Explorer")

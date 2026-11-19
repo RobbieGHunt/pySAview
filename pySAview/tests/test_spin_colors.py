@@ -22,8 +22,8 @@ def test_independent_spin_line_and_marker_styles(qtbot):
     controls["line_width"].setValue(4)
     controls["marker_size"].setValue(11)
     plots = {item.name(): item for item in view.plot_widget.listDataItems()}
-    up = plots["u (ON)"]
-    down = plots["d (OFF)"]
+    up = plots["u (OFF)"]
+    down = plots["d (ON)"]
     assert up.opts["pen"].style() == Qt.PenStyle.DashLine
     assert up.opts["pen"].widthF() == 4
     assert up.opts["symbolSize"] == 11
@@ -31,7 +31,7 @@ def test_independent_spin_line_and_marker_styles(qtbot):
     assert down.opts["pen"].widthF() == 2
     assert down.opts["symbolSize"] == 5
     controls["marker_size"].setValue(0)
-    up = next(item for item in view.plot_widget.listDataItems() if item.name() == "u (ON)")
+    up = next(item for item in view.plot_widget.listDataItems() if item.name() == "u (OFF)")
     assert up.opts["symbol"] is None
 
 
@@ -57,7 +57,7 @@ def test_overlay_palette_changes_preserve_data_and_visibility_identity(qtbot):
     before = {c.source_path + c.label.split("]")[-1]: (c.color, c.y.copy(), c.y_lower.copy(), c.symbol) for c in view._current_curves}
     for c in view._current_curves:
         rgb = to_rgb(c.color)
-        if "d (OFF)" in c.label:
+        if "d (ON)" in c.label:
             assert rgb[2] > rgb[0]
             assert np.all(c.indices % 2 == 0)
         else:
@@ -68,14 +68,14 @@ def test_overlay_palette_changes_preserve_data_and_visibility_identity(qtbot):
         original = before[c.source_path + c.label.split("]")[-1]]
         assert c.color == original[0]
         assert c.symbol == original[3]
-    down_colors = [c.color for c in view._current_curves if "d (OFF)" in c.label]
+    down_colors = [c.color for c in view._current_curves if "d (ON)" in c.label]
     view.combo_up_colormap.setCurrentText("Greens")
-    assert [c.color for c in view._current_curves if "d (OFF)" in c.label] == down_colors
+    assert [c.color for c in view._current_curves if "d (ON)" in c.label] == down_colors
     for c in view._current_curves:
         original = before[c.source_path + c.label.split("]")[-1]]
         np.testing.assert_array_equal(c.y, original[1])
         np.testing.assert_array_equal(c.y_lower, original[2])
-        if "u (ON)" in c.label:
+        if "u (OFF)" in c.label:
             assert to_rgb(c.color)[1] > to_rgb(c.color)[0]
     view.combo_down_colormap.setCurrentText("Purples_r")
     assert "Purples_r" == view.combo_down_colormap.currentText()

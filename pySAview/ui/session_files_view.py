@@ -14,6 +14,7 @@ from PyQt6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QVBoxLayout,
     QWidget,
@@ -21,6 +22,7 @@ from PyQt6.QtWidgets import (
 
 from pySAview.core.models import ScanData
 from pySAview.ui import icons
+from pySAview.ui.flow_layout import FlowLayout
 
 
 class SessionFilesView(QWidget):
@@ -44,13 +46,30 @@ class SessionFilesView(QWidget):
         self._init_ui()
 
     def _init_ui(self) -> None:
+        self.setMinimumSize(0, 0)
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
+
         main_layout = QVBoxLayout(self)
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
 
         # ---------------- 1. Expanded State Container ----------------
         self.expanded_container = QWidget()
-        exp_layout = QVBoxLayout(self.expanded_container)
+        self.expanded_container.setMinimumSize(0, 0)
+        self.expanded_container.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
+        exp_outer = QVBoxLayout(self.expanded_container)
+        exp_outer.setContentsMargins(0, 0, 0, 0)
+        exp_outer.setSpacing(0)
+
+        exp_scroll = QScrollArea()
+        exp_scroll.setWidgetResizable(True)
+        exp_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        exp_scroll.setMinimumSize(0, 0)
+        exp_scroll.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
+
+        exp_inner = QWidget()
+        exp_inner.setMinimumSize(0, 0)
+        exp_layout = QVBoxLayout(exp_inner)
         exp_layout.setContentsMargins(8, 8, 8, 8)
         exp_layout.setSpacing(8)
 
@@ -58,6 +77,8 @@ class SessionFilesView(QWidget):
         header_row = QHBoxLayout()
         header_row.setContentsMargins(0, 0, 0, 0)
         self.lbl_header = QLabel("Loaded Scans (0)")
+        self.lbl_header.setMinimumWidth(0)
+        self.lbl_header.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         self.lbl_header.setStyleSheet("font-weight: 700; font-size: 13px; color: #0284c7;")
         header_row.addWidget(self.lbl_header, 1)
 
@@ -71,8 +92,7 @@ class SessionFilesView(QWidget):
         exp_layout.addLayout(header_row)
 
         # 2. File actions row: Open, Add, Close
-        act_row = QHBoxLayout()
-        act_row.setSpacing(4)
+        act_row = FlowLayout(margin=0, h_spacing=4, v_spacing=4)
 
         self.btn_open = QPushButton("Open")
         self.btn_open.setToolTip("Open new scan file(s) (Ctrl+O)")
@@ -93,6 +113,7 @@ class SessionFilesView(QWidget):
 
         # 3. List of loaded scans with checkboxes for chart overlay
         self.list_files = QListWidget()
+        self.list_files.setMinimumSize(0, 60)
         self.list_files.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
         self.list_files.currentItemChanged.connect(self._on_current_item_changed)
         self.list_files.itemChanged.connect(self._on_item_check_changed)
@@ -107,9 +128,11 @@ class SessionFilesView(QWidget):
         lbl_hint = QLabel("☑ Tick box to include in Scan Chart overlay")
         lbl_hint.setStyleSheet("color: #64748b; font-size: 11px;")
         lbl_hint.setWordWrap(True)
+        lbl_hint.setMinimumWidth(0)
+        lbl_hint.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         grp_layout.addWidget(lbl_hint)
 
-        btn_row = QHBoxLayout()
+        btn_row = FlowLayout(margin=0, h_spacing=6, v_spacing=4)
         self.btn_select_all = QPushButton("Select All")
         self.btn_select_all.clicked.connect(self._select_all_overlay)
         self.btn_select_none = QPushButton("Clear All")
@@ -148,10 +171,13 @@ class SessionFilesView(QWidget):
         info_layout.addWidget(self.lbl_info_desc)
 
         exp_layout.addWidget(self.info_frame)
+        exp_scroll.setWidget(exp_inner)
+        exp_outer.addWidget(exp_scroll, 1)
         main_layout.addWidget(self.expanded_container, 1)
 
         # ---------------- 2. Minimized State Strip Container ----------------
         self.minimized_container = QWidget()
+        self.minimized_container.setMinimumSize(0, 0)
         self.minimized_container.setVisible(False)
         self.minimized_container.setCursor(Qt.CursorShape.PointingHandCursor)
         self.minimized_container.setToolTip("Click to expand sidebar (Ctrl+B)")
@@ -207,13 +233,15 @@ class SessionFilesView(QWidget):
                 tot = sum(splitter.sizes())
                 splitter.setSizes([34, max(50, tot - 34)])
         else:
-            self.setMinimumWidth(180)
+            self.setMinimumWidth(0)
             self.setMaximumWidth(16777215)
             self.minimized_container.setVisible(False)
             self.expanded_container.setVisible(True)
             if splitter is not None:
                 tot = sum(splitter.sizes())
                 target_w = self._last_expanded_width if self._last_expanded_width >= 180 else 280
+                if tot > 0:
+                    target_w = min(target_w, max(40, tot // 3))
                 splitter.setSizes([target_w, max(50, tot - target_w)])
 
         self.minimized_changed.emit(self.is_minimized)
