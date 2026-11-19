@@ -2,32 +2,43 @@
 
 Geometry (displayed detector coordinates, X = raw axis 1)::
 
-    α_i         = θ
-    α_f(x)      = (2θ − θ) + sign · (x − x₀) · deg_per_pixel
+    α_i = θ
 
-* ``deg_per_pixel`` comes from the direct beam. With the sample in, part of the
-  beam passes the sample unreflected and stays at lab angle 0, i.e. at an
-  angular offset −2θ from the detector reference direction. Its pixel position
-  therefore moves linearly with 2θ; the fitted slope (px per degree of 2θ)
-  gives degrees per pixel and the direction of X (``sign``).
-* Low-2θ exclusion (default ``min_tth = 0.40°``): below ~0.40°, grazing-angle
-  sample masking shifts the transmitted direct-beam centroid toward the
-  specular ridge (Gibaud, Vignaud & Sinha 1993, *Acta Cryst.* A49, Eq. 13 &
-  Fig. 4) and the direct beam overlaps and contaminates the specular ROI.
-* Active-detector-edge exclusion (default ``edge_margin = 20`` px): peaks
-  within ``edge_margin`` of the array borders, or within ``edge_margin`` of a
-  data-detected internal active-cathode cutoff (such as SuperADAM's TDC edge
-  near x ≈ 912 px inside a 1024 px readout), are excluded so clipped beam
-  tails cannot pull the linear fit.
-* ``x₀`` is the pixel of exit angle 2θ − θ. It is taken from the specular peak
-  (α_f = α_i in a specular scan), preferring frames with |2θ| ≥ ``min_tth`` so
-  low-angle direct-beam overlap does not bias ``x₀``.
-* The linear pixel→angle mapping is the one the calibration fits. Across the
-  detector (about −3° to +5.4° from x₀ in the example scans) it differs from
-  flat-detector atan geometry by at most ~0.006°, under one pixel.
-* No sample-to-detector distance is needed. With the known detector width
-  (``DETECTOR_WIDTH_MM`` over the X pixels) the distance the calibration
-  implies is L = p / tan(Δ) (:func:`implied_distance_mm`), shown for checking.
+Two calibration modes are supported on :class:`AngleCalibration`:
+
+1. ``"direct_beam"`` (default — data-driven linear scale)::
+
+       α_f(x) = (2θ − θ) + sign · (x − x₀) · deg_per_pixel
+
+   * ``deg_per_pixel`` comes from the direct beam. With the sample in, part of
+     the beam passes the sample unreflected and stays at lab angle 0, i.e. at an
+     angular offset −2θ from the detector reference direction. Its pixel
+     position therefore moves linearly with 2θ; the fitted slope (px per degree
+     of 2θ) gives degrees per pixel and the direction of X (``sign``).
+   * Low-2θ exclusion (default ``min_tth = 0.40°``): below ~0.40°, grazing-angle
+     sample masking shifts the transmitted direct-beam centroid toward the
+     specular ridge (Gibaud, Vignaud & Sinha 1993, *Acta Cryst.* A49, Eq. 13 &
+     Fig. 4) and the direct beam overlaps and contaminates the specular ROI.
+   * Active-detector-edge exclusion (default ``edge_margin = 20`` px): peaks
+     within ``edge_margin`` of the array borders, or within ``edge_margin`` of a
+     data-detected internal active-cathode cutoff (such as SuperADAM's TDC edge
+     near x ≈ 912 px inside a 1024 px readout), are excluded so clipped beam
+     tails cannot pull the linear fit.
+   * ``x₀`` is the pixel of exit angle 2θ − θ. It is taken from the specular
+     peak (α_f = α_i in a specular scan), preferring frames with
+     |2θ| ≥ ``min_tth`` so low-angle direct-beam overlap does not bias ``x₀``.
+   * No sample-to-detector distance is needed. With the known detector width
+     (``DETECTOR_WIDTH_MM`` over the X pixels) the distance the calibration
+     implies is L = p / tan(Δ) (:func:`implied_distance_mm`), shown for checking.
+
+2. ``"pysared"`` (classic ``pySAred`` flat-detector manual geometry)::
+
+       mm_per_pix = detector_width_mm / nx
+       α_f(x)     = (2θ − θ) + sign · degrees(arctan((x − x₀) · mm_per_pix / L))
+
+   Matches ``pySAred`` (``L`` defaulting to ``2500.0`` mm and detector width
+   defaulting to ``300.0`` mm). :func:`pixel_for_alpha_f_offset` provides the
+   exact inverse (linear in ``direct_beam`` mode, ``tan`` in ``pysared`` mode).
 
 Each scan holds its own calibration (in memory, like its ROI). Nothing is
 written to measurement files.
@@ -36,18 +47,58 @@ written to measurement files.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from typing import Literal
 
 import numpy as np
 
 
+CalibrationMode = Literal["direct_beam", "pysared"]
+
 DETECTOR_WIDTH_MM = 300.0  # SuperADAM 2D detector active area is 300 mm × 300 mm
+PYSARED_DEFAULT_DISTANCE_MM = 2500.0  # Classic pySAred default sample-to-detector distance (mm)
+
+
+def _validate_positive_finite(value: float, label: str) -> float:
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, float, np.integer, np.floating)):
+        raise ValueError(f"{label} must be a positive finite number")
+    val = float(value)
+    if not (np.isfinite(val) and val > 0):
+        raise ValueError(f"{label} must be a positive finite number")
+    return val
+
+
+def _validate_finite(value: float, label: str) -> float:
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, float, np.integer, np.floating)):
+        raise ValueError(f"{label} must be finite")
+    val = float(value)
+    if not np.isfinite(val):
+        raise ValueError(f"{label} must be finite")
+    return val
+
+
+def _validate_sign(sign: int) -> int:
+    if isinstance(sign, (bool, np.bool_)) or sign not in (-1, 1):
+        raise ValueError("Direction sign must be +1 or −1")
+    return int(sign)
+
+
+def _validate_mode(mode: str) -> CalibrationMode:
+    if mode not in ("direct_beam", "pysared"):
+        raise ValueError("Calibration mode must be 'direct_beam' or 'pysared'")
+    return mode
+
+
+def _validate_nx(nx: int) -> int:
+    if isinstance(nx, (bool, np.bool_)) or not isinstance(nx, (int, np.integer)) or int(nx) <= 0:
+        raise ValueError("Number of pixels must be a positive integer")
+    return int(nx)
 
 
 def pixel_pitch_mm(n_pixels: int, width_mm: float = DETECTOR_WIDTH_MM) -> float:
     """Pixel spacing (mm) of a detector ``width_mm`` wide read out in ``n_pixels``."""
-    if n_pixels <= 0:
-        raise ValueError("Number of pixels must be positive")
-    return width_mm / n_pixels
+    n = _validate_nx(n_pixels)
+    width = _validate_positive_finite(width_mm, "Detector width")
+    return width / n
 
 
 def implied_distance_mm(deg_per_pixel: float, pitch_mm: float) -> float:
@@ -56,9 +107,24 @@ def implied_distance_mm(deg_per_pixel: float, pitch_mm: float) -> float:
         L = p / tan(Δ)
 
     Δ comes from the data (direct-beam fit or manual), so this is a derived
-    check value: it is not used in any angle or Q conversion.
+    check value: it is not used in any angle or Q conversion in ``direct_beam``
+    mode.
     """
     return pitch_mm / np.tan(np.radians(deg_per_pixel))
+
+
+def effective_deg_per_pixel(
+    distance_mm: float,
+    nx: int,
+    detector_width_mm: float = DETECTOR_WIDTH_MM,
+) -> float:
+    """Effective small-angle degrees per pixel at the detector normal.
+
+        Δ = degrees(arctan((detector_width_mm / nx) / distance_mm))
+    """
+    dist = _validate_positive_finite(distance_mm, "Sample-to-detector distance")
+    pitch = pixel_pitch_mm(nx, detector_width_mm)
+    return float(np.degrees(np.arctan(pitch / dist)))
 
 
 class CalibrationError(ValueError):
@@ -104,47 +170,231 @@ class AngleCalibration:
     deg_per_pixel_source: str = "direct-beam fit"
     x0_source: str = "specular peak"
     fit_y_rows: tuple[int, int] | None = None  # detector Y rows integrated for the fit
+    mode: CalibrationMode = "direct_beam"
+    sample_detector_distance_mm: float = PYSARED_DEFAULT_DISTANCE_MM
+    detector_width_mm: float = DETECTOR_WIDTH_MM
 
     def __post_init__(self):
-        if not (np.isfinite(self.deg_per_pixel) and self.deg_per_pixel > 0):
-            raise ValueError("Degrees per pixel must be a positive finite number")
-        if not np.isfinite(self.x0):
-            raise ValueError("Reference pixel x₀ must be finite")
-        if self.sign not in (-1, 1):
-            raise ValueError("Direction sign must be +1 or −1")
+        _validate_positive_finite(self.deg_per_pixel, "Degrees per pixel")
+        _validate_finite(self.x0, "Reference pixel x₀")
+        _validate_sign(self.sign)
+        _validate_mode(self.mode)
+        _validate_positive_finite(self.sample_detector_distance_mm, "Sample-to-detector distance")
+        _validate_positive_finite(self.detector_width_mm, "Detector width")
+
+    @classmethod
+    def from_pysared(
+        cls,
+        distance_mm: float = PYSARED_DEFAULT_DISTANCE_MM,
+        x0: float = 0.0,
+        sign: int = -1,
+        detector_width_mm: float = DETECTOR_WIDTH_MM,
+        nx: int = 1024,
+        fit: DirectBeamFit | None = None,
+        *,
+        x0_source: str = "manual",
+        fit_y_rows: tuple[int, int] | None = None,
+    ) -> AngleCalibration:
+        """Build a calibration using classic ``pySAred`` flat-detector ``arctan`` geometry.
+
+        Computes the effective small-angle scale
+        ``deg_per_pixel = degrees(arctan((detector_width_mm / nx) / distance_mm))``
+        so ``deg_per_pixel`` remains positive and valid for display step
+        formatting and small-angle checks.
+        """
+        dist = _validate_positive_finite(distance_mm, "Sample-to-detector distance")
+        width = _validate_positive_finite(detector_width_mm, "Detector width")
+        x0_val = _validate_finite(x0, "Reference pixel x₀")
+        sign_val = _validate_sign(sign)
+        dpp = effective_deg_per_pixel(dist, nx, width)
+        return cls(
+            deg_per_pixel=dpp,
+            x0=x0_val,
+            sign=sign_val,
+            fit=fit,
+            deg_per_pixel_source="pySAred geometry",
+            x0_source=x0_source,
+            fit_y_rows=fit_y_rows,
+            mode="pysared",
+            sample_detector_distance_mm=dist,
+            detector_width_mm=width,
+        )
 
     def with_manual(self, *, deg_per_pixel=None, x0=None, sign=None) -> AngleCalibration:
         """Independent copy with user overrides; the fit is kept for reference."""
         changes = {}
-        if deg_per_pixel is not None and deg_per_pixel != self.deg_per_pixel:
-            changes.update(deg_per_pixel=float(deg_per_pixel), deg_per_pixel_source="manual")
-        if x0 is not None and x0 != self.x0:
-            changes.update(x0=float(x0), x0_source="manual")
-        if sign is not None and sign != self.sign:
-            changes.update(sign=int(sign))
+        if deg_per_pixel is not None:
+            dpp = _validate_positive_finite(deg_per_pixel, "Degrees per pixel")
+            if dpp != self.deg_per_pixel:
+                changes.update(deg_per_pixel=dpp, deg_per_pixel_source="manual")
+        if x0 is not None:
+            x0_val = _validate_finite(x0, "Reference pixel x₀")
+            if x0_val != self.x0:
+                changes.update(x0=x0_val, x0_source="manual")
+        if sign is not None:
+            sign_val = _validate_sign(sign)
+            if sign_val != self.sign:
+                changes.update(sign=sign_val)
         return replace(self, **changes) if changes else self
 
-    def distance_mm(self, pitch_mm: float) -> float:
-        """Sample-to-detector distance implied by this Δ (see :func:`implied_distance_mm`)."""
+    def with_pysared(
+        self,
+        *,
+        distance_mm: float | None = None,
+        detector_width_mm: float | None = None,
+        x0: float | None = None,
+        sign: int | None = None,
+        nx: int = 1024,
+    ) -> AngleCalibration:
+        """Independent copy in ``pysared`` geometry mode; preserves ``fit`` and ``fit_y_rows``."""
+        dist = (
+            self.sample_detector_distance_mm
+            if distance_mm is None
+            else _validate_positive_finite(distance_mm, "Sample-to-detector distance")
+        )
+        width = (
+            self.detector_width_mm
+            if detector_width_mm is None
+            else _validate_positive_finite(detector_width_mm, "Detector width")
+        )
+        dpp = effective_deg_per_pixel(dist, nx, width)
+        new_x0 = self.x0
+        new_x0_source = self.x0_source
+        if x0 is not None:
+            x0_val = _validate_finite(x0, "Reference pixel x₀")
+            if x0_val != self.x0:
+                new_x0 = x0_val
+                new_x0_source = "manual"
+        new_sign = self.sign if sign is None else _validate_sign(sign)
+        return replace(
+            self,
+            mode="pysared",
+            deg_per_pixel=dpp,
+            deg_per_pixel_source="pySAred geometry",
+            x0=new_x0,
+            x0_source=new_x0_source,
+            sign=new_sign,
+            sample_detector_distance_mm=dist,
+            detector_width_mm=width,
+        )
+
+    def with_mode(
+        self,
+        mode: CalibrationMode,
+        *,
+        nx: int = 1024,
+        deg_per_pixel: float | None = None,
+        distance_mm: float | None = None,
+        detector_width_mm: float | None = None,
+        x0: float | None = None,
+        sign: int | None = None,
+    ) -> AngleCalibration:
+        """Return an independent copy switched to ``mode`` (``'direct_beam'`` or ``'pysared'``).
+
+        Preserves ``fit``, ``fit_y_rows``, ``x0``, ``sign``, and remembered
+        ``sample_detector_distance_mm`` / ``detector_width_mm``. When switching
+        from ``'pysared'`` back to ``'direct_beam'`` without an explicit
+        ``deg_per_pixel``, restores ``fit.deg_per_pixel`` if a fit is stored.
+        """
+        target = _validate_mode(mode)
+        if target == "pysared":
+            if deg_per_pixel is not None:
+                raise ValueError(
+                    "deg_per_pixel cannot be overridden directly in 'pysared' mode; "
+                    "set distance_mm and/or detector_width_mm instead"
+                )
+            return self.with_pysared(
+                distance_mm=distance_mm,
+                detector_width_mm=detector_width_mm,
+                x0=x0,
+                sign=sign,
+                nx=nx,
+            )
+
+        changes: dict[str, object] = {}
+        if self.mode != "direct_beam":
+            changes["mode"] = "direct_beam"
+        if deg_per_pixel is not None:
+            dpp = _validate_positive_finite(deg_per_pixel, "Degrees per pixel")
+            if self.mode == "pysared" or dpp != self.deg_per_pixel:
+                changes["deg_per_pixel"] = dpp
+                changes["deg_per_pixel_source"] = "manual"
+        elif self.mode == "pysared":
+            if self.fit is not None:
+                changes["deg_per_pixel"] = float(self.fit.deg_per_pixel)
+                changes["deg_per_pixel_source"] = "direct-beam fit"
+            elif self.deg_per_pixel_source == "pySAred geometry":
+                changes["deg_per_pixel_source"] = "manual"
+        if distance_mm is not None:
+            changes["sample_detector_distance_mm"] = _validate_positive_finite(
+                distance_mm, "Sample-to-detector distance"
+            )
+        if detector_width_mm is not None:
+            changes["detector_width_mm"] = _validate_positive_finite(detector_width_mm, "Detector width")
+        if x0 is not None:
+            x0_val = _validate_finite(x0, "Reference pixel x₀")
+            if x0_val != self.x0:
+                changes["x0"] = x0_val
+                changes["x0_source"] = "manual"
+        if sign is not None:
+            sign_val = _validate_sign(sign)
+            if sign_val != self.sign:
+                changes["sign"] = sign_val
+        return replace(self, **changes) if changes else self
+
+    def distance_mm(self, pitch_mm: float | None = None) -> float:
+        """Sample-to-detector distance (mm).
+
+        In ``direct_beam`` mode, returns the implied check distance
+        ``L = p / tan(Δ)`` from ``deg_per_pixel`` and ``pitch_mm`` (see
+        :func:`implied_distance_mm`). In ``pysared`` mode, returns the
+        configured :attr:`sample_detector_distance_mm`.
+        """
+        if self.mode == "pysared":
+            return float(self.sample_detector_distance_mm)
+        if pitch_mm is None:
+            raise ValueError("pitch_mm is required to compute implied distance in 'direct_beam' mode")
         return implied_distance_mm(self.deg_per_pixel, pitch_mm)
 
     def describe(self, pitch_mm: float | None = None) -> str:
-        text = (f"{self.deg_per_pixel:.5f}°/px ({self.deg_per_pixel_source}), "
+        if self.mode == "pysared":
+            text = (
+                f"pySAred geometry: L = {self.sample_detector_distance_mm:.6g} mm, "
+                f"detector width = {self.detector_width_mm:.6g} mm, "
                 f"x₀ = {self.x0:.1f} px ({self.x0_source}), "
-                f"α_f {'increases' if self.sign > 0 else 'decreases'} with X")
-        if pitch_mm is not None:
-            text += (f" | Implied sample–detector distance {self.distance_mm(pitch_mm):.0f} mm "
-                     f"(pixel {pitch_mm:.4f} mm)")
+                f"α_f {'increases' if self.sign > 0 else 'decreases'} with X"
+            )
+            if pitch_mm is not None:
+                eff_dpp = float(np.degrees(np.arctan(pitch_mm / self.sample_detector_distance_mm)))
+                text += f" | Effective scale {eff_dpp:.5f}°/px (pixel {pitch_mm:.4f} mm)"
+            else:
+                text += f" | Effective scale {self.deg_per_pixel:.5f}°/px"
+        else:
+            text = (
+                f"{self.deg_per_pixel:.5f}°/px ({self.deg_per_pixel_source}), "
+                f"x₀ = {self.x0:.1f} px ({self.x0_source}), "
+                f"α_f {'increases' if self.sign > 0 else 'decreases'} with X"
+            )
+            if pitch_mm is not None:
+                text += (
+                    f" | Implied sample–detector distance {self.distance_mm(pitch_mm):.0f} mm "
+                    f"(pixel {pitch_mm:.4f} mm)"
+                )
         if self.fit is not None:
             tth_lo = self.fit.min_tth_used
             tth_hi = self.fit.max_tth_used
             if (tth_lo is None or tth_hi is None) and self.fit.tth.size:
                 tth_lo = float(np.min(self.fit.tth))
                 tth_hi = float(np.max(self.fit.tth))
-            tth_span = (f" (2θ {tth_lo:.2f}°–{tth_hi:.2f}°)"
-                        if tth_lo is not None and tth_hi is not None else "")
-            text += (f" | Direct-beam fit: {abs(self.fit.slope_px_per_deg):.2f} px/° over "
-                     f"{self.fit.frames.size} frames{tth_span}, rms {self.fit.rms_px:.2f} px")
+            tth_span = (
+                f" (2θ {tth_lo:.2f}°–{tth_hi:.2f}°)"
+                if tth_lo is not None and tth_hi is not None
+                else ""
+            )
+            text += (
+                f" | Direct-beam fit: {abs(self.fit.slope_px_per_deg):.2f} px/° over "
+                f"{self.fit.frames.size} frames{tth_span}, rms {self.fit.rms_px:.2f} px"
+            )
         if self.fit_y_rows is not None:
             text += f" | fitted on Y rows [{self.fit_y_rows[0]}, {self.fit_y_rows[1]})"
 
@@ -570,10 +820,71 @@ def calibrate(
     )
 
 
+def alpha_f_offset_for_pixel(
+    x,
+    nx: int,
+    calibration: AngleCalibration,
+) -> np.ndarray | float:
+    """Exit-angle offset ``α_f − (2θ − θ)`` (deg) at edge-based pixel coordinate(s) ``x``.
+
+    Pixel ``i`` spans ``[i, i + 1)`` with centre ``i + 0.5``.
+
+    * ``direct_beam`` mode: ``sign * (x - x0) * deg_per_pixel``
+    * ``pysared`` mode: ``sign * degrees(arctan((x - x0) * (detector_width_mm / nx) / sample_detector_distance_mm))``
+    """
+    n = _validate_nx(nx)
+    scalar = np.ndim(x) == 0
+    x_arr = np.asarray(x, dtype=float)
+    if calibration.mode == "pysared":
+        mm_per_pix = calibration.detector_width_mm / n
+        out = calibration.sign * np.degrees(
+            np.arctan((x_arr - calibration.x0) * mm_per_pix / calibration.sample_detector_distance_mm)
+        )
+    else:
+        out = calibration.sign * (x_arr - calibration.x0) * calibration.deg_per_pixel
+    return float(out) if scalar else np.asarray(out, dtype=float)
+
+
 def alpha_f_offsets(nx: int, calibration: AngleCalibration, *, edges: bool = False) -> np.ndarray:
     """α_f − (2θ − θ) for pixel centres (default) or the nx + 1 pixel edges."""
-    x = np.arange(nx + 1, dtype=float) if edges else np.arange(nx, dtype=float) + 0.5
-    return calibration.sign * (x - calibration.x0) * calibration.deg_per_pixel
+    n = _validate_nx(nx)
+    x = np.arange(n + 1, dtype=float) if edges else np.arange(n, dtype=float) + 0.5
+    return np.asarray(alpha_f_offset_for_pixel(x, n, calibration), dtype=float)
+
+
+def pixel_for_alpha_f_offset(
+    offset_deg,
+    nx: int,
+    calibration: AngleCalibration,
+) -> np.ndarray | float:
+    """Exact inverse of :func:`alpha_f_offset_for_pixel`: pixel coordinate ``x`` for ``α_f − (2θ − θ)``.
+
+    Returns edge-based pixel coordinate(s) ``x`` (pixel index is ``int(np.floor(x))``
+    when ``0 <= x < nx``):
+
+    * ``direct_beam`` mode: ``x0 + sign * offset_deg / deg_per_pixel``
+    * ``pysared`` mode: ``x0 + sign * (L / (detector_width_mm / nx)) * tan(radians(offset_deg))``
+      for ``|offset_deg| < 90°``; offsets with ``|offset_deg| >= 90°`` have no
+      preimage on a flat detector and return ``NaN``.
+    """
+    n = _validate_nx(nx)
+    scalar = np.ndim(offset_deg) == 0
+    off = np.asarray(offset_deg, dtype=float)
+    if calibration.mode == "pysared":
+        mm_per_pix = calibration.detector_width_mm / n
+        valid = np.isfinite(off) & (np.abs(off) < 90.0)
+        safe_off = np.where(valid, off, 0.0)
+        out = np.where(
+            valid,
+            calibration.x0
+            + calibration.sign
+            * (calibration.sample_detector_distance_mm / mm_per_pix)
+            * np.tan(np.radians(safe_off)),
+            np.nan,
+        )
+    else:
+        out = calibration.x0 + calibration.sign * off / calibration.deg_per_pixel
+    return float(out) if scalar else np.asarray(out, dtype=float)
 
 
 def alpha_angles(th, tth, nx: int, calibration: AngleCalibration):
@@ -612,13 +923,17 @@ __all__ = [
     "CalibrationError",
     "DETECTOR_WIDTH_MM",
     "DirectBeamFit",
+    "PYSARED_DEFAULT_DISTANCE_MM",
     "alpha_angles",
+    "alpha_f_offset_for_pixel",
     "alpha_f_offsets",
     "alpha_i_strip_edges",
     "calibrate",
+    "effective_deg_per_pixel",
     "find_direct_beam",
     "fit_direct_beam",
     "implied_distance_mm",
+    "pixel_for_alpha_f_offset",
     "pixel_pitch_mm",
     "specular_center",
 ]

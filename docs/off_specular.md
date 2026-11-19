@@ -16,17 +16,41 @@ zero and invalid pixels blank; it never substitutes a value.
 
 ## α_i / α_f geometry
 
-```
-α_i     = θ
-α_f(x)  = (2θ − θ) + s · (x − x₀) · Δ
-```
+Two per-scan calibration modes are available in `AngleCalibration` and in the
+Off-Specular calibration panel:
+
+1. **Direct-beam fit (`mode="direct_beam"`, default)** — linear pixel-to-angle
+   mapping calibrated directly from the transmitted beam streak:
+
+   ```
+   α_i     = θ
+   α_f(x)  = (2θ − θ) + s · (x − x₀) · Δ
+   ```
+
+2. **pySAred geometry (`mode="pysared"`)** — flat-detector `arctan` mapping
+   matching classic `pySAred`, parameterized by manual sample-to-detector
+   distance *L* (default `2500.0` mm, `PYSARED_DEFAULT_DISTANCE_MM`) and
+   detector width *W* (default `300.0` mm, `DETECTOR_WIDTH_MM`):
+
+   ```
+   mm_per_pix = W / nx
+   α_f(x)     = (2θ − θ) + s · degrees(arctan((x − x₀) · mm_per_pix / L))
+   ```
+
+   Its exact inverse `pixel_for_alpha_f_offset(offset_deg, nx, calibration)`
+   uses `x₀ + s · (L / mm_per_pix) · tan(radians(offset_deg))` for
+   `|offset_deg| < 90°` (returning `NaN` outside that range) and
+   `x₀ + s · offset_deg / Δ` in `direct_beam` mode, keeping crosshair selection
+   and constant-`Q` cuts exact in both modes. Switching modes preserves any
+   stored `DirectBeamFit`, `x₀`, `s`, and manual `L`/`W` values for that scan.
 
 | Symbol | Meaning | Source |
 | --- | --- | --- |
 | θ, 2θ | sample and detector angles of the frame | scan channels `th`, `tth` |
-| Δ | exit-angle step per displayed X pixel (°/px) | direct-beam fit |
-| s | +1 if α_f increases with X, −1 if it decreases | sign of the direct-beam fit |
-| x₀ | pixel whose exit angle is 2θ − θ | specular peak |
+| Δ | exit-angle step per displayed X pixel (°/px) | direct-beam fit (`direct_beam` mode) or effective `atan((W/nx)/L)` (`pysared` mode) |
+| L, W | sample-to-detector distance and detector width (mm) | manual geometry (`pysared` mode; defaults `2500 mm`, `300 mm`) |
+| s | +1 if α_f increases with X, −1 if it decreases | sign of the direct-beam fit (or manual) |
+| x₀ | pixel whose exit angle is 2θ − θ | specular peak (or manual) |
 
 The SuperADAM NeXus files contain `Detector1/sample_distance` and
 `Detector1/angular_width`, but in the example files both are written as 0, so
@@ -82,10 +106,10 @@ at most ~0.006°, less than one pixel (0.0082°). Fitting the direct beam with
 atan geometry instead does not reduce the residuals, so the data cannot tell
 the two apart. No sample-curvature correction is applied.
 
-**Sample-to-detector distance.** No distance is needed or entered: Δ is
-measured directly in degrees per pixel, and α_f, Qx and Qz follow from Δ, x₀,
-θ, 2θ and λ. The panel still shows the distance that Δ implies, as a check
-assuming nominal pixel pitch `p = 300 mm / nx`:
+**Sample-to-detector distance.** In **Direct-beam fit** mode no distance is
+needed or entered: Δ is measured directly in degrees per pixel, and α_f, Qx and
+Qz follow from Δ, x₀, θ, 2θ and λ. The panel still shows the distance that Δ
+implies, as a check assuming nominal pixel pitch `p = 300 mm / nx`:
 
 ```
 p = 300 mm / 1024 px = 0.2930 mm      L = p / tan(Δ)
@@ -94,8 +118,11 @@ p = 300 mm / 1024 px = 0.2930 mm      L = p / tan(Δ)
 (the SuperADAM detector is 300 mm × 300 mm; `DETECTOR_WIDTH_MM` in
 `core/reduction/angle_calibration.py`). For the example scans L ≈ 2051 mm
 (5572: 2050.8 mm, 5594: 2050.6 mm); an atan fit to the direct beam gives
-2047 mm. The value follows any manual change of Δ and is written to the export
-header. It is never used in an angle or Q conversion.
+2047 mm. In **Direct-beam fit** mode this implied distance follows any manual
+change of Δ and is written to the export header, but is never used in an angle
+or Q conversion. In **pySAred geometry** mode, by contrast, the entered *L*
+(`sample_detector_distance_mm`) and detector width *W* (`detector_width_mm`)
+directly drive the `arctan` pixel-to-angle conversion above.
 
 ## Reduction package layout
 
@@ -105,9 +132,11 @@ for backward compatibility):
 
 * `roi_extraction.py` — whole-pixel ROI bounds, 2D and Y-axis integration, and
   reflection peak tracking.
-* `angle_calibration.py` — direct-beam and specular pixel-to-angle calibration
-  (`AngleCalibration`, `DirectBeamFit`, `find_direct_beam`, `fit_direct_beam`,
-  `specular_center`, `calibrate`, `(α_i, α_f)` strip coordinates).
+* `angle_calibration.py` — direct-beam fit and classic `pySAred` flat-detector
+  pixel-to-angle calibration (`AngleCalibration`, `DirectBeamFit`,
+  `find_direct_beam`, `fit_direct_beam`, `specular_center`, `calibrate`,
+  `alpha_f_offsets`, `alpha_f_offset_for_pixel`, `pixel_for_alpha_f_offset`,
+  `effective_deg_per_pixel`, `(α_i, α_f)` strip coordinates).
 * `kinematics.py` — specular `Q`, off-specular `(Qx, Qz)` and inverse
   `(α_i, α_f)` mapping, pixel `Qz` step, and constant-`Qz` / constant-`Qx`
   iso-contours.

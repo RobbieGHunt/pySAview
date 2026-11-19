@@ -6,15 +6,22 @@ import numpy as np
 import pytest
 
 from pySAview.core.angle_calibration import (
+    DETECTOR_WIDTH_MM,
+    PYSARED_DEFAULT_DISTANCE_MM,
     AngleCalibration,
     CalibrationError,
     alpha_angles,
+    alpha_f_offset_for_pixel,
     alpha_f_offsets,
     alpha_i_strip_edges,
+    angles_from_q,
     calibrate,
+    effective_deg_per_pixel,
     fit_direct_beam,
     implied_distance_mm,
+    pixel_for_alpha_f_offset,
     pixel_pitch_mm,
+    q_from_angles,
 )
 from pySAview.ui.main_window import MainWindow
 
@@ -583,5 +590,288 @@ def test_nonfinite_and_negative_count_safety():
     bad_roi_counts[:, 11] = -np.inf
     with pytest.raises(CalibrationError):
         specular_center(bad_roi_counts, np.tile([5.0, 20.0], (3, 1)), min_counts=0.0)
+
+
+def test_pysared_mode_exact_arctan_offsets_and_edges():
+    nx = 1024
+    x0 = 370.5
+    cal = AngleCalibration.from_pysared(x0=x0, sign=-1, nx=nx)
+    assert cal.mode == "pysared"
+    assert cal.sample_detector_distance_mm == PYSARED_DEFAULT_DISTANCE_MM == 2500.0
+    assert cal.detector_width_mm == DETECTOR_WIDTH_MM == 300.0
+    assert cal.deg_per_pixel_source == "pySAred geometry"
+    assert cal.x0_source == "manual"
+    expected_dpp = np.degrees(np.arctan((300.0 / nx) / 2500.0))
+    assert cal.deg_per_pixel == pytest.approx(expected_dpp, rel=1e-14)
+    assert cal.distance_mm(pixel_pitch_mm(nx)) == pytest.approx(2500.0, rel=1e-14)
+    assert cal.distance_mm() == pytest.approx(2500.0, rel=1e-14)
+
+    # Exact pySAred arctan formula at pixel centres and pixel edges.
+    mm_per_pix = 300.0 / nx
+    x_centres = np.arange(nx, dtype=float) + 0.5
+    expected_centres = -np.degrees(np.arctan((x_centres - x0) * mm_per_pix / 2500.0))
+    offsets = alpha_f_offsets(nx, cal)
+    np.testing.assert_allclose(offsets, expected_centres, atol=1e-14)
+    assert offsets[370] == 0.0
+
+    x_edges = np.arange(nx + 1, dtype=float)
+    expected_edges = -np.degrees(np.arctan((x_edges - x0) * mm_per_pix / 2500.0))
+    np.testing.assert_allclose(alpha_f_offsets(nx, cal, edges=True), expected_edges, atol=1e-14)
+
+    # Must use true arctan geometry, distinct from the linear small-angle approximation at far pixels.
+    linear_far = -(x_centres[-1] - x0) * cal.deg_per_pixel
+    assert abs(offsets[-1] - linear_far) > 5e-3
+
+    # Custom sign (+1), detector width, distance, and nx.
+    cal_custom = AngleCalibration.from_pysared(
+        distance_mm=1500.0, x0=200.0, sign=1, detector_width_mm=200.0, nx=512
+    )
+    x_512 = np.arange(512, dtype=float) + 0.5
+    expected_custom = np.degrees(np.arctan((x_512 - 200.0) * (200.0 / 512) / 1500.0))
+    np.testing.assert_allclose(alpha_f_offsets(512, cal_custom), expected_custom, atol=1e-14)
+
+    # Scalar and arbitrary float pixel helper agrees identically.
+    xb = 354.25
+    scalar_off = alpha_f_offset_for_pixel(xb, nx, cal)
+    assert isinstance(scalar_off, float)
+    assert scalar_off == pytest.approx(
+        -np.degrees(np.arctan((xb - x0) * mm_per_pix / 2500.0)), abs=1e-14
+    )
+
+
+def test_pixel_for_alpha_f_offset_round_trip_both_modes():
+    nx = 1024
+    for sign in (-1, 1):
+        # Direct-beam linear mode round-trip (centres, edges, scalars).
+        cal_lin = AngleCalibration(0.008185, 369.9, sign)
+        off_c = alpha_f_offsets(nx, cal_lin)
+        x_back = pixel_for_alpha_f_offset(off_c, nx, cal_lin)
+        assert isinstance(x_back, np.ndarray)
+        np.testing.assert_allclose(x_back, np.arange(nx, dtype=float) + 0.5, atol=1e-12)
+        off_e = alpha_f_offsets(nx, cal_lin, edges=True)
+        np.testing.assert_allclose(
+            pixel_for_alpha_f_offset(off_e, nx, cal_lin), np.arange(nx + 1, dtype=float), atol=1e-12
+        )
+        px_scalar = pixel_for_alpha_f_offset(float(off_c[700]), nx, cal_lin)
+        assert isinstance(px_scalar, float)
+        assert px_scalar == pytest.approx(700.5, abs=1e-12)
+        assert np.isnan(pixel_for_alpha_f_offset(float("nan"), nx, cal_lin))
+
+        # pySAred arctan mode round-trip, including short distance where curvature is strong (~26 deg).
+        for dist, width in ((2500.0, 300.0), (300.0, 300.0), (1800.0, 240.0)):
+            cal_ps = AngleCalibration.from_pysared(
+                distance_mm=dist, x0=370.25, sign=sign, detector_width_mm=width, nx=nx
+            )
+            ps_off_c = alpha_f_offsets(nx, cal_ps)
+            ps_x_back = pixel_for_alpha_f_offset(ps_off_c, nx, cal_ps)
+            assert isinstance(ps_x_back, np.ndarray)
+            np.testing.assert_allclose(ps_x_back, np.arange(nx, dtype=float) + 0.5, atol=1e-11)
+
+            ps_off_e = alpha_f_offsets(nx, cal_ps, edges=True)
+            np.testing.assert_allclose(
+                pixel_for_alpha_f_offset(ps_off_e, nx, cal_ps),
+                np.arange(nx + 1, dtype=float),
+                atol=1e-11,
+            )
+
+            # Arbitrary wide offsets round-trip through inverse -> forward.
+            sample_offsets = np.array([-75.0, -20.0, -0.5, 0.0, 3.25, 45.0, 75.0])
+            x_inv = pixel_for_alpha_f_offset(sample_offsets, nx, cal_ps)
+            np.testing.assert_allclose(
+                alpha_f_offset_for_pixel(x_inv, nx, cal_ps), sample_offsets, atol=1e-11
+            )
+
+            # Scalar input returns Python float.
+            x_s = pixel_for_alpha_f_offset(float(ps_off_c[900]), nx, cal_ps)
+            assert isinstance(x_s, float)
+            assert x_s == pytest.approx(900.5, abs=1e-11)
+
+            # |offset_deg| >= 90 deg and non-finite offsets have no flat-detector preimage -> NaN.
+            oob = np.array([-120.0, -90.0, 90.0, 95.0, np.inf, -np.inf, np.nan])
+            res_oob = pixel_for_alpha_f_offset(oob, nx, cal_ps)
+            assert np.all(np.isnan(res_oob))
+            assert np.isnan(pixel_for_alpha_f_offset(90.0, nx, cal_ps))
+            assert np.isnan(pixel_for_alpha_f_offset(-95.0, nx, cal_ps))
+
+
+def test_pysared_mode_qx_qz_consistency():
+    nx = 1024
+    lam = 5.21
+    dist = 2500.0
+    width = 300.0
+    x0 = 370.5
+    sign = -1
+    th = np.array([0.5, 1.2, 2.4])
+    tth = 2.0 * th
+
+    cal = AngleCalibration.from_pysared(
+        distance_mm=dist, x0=x0, sign=sign, detector_width_mm=width, nx=nx
+    )
+    ai, af = alpha_angles(th, tth, nx, cal)
+    qx, qz = q_from_angles(ai[:, None], af, lam)
+
+    # Compare directly against pySAred's explicit equations.
+    k0 = 2.0 * np.pi / lam
+    mm_per_pix = width / nx
+    x = np.arange(nx, dtype=float) + 0.5
+    af_ref = (tth - th)[:, None] + sign * np.degrees(np.arctan((x - x0) * mm_per_pix / dist))[None, :]
+    qx_ref = k0 * (np.cos(np.radians(af_ref)) - np.cos(np.radians(th[:, None])))
+    qz_ref = k0 * (np.sin(np.radians(af_ref)) + np.sin(np.radians(th[:, None])))
+    np.testing.assert_allclose(qx, qx_ref, atol=1e-15)
+    np.testing.assert_allclose(qz, qz_ref, atol=1e-15)
+
+    # Specular pixel (x = x0 = 370.5 -> index 370) sits on Qx = 0, Qz = (4pi/lam) sin(th).
+    np.testing.assert_allclose(qx[:, 370], 0.0, atol=1e-15)
+    np.testing.assert_allclose(qz[:, 370], 2.0 * k0 * np.sin(np.radians(th)), atol=1e-12)
+
+    # Full inverse round-trip: (Qx, Qz) -> (alpha_i, alpha_f) -> pixel coordinate x.
+    for row_idx in range(th.size):
+        for px in (25, 200, 370, 600, 950):
+            ai_b, af_b = angles_from_q(qx[row_idx, px], qz[row_idx, px], lam)
+            assert ai_b == pytest.approx(th[row_idx], abs=1e-10)
+            x_b = pixel_for_alpha_f_offset(af_b - (tth[row_idx] - th[row_idx]), nx, cal)
+            assert x_b == pytest.approx(px + 0.5, abs=1e-10)
+
+
+def test_mode_switching_preserves_fit_and_describe():
+    counts, tth = _synthetic(n=60)
+    cal_db = calibrate(counts, tth, np.tile([385.0, 415.0], (tth.size, 1)), y_rows=(12, 900))
+    assert cal_db.mode == "direct_beam"
+    assert cal_db.fit is not None
+    assert cal_db.sample_detector_distance_mm == PYSARED_DEFAULT_DISTANCE_MM
+    assert cal_db.detector_width_mm == DETECTOR_WIDTH_MM
+
+    # Switch to pySAred mode: fit, fit_y_rows, x0, x0_source, and sign are preserved; original untouched.
+    cal_ps = cal_db.with_mode("pysared", nx=1024)
+    assert cal_db.mode == "direct_beam"
+    assert cal_ps.mode == "pysared"
+    assert cal_ps.fit is cal_db.fit
+    assert cal_ps.fit_y_rows == (12, 900)
+    assert cal_ps.x0 == cal_db.x0 and cal_ps.x0_source == "specular peak"
+    assert cal_ps.sign == cal_db.sign
+    assert cal_ps.deg_per_pixel == pytest.approx(effective_deg_per_pixel(2500.0, 1024, 300.0), rel=1e-14)
+    assert cal_ps.deg_per_pixel_source == "pySAred geometry"
+
+    # Update pySAred geometry parameters while keeping fit.
+    cal_ps2 = cal_ps.with_pysared(distance_mm=2100.0, detector_width_mm=280.0, x0=405.0, nx=1024)
+    assert cal_ps2.mode == "pysared"
+    assert cal_ps2.sample_detector_distance_mm == 2100.0
+    assert cal_ps2.detector_width_mm == 280.0
+    assert cal_ps2.x0 == 405.0 and cal_ps2.x0_source == "manual"
+    assert cal_ps2.fit is cal_db.fit
+    assert cal_ps2.deg_per_pixel == pytest.approx(effective_deg_per_pixel(2100.0, 1024, 280.0), rel=1e-14)
+
+    # Switch back to direct_beam: restores fit.deg_per_pixel and remembers L/W for next toggle.
+    cal_back = cal_ps2.with_mode("direct_beam")
+    assert cal_back.mode == "direct_beam"
+    assert cal_back.fit is cal_db.fit
+    assert cal_back.fit_y_rows == (12, 900)
+    assert cal_back.deg_per_pixel == pytest.approx(cal_db.fit.deg_per_pixel, rel=1e-14)
+    assert cal_back.deg_per_pixel_source == "direct-beam fit"
+    assert cal_back.sample_detector_distance_mm == 2100.0
+    assert cal_back.detector_width_mm == 280.0
+    assert cal_back.x0 == 405.0 and cal_back.x0_source == "manual"
+
+    # Switching back to pysared remembers L=2100 and W=280.
+    cal_ps3 = cal_back.with_mode("pysared", nx=1024)
+    assert cal_ps3.sample_detector_distance_mm == 2100.0
+    assert cal_ps3.detector_width_mm == 280.0
+    assert cal_ps3.deg_per_pixel == pytest.approx(effective_deg_per_pixel(2100.0, 1024, 280.0), rel=1e-14)
+
+    # No-op direct_beam switch keeps manual deg_per_pixel intact.
+    cal_manual = cal_db.with_manual(deg_per_pixel=0.009)
+    assert cal_manual.with_mode("direct_beam") is cal_manual
+
+    # Switching a fit-less pySAred calibration to direct_beam keeps valid positive deg_per_pixel as manual.
+    cal_no_fit = AngleCalibration.from_pysared(distance_mm=2400.0, x0=370.0, sign=-1, nx=1024)
+    cal_no_fit_db = cal_no_fit.with_mode("direct_beam")
+    assert cal_no_fit_db.mode == "direct_beam"
+    assert cal_no_fit_db.fit is None
+    assert cal_no_fit_db.deg_per_pixel == pytest.approx(cal_no_fit.deg_per_pixel, rel=1e-14)
+    assert cal_no_fit_db.deg_per_pixel_source == "manual"
+
+    # Describe outputs clear mode-specific summaries.
+    pitch = pixel_pitch_mm(1024)
+    desc_db = cal_db.describe(pitch)
+    assert "Implied sample–detector distance" in desc_db
+    assert "Direct-beam fit:" in desc_db
+    desc_ps = cal_ps2.describe(pixel_pitch_mm(1024, 280.0))
+    assert "pySAred geometry: L = 2100 mm, detector width = 280 mm" in desc_ps
+    assert "Effective scale" in desc_ps
+    assert "Direct-beam fit:" in desc_ps
+    desc_ps_no_pitch = cal_no_fit.describe()
+    assert "pySAred geometry: L = 2400 mm, detector width = 300 mm" in desc_ps_no_pitch
+    assert "Effective scale" in desc_ps_no_pitch
+
+
+def test_pysared_validation_errors():
+    valid = AngleCalibration.from_pysared(distance_mm=2500.0, x0=370.0, sign=-1, nx=1024)
+
+    for bad_pos in (0.0, -100.0, float("nan"), float("inf"), -float("inf"), True, False, "2500"):
+        with pytest.raises(ValueError):
+            AngleCalibration(0.01, 370.0, -1, sample_detector_distance_mm=bad_pos)
+        with pytest.raises(ValueError):
+            AngleCalibration(0.01, 370.0, -1, detector_width_mm=bad_pos)
+        with pytest.raises(ValueError):
+            AngleCalibration.from_pysared(distance_mm=bad_pos, x0=370.0)
+        with pytest.raises(ValueError):
+            AngleCalibration.from_pysared(detector_width_mm=bad_pos, x0=370.0)
+        with pytest.raises(ValueError):
+            valid.with_pysared(distance_mm=bad_pos)
+        with pytest.raises(ValueError):
+            valid.with_pysared(detector_width_mm=bad_pos)
+        with pytest.raises(ValueError):
+            effective_deg_per_pixel(bad_pos, 1024)
+        with pytest.raises(ValueError):
+            effective_deg_per_pixel(2500.0, 1024, detector_width_mm=bad_pos)
+        with pytest.raises(ValueError):
+            AngleCalibration(bad_pos, 370.0, -1)
+
+    with pytest.raises(ValueError):
+        AngleCalibration(0.01, 370.0, -1, sample_detector_distance_mm=None)
+    with pytest.raises(ValueError):
+        AngleCalibration(0.01, 370.0, -1, detector_width_mm=None)
+    with pytest.raises(ValueError):
+        AngleCalibration.from_pysared(distance_mm=None, x0=370.0)
+
+    for bad_mode in ("invalid", "", None, 1):
+        with pytest.raises(ValueError):
+            AngleCalibration(0.01, 370.0, -1, mode=bad_mode)
+        with pytest.raises(ValueError):
+            valid.with_mode(bad_mode)
+
+    for bad_sign in (0, 2, -2, True, False):
+        with pytest.raises(ValueError):
+            AngleCalibration(0.01, 370.0, bad_sign)
+        with pytest.raises(ValueError):
+            AngleCalibration.from_pysared(x0=370.0, sign=bad_sign)
+        with pytest.raises(ValueError):
+            valid.with_pysared(sign=bad_sign)
+
+    for bad_x0 in (float("nan"), float("inf"), True, False):
+        with pytest.raises(ValueError):
+            AngleCalibration(0.01, bad_x0, -1)
+        with pytest.raises(ValueError):
+            AngleCalibration.from_pysared(x0=bad_x0)
+
+    for bad_nx in (0, -10, True, False, 1024.5):
+        with pytest.raises(ValueError):
+            AngleCalibration.from_pysared(nx=bad_nx)
+        with pytest.raises(ValueError):
+            alpha_f_offsets(bad_nx, valid)
+        with pytest.raises(ValueError):
+            alpha_f_offset_for_pixel(370.5, bad_nx, valid)
+        with pytest.raises(ValueError):
+            pixel_for_alpha_f_offset(0.0, bad_nx, valid)
+        with pytest.raises(ValueError):
+            pixel_pitch_mm(bad_nx)
+
+    with pytest.raises(ValueError):
+        valid.with_mode("pysared", deg_per_pixel=0.01)
+
+    cal_db = AngleCalibration(0.01, 370.0, -1)
+    with pytest.raises(ValueError):
+        cal_db.distance_mm()
+
 
 
