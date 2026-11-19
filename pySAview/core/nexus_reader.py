@@ -459,6 +459,36 @@ class NexusReader:
         except Exception:
             return None
 
+    def get_virtual_slit_widths(self) -> tuple[float, float] | None:
+        """Read scalar horizontal slit openings ``(s1h, s2h)`` in mm from ``SUPERADAM/VirtualSlit``."""
+        vs = self.file.get("entry0/SUPERADAM/VirtualSlit")
+        if not isinstance(vs, h5py.Group):
+            return None
+        try:
+            s1_raw = vs["s1h_actual_width"][()]
+            s2_raw = vs["s2h_actual_width"][()]
+            s1 = float(np.asarray(s1_raw).flat[0])
+            s2 = float(np.asarray(s2_raw).flat[0])
+            if np.isfinite(s1) and np.isfinite(s2) and s1 > 0 and s2 > 0:
+                return (round(s1, 8), round(s2, 8))
+        except Exception:
+            return None
+        return None
+
+    def compute_y_integrated_map(self, y_range: tuple[float, float] | None = None):
+        """Return an ``OffSpecularMap`` integrated along ``y_range`` for the 2D detector."""
+        ds = self._get_detector_dataset()
+        if ds is None or ds.ndim != 3:
+            return None
+        from pySAview.core.off_specular import compute_off_specular_map
+
+        return compute_off_specular_map(
+            ds,
+            y_range=y_range,
+            cancelled=self._cancelled,
+            source_path=str(self.path),
+        )
+
     def compute_full_scan_roi(
         self, roi: tuple[float, float, float, float], *, parallel: bool = True
     ) -> np.ndarray | None:
@@ -718,6 +748,14 @@ class NexusReader:
                     data=roi_counts,
                 )
 
+        slit_defaults = self.get_virtual_slit_widths()
+        from pySAview.core.reduction.background import default_bkg_x_bounds
+        from pySAview.core.reduction.pysared import ReductionParams
+
+        red_params = ReductionParams()
+        if has_det and roi and det_shape is not None:
+            red_params.bkg_x_bounds = default_bkg_x_bounds(roi[0], roi[1], nx=int(det_shape[1]))
+
         return ScanData(
             file_path=str(self.path),
             metadata=meta,
@@ -727,4 +765,6 @@ class NexusReader:
             detector_shape=det_shape,
             detector_roi=roi,
             detector_path=det_path if has_det else "",
+            reduction_params=red_params,
+            slit_defaults=slit_defaults,
         )

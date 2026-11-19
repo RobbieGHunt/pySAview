@@ -15,8 +15,8 @@ def test_independent_spin_line_and_marker_styles(qtbot):
     data.variables["Flipper1"] = ScanVariable(3, "Flipper1", "F1", "", "", 0, False, np.array([0, 1, 0]))
     view.add_scan(data)
     view.chk_log_y.setChecked(False)
-    tab = view.control_tabs.widget(1)
-    assert view.control_tabs.tabText(1) == "Chart Display Options"
+    tabs = [view.control_tabs.tabText(i) for i in range(view.control_tabs.count())]
+    assert tabs == ["Data & Processing", "Reduction", "Chart Display Options"]
     controls = view.spin_style_controls["u"]
     controls["line_style"].setCurrentIndex(controls["line_style"].findData("dashed"))
     controls["line_width"].setValue(4)

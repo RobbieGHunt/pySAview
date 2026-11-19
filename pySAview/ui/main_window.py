@@ -103,6 +103,7 @@ class MainWindow(QMainWindow):
         # Image/data exports from any tab must refuse every loaded measurement file.
         for view in (self.view_hierarchy, self.view_detector, self.view_offspec):
             view.session_source_paths = self._loaded_source_paths
+        self.view_charts.reader_provider = self.loaded_readers.get
 
         self.tabs.addTab(self.view_hierarchy, "File Hierarchy")
         self.tabs.addTab(self.view_charts, "Scan Charts")
@@ -117,8 +118,14 @@ class MainWindow(QMainWindow):
         self.session_files_view.add_requested.connect(self._on_action_add)
         self.session_files_view.close_requested.connect(self.close_active_file)
 
-        # Connect interactive ROI signal
+        # Connect interactive ROI, background ROI, and curvature synchronization signals
         self.view_detector.roi_applied.connect(self._on_detector_roi_applied)
+        self.view_detector.bkg_roi_changed.connect(self._on_detector_bkg_roi_changed)
+        self.view_offspec.curvature_changed.connect(self._on_offspec_curvature_changed)
+        self.view_charts.curvature_changed.connect(self._on_charts_curvature_changed)
+        self.view_charts.background_toggled.connect(self._on_charts_background_toggled)
+        self.view_charts.jump_to_detector_requested.connect(lambda: self.tabs.setCurrentWidget(self.view_detector))
+        self.view_charts.jump_to_offspec_requested.connect(lambda: self.tabs.setCurrentWidget(self.view_offspec))
 
         # Menu Bar & Actions
         self._create_actions_and_menus()
@@ -238,6 +245,9 @@ class MainWindow(QMainWindow):
         self.act_export_refl_data.setShortcut(QKeySequence("Ctrl+Shift+E"))
         self.act_export_refl_data.setToolTip("Plotted Scan Charts curves with each scan's ROI, normalization and intervals")
         self.act_export_refl_data.triggered.connect(lambda: self.view_charts.export_data())
+        self.act_export_pysared_dat = QAction("&pySAred Reflectivity (.dat)…", self)
+        self.act_export_pysared_dat.setToolTip("Space-delimited 3- or 4-column pySAred 1.5.3 .dat file(s) (angle  I  dI  [Resolution])")
+        self.act_export_pysared_dat.triggered.connect(lambda: self.view_charts.export_pysared_dat())
         self.act_export_refl_image = QAction("Reflectivity &Plot Image (PNG/SVG)…", self)
         self.act_export_refl_image.triggered.connect(lambda: self.view_charts.export_image())
         self.act_export_offspec_data = QAction("&Off-Specular Map Data (tab-delimited)…", self)
@@ -247,6 +257,7 @@ class MainWindow(QMainWindow):
         self.act_export_offspec_image.triggered.connect(lambda: self._export_offspec(image=True))
 
         self.menu_export.addAction(self.act_export_refl_data)
+        self.menu_export.addAction(self.act_export_pysared_dat)
         self.menu_export.addAction(self.act_export_refl_image)
         self.menu_export.addSeparator()
         self.menu_export.addAction(self.act_export_offspec_data)
@@ -261,7 +272,7 @@ class MainWindow(QMainWindow):
         has_curves = self.view_charts.has_export_data()
         scan = self.view_offspec.scan_data
         has_detector = bool(scan is not None and scan.has_detector_2d)
-        for action in (self.act_export_refl_data, self.act_export_refl_image):
+        for action in (self.act_export_refl_data, self.act_export_pysared_dat, self.act_export_refl_image):
             action.setEnabled(has_curves)
         for action in (self.act_export_offspec_data, self.act_export_offspec_image):
             action.setEnabled(has_detector)
@@ -633,6 +644,7 @@ class MainWindow(QMainWindow):
 
         # Update views (share the already-open read-only reader with File Hierarchy)
         self.view_hierarchy.set_reader(reader, owned=False)
+        self.view_charts.set_active_scan(scan_data)
         self.view_detector.set_data(reader, scan_data)
         self.view_offspec.set_data(scan_data)
         self.view_metadata.set_data(scan_data)
@@ -691,6 +703,7 @@ class MainWindow(QMainWindow):
             self.view_hierarchy.close()
             self.view_hierarchy.tree.clear()
             self.view_offspec.set_data(None)
+            self.view_charts.set_active_scan(None)
             self.setWindowTitle("SuperADAM NeXus Explorer")
             self.status_bar.showMessage("Ready. Open one or more NeXus (.nxs) files to begin.")
 
@@ -725,6 +738,24 @@ class MainWindow(QMainWindow):
         self.status_bar.showMessage(
             f"User ROI Applied to Scan Charts: X [{x0:.0f}..{x1:.0f}], Y [{y0:.0f}..{y1:.0f}]  |  Total ROI Counts: {np.sum(roi_counts):,.0f}"
         )
+
+    def _on_detector_bkg_roi_changed(self, _file_path: str) -> None:
+        """Sync background ROI edits from Detector Image into Scan Charts and 2D Map."""
+        self.view_charts.refresh_reduction()
+        self.view_offspec.refresh_reduction()
+
+    def _on_offspec_curvature_changed(self, _file_path: str) -> None:
+        """Sync curvature changes from 2D Map into Scan Charts."""
+        self.view_charts.refresh_reduction()
+
+    def _on_charts_curvature_changed(self, _file_path: str) -> None:
+        """Sync curvature changes from Scan Charts into 2D Map."""
+        self.view_offspec.refresh_reduction()
+
+    def _on_charts_background_toggled(self, _file_path: str) -> None:
+        """Sync background subtraction toggle from Scan Charts into Detector Image and 2D Map."""
+        self.view_detector.sync_from_scan()
+        self.view_offspec.refresh_reduction()
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
         if event.mimeData().hasUrls():

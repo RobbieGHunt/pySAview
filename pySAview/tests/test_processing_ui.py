@@ -34,16 +34,20 @@ def set_mode(view, mode):
     view.combo_norm.setCurrentIndex(view.combo_norm.findData(mode))
 
 
-def test_exact_intervals_and_log_hidden_zero_remain_in_table(view):
+def test_pysared_uncertainties_and_log_hidden_zero_remain_in_table(view):
     view.add_scan(scan())
     assert len(view._current_curves) == 1
     curve = view._current_curves[0]
     assert curve.y[0] == 0
-    assert curve.y_upper[0] > 1.8
-    assert "Garwood" in view.processing_status
+    # pySAred 1.5.3 rule: dI = 1 when I == 0, displayed at default 1σ
+    assert curve.y_err[0] == pytest.approx(1.0)
+    assert curve.y_upper[0] == pytest.approx(1.0)
+    assert curve.y_lower[0] == pytest.approx(-1.0)
+    assert "pySAred 1.5.3" in view.processing_status
     assert "Log axes hide" in view.processing_status
     assert view.curve_data_table.rowCount() == 3
-    assert float(view.curve_data_table.item(0, 7).text()) > 1.8
+    assert float(view.curve_data_table.item(0, 5).text()) == pytest.approx(1.0)
+    assert float(view.curve_data_table.item(0, 7).text()) == pytest.approx(1.0)
 
 
 def test_missing_monitor_skips_scan_without_raw_fallback(view):
@@ -149,15 +153,15 @@ def test_export_retains_interval_precision_method_and_processing(view, tmp_path,
     text = " ".join(header)
     assert "Normalization: monitor_time" in text
     assert "Reference monitor rate: 123.456789" in text
-    assert "conditional exact" in text and "source: first.nxs" in text
+    assert "pySAred 1.5.3" in text and "source: first.nxs" in text
     assert "Log axes hide" in view.processing_status
     np.testing.assert_array_equal([float(r["UpperBound"]) for r in rows], view._current_curves[0].y_upper)
 
 
 def test_processing_label_shows_only_warnings(view):
     view.add_scan(scan())
-    assert "Garwood" in view.processing_status or "exact" in view.processing_status
-    assert "Processing:" not in view.lbl_processing.text()
+    assert "pySAred 1.5.3" in view.processing_status
+    assert "Processing" not in view.lbl_processing.text()
     assert view.lbl_processing.isHidden() == (view.lbl_processing.text() == "")
 
 
@@ -191,11 +195,10 @@ def test_unknown_time_units_are_not_assumed_to_be_seconds(view):
     assert "must have units of seconds" in view.processing_status
 
 
-def test_explicit_variance_fallback_is_visible(view):
+def test_explicit_variance_overrides_count_rule_and_is_recorded(view):
     data = scan()
     data.variables["Detector1"].variance = np.array([4, 100, 200])
     view.add_scan(data)
     assert "propagated standard uncertainty" in view.processing_status
-    assert "Exact intervals unavailable" in view.lbl_processing.text()  # requested method not used: visible
-    assert "exact" not in view.processing_status
+    assert "propagated standard uncertainty" in view._current_curves[0].uncertainty_method
     assert view._current_curves[0].y_err[0] == 2

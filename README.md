@@ -32,14 +32,15 @@ inspection and check files in **Loaded Scans** to compare them on the chart.
 | Tab | Purpose |
 | --- | --- |
 | **File Hierarchy** | Browse datasets and attributes; preview data as plots, images, tables or text. |
-| **Scan Charts** | Plot selected channels, compare scans, separate spin states, normalize counts and display uncertainties. |
-| **Detector Image** | Browse detector frames (or pooled u + d pairs), define or track an ROI, inspect profiles and apply ROI counts to the chart. |
-| **2D Map** | Heatmap of every detector frame integrated along Y (full height, scan ROI or custom rows), shown as X pixel versus θ (default) or scan point, α_i versus α_f or Qx versus Qz, with spin selection, pooled u + d sum or spin asymmetry, normalization and crosshair cuts. |
+| **Scan Charts** | Plot selected channels, compare scans, separate spin states, normalize counts, and apply per-scan pySAred 1.5.3 data reduction (overillumination, curvature, background subtraction, angle offset, resolution, scale factor, trimming). |
+| **Detector Image** | Browse detector frames (or pooled u + d pairs), define or track a signal ROI and optional width/Y-locked background ROI, inspect profiles and apply ROI counts to the chart. |
+| **2D Map** | Heatmap of every detector frame integrated along Y (full height, scan ROI or custom rows), shown as X pixel versus θ (default) or scan point, α_i versus α_f or Qx versus Qz, with spin selection, pooled u + d sum or spin asymmetry, per-scan sample curvature alignment, live ROI-summed profile cut, normalization and draggable cuts. |
 | **Metadata & Motors** | View experiment details, sample environment and instrument positions. |
 
-Chart processing includes angle-to-Q conversion, time or monitor normalization,
-and selectable **1σ–6σ** uncertainty bounds, defaulting to **2σ**. Spin separation
-uses Flipper ON/0 for **d/down** and OFF/1 for **u/up**.
+Chart processing follows **pySAred 1.5.3** conventions, including angle-to-Q conversion,
+time or monitor normalization, selectable **1σ–6σ** display error bounds (defaulting to
+**1σ**), and per-scan data reduction in the **Reduction** sub-tab. Spin separation uses
+Flipper ON/0 for **d/down** and OFF/1 for **u/up**.
 
 **Chart Display Options** controls spin colormaps, a shared shade range, lines,
 markers, axis fonts, legend visibility and waterfall offsets.
@@ -53,9 +54,10 @@ export image); hover a button for its name.
 
 | Entry | Contents |
 | --- | --- |
-| **Reflectivity Data (tab-delimited)** (Ctrl+Shift+E) | The curves plotted in Scan Charts, each scan with its own ROI: step index, X, Y, 1σ standard uncertainty and the plotted interval bounds. `#` header lines record normalization, wavelength, the processing description, warnings and each curve's source file and uncertainty method. |
+| **Reflectivity Data (tab-delimited)** (Ctrl+Shift+E) | The curves plotted in Scan Charts, each scan with its own ROI and reduction settings: step index, X, Y, 1σ standard uncertainty, plotted interval bounds and optional `ResolutionSigma`. `#` header lines record normalization, wavelength, reduction parameters, the processing description, warnings and each curve's source file and uncertainty method. |
+| **pySAred Reflectivity (.dat)…** | Space-delimited 3- or 4-column headerless `.dat` file(s) (`angle  I  dI  [Resolution_sigma]`) matching pySAred 1.5.3 in Qz, Degrees or Radians. |
 | **Reflectivity Plot Image** | The chart as PNG or SVG. |
-| **Off-Specular Map Data (tab-delimited)** | The active scan's map in the current axes (X pixel vs point or θ, α_i/α_f, or Qx/Qz), spin selection or asymmetry and normalization: one row per frame and pixel with its coordinates, value and 1σ uncertainty. |
+| **Off-Specular Map Data (tab-delimited)** | The active scan's map in the current axes (X pixel vs point or θ, α_i/α_f, or Qx/Qz), spin selection or asymmetry, curvature and normalization: one row per frame and pixel with its coordinates, value and 1σ uncertainty. |
 | **Off-Specular Map Image** | The map as PNG or SVG. |
 
 Data files are tab-separated text with `#` comment lines, readable by
@@ -69,8 +71,9 @@ ROI definitions can be saved and loaded as JSON files. File loading supports
 progress and cancellation. The last load folder and display preferences are
 remembered between launches.
 
-See [Normalization and uncertainty](docs/normalization.md) for calculation
-methods and statistical conventions.
+See [Normalization and uncertainty](docs/normalization.md) and
+[Data reduction (pySAred 1.5.3)](docs/reduction.md) for calculation methods,
+standalone reduction scripts and statistical conventions.
 
 The α_i–α_f view is calibrated per scan from the direct beam visible in the
 detector images; see [Off-specular angle calibration](docs/off_specular.md).

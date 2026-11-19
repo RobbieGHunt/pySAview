@@ -1,8 +1,11 @@
 # Normalization and uncertainty
 
-pySAview is a viewer for SuperADAM scan channels. Monitor-normalized intensity
-is not absolute reflectivity: no direct-beam, footprint, transmission, detector
-efficiency, dead-time, or polarization correction is implied by these controls.
+pySAview is a viewer and data-reduction interface for ILL SuperADAM scan channels,
+aligned with **pySAred v1.5.3** (`pySAred_V1.5.3.py`). Monitor-normalized intensity
+alone is not absolute reflectivity: direct-beam normalization is not implied unless
+applied explicitly (see [Data reduction](reduction.md) for overillumination,
+sample curvature, background ROI subtraction, angle offset, resolution, and `.dat`
+export).
 
 ## Definitions
 
@@ -27,14 +30,42 @@ reference-rate calibration has uncertainty, that needs a separate model.
 `monitor_time` and `monitor_cps` are internal names retained for the last
 mode; it requires monitor counts but not a second division by dwell time.
 
-## Standard uncertainties
+## pySAred 1.5.3 uncertainty convention (Scan Charts)
 
-Unweighted Poisson observations have plug-in variance estimates `v_N = N`
-and `v_M = M`. Independent supplied variance arrays can replace these
-estimates for weighted/processed observations. Supplied errors are squared
-once; supplied variances are not squared again.
+**Scan Charts** uses the counting-uncertainty and propagation rules from
+`pySAred 1.5.3` (`pySAview/core/reduction.py`):
 
-Using first-order derivatives for independent observations:
+1. **Raw count uncertainty**:
+   ```
+   dI = 1           when I = 0
+   dI = sqrt(I)     when I > 0
+   ```
+2. **Background subtraction** (applied **before** monitor or dwell-time division,
+   for points with `Qz > bkg_skip_qz` and `I_bkg > 0`):
+   ```
+   dI = sqrt(I + I_bkg)
+   I  = I - I_bkg
+   ```
+3. **Exposure propagation**:
+   ```
+   Raw:      val = I,            sigma = dI
+   Time:     val = I / t,        sigma = dI / t
+   Monitor:  val = I / M,        sigma = sqrt((dI / M)**2 + I**2 / M**3)
+   Ref rate: val = r_ref * I/M,  sigma = r_ref * sqrt((dI / M)**2 + I**2 / M**3)
+   ```
+   For `I > 0`, `sqrt((dI / M)**2 + I**2 / M**3)` is algebraically identical to
+   pySAred's `(I / M) * sqrt((dI / I)**2 + 1 / M)` while avoiding division by zero
+   at `I = 0` and staying nonnegative if background subtraction yields `I < 0`.
+4. **Overillumination and manual scale factor**:
+   When enabled, both `val` and `sigma` are divided by `c₀` and/or `scale_factor`.
+5. **Display Sigma selector**:
+   The **Sigma** selector in Scan Charts defaults to **1σ** (matching pySAred 1.5.3)
+   and scales the plotted symmetric bounds to `value ± selected_sigma * sigma` for
+   `1σ`–`6σ`. The numerical `StdUncertainty` table/export column and pySAred `.dat`
+   `dI` column always retain the **1σ** standard uncertainty.
+
+Independent supplied variance arrays (`ScanVariable.variance`) override the raw
+count rule using first-order propagation:
 
 ```
 var(N)       = v_N
@@ -43,29 +74,17 @@ var(N / M)   = v_N / M**2 + N**2 * v_M / M**4
 var(r*N / M) = r**2 * var(N / M)
 ```
 
-Dwell time is treated as known exposure. The ratio formula is evaluated
-directly, without relative-error divisions by `N` or an arbitrary count floor.
-If the selected numerator is Monitor1 itself, the shared measurement cancels:
+Supplied errors are squared once; supplied variances are not squared again.
+If the selected numerator is `Monitor1` itself, the shared measurement cancels:
 `M/M = 1` (or `r_ref` in reference-rate mode), with zero statistical uncertainty
-for positive valid `M`. It must not be treated as two independent observations.
+for positive valid `M`. It is never treated as two independent observations.
 
-These standard uncertainties are estimates and first-order propagation is
-an approximation; it is **not** an exact low-count confidence interval.
-At `N=0`, the plug-in Poisson standard uncertainty is zero, while the exact
-confidence interval has a nonzero upper bound. Both are identified separately
-in the table and export, so zero standard uncertainty cannot be mistaken for
-proof that the underlying intensity is exactly zero.
+## Exact counting confidence intervals (`core/normalization.py`)
 
-## Exact counting confidence intervals
-
-The **Sigma** selector defaults to **2σ**, equivalent to equal-tailed
-**95.44997361036415% confidence limits**. Choices 1σ through 6σ use
-`confidence = erf(sigma / sqrt(2))` (1σ ≈ 68.27%, 3σ ≈ 99.73%).
-These are exact count confidence intervals at Gaussian-equivalent coverage,
-not symmetric error bars or a multiplication of the 1σ bounds. Because counts
-are discrete, coverage is at least nominal and can exceed it.
-
-For raw counts, Garwood limits on the Poisson mean are:
+For standalone statistical analysis and **Off-Specular** normalization,
+`pySAview/core/normalization.py` retains exact Garwood Poisson limits and
+Clopper-Pearson Poisson-ratio limits at Gaussian-equivalent coverage
+`confidence = erf(sigma / sqrt(2))` (`1σ`–`6σ`):
 
 ```
 lower = 0                               when N = 0
@@ -73,28 +92,10 @@ lower = 0.5 * chi2.ppf(alpha/2, 2*N)     otherwise
 upper = 0.5 * chi2.isf(alpha/2, 2*(N+1))
 ```
 
-Divide these bounds by the known exposure for time-normalized rates.
-For zero counts, the default 2σ raw interval is `[0, 3.783184333...]`;
-at 1σ it is `[0, 1.841021645...]`. The selector applies to exact Poisson
-and Poisson-ratio intervals, including known-exposure and fixed-reference
-scaling. Exported standard uncertainties remain 1σ; explicit variance
-inputs and propagated-uncertainty mode use first-order bounds of
-`value ± selected_sigma * standard_uncertainty`, also defaulting to 2σ.
-These approximate propagated bounds are not exact Poisson intervals. The selected coverage is recorded in the interval method.
-
 For independent detector and monitor Poisson counts measured simultaneously,
-conditioning on `N+M` gives a binomial observation with
-`p = lambda_N / (lambda_N + lambda_M)`. Compute exact Clopper-Pearson
-limits for `p`, then transform using `p/(1-p)` to obtain limits on the ratio
-of Poisson means. Scale these limits by the fixed reference rate when selected.
-Thus uncertainty in the monitor is included; it is not treated as exact.
-
-Exact intervals apply only to finite, nonnegative integer, unweighted counts
-with an independent Poisson monitor. Explicit variance arrays use propagated
-standard uncertainty, and the processing description says so even if the exact option is selected.
-Background-subtracted data, detector/monitor covariance other than the identical
-Monitor1 channel, weighted pixels, dead time, and systematic calibration errors
-need additional models; no exact Poisson claim is made for them.
+conditioning on `N+M` yields a binomial proportion with Clopper-Pearson limits
+transformed via `p/(1-p)`. Exact intervals apply only to finite, nonnegative
+integer, unweighted counts without background subtraction.
 
 ## Validation and display
 

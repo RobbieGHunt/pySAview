@@ -34,32 +34,34 @@ def test_invalid_sigma_rejected(level):
         normalize_signal([1], sigma_level=level)
 
 
-def test_sigma_changes_exact_bounds_not_values_or_standard_uncertainties(qtbot, monkeypatch, tmp_path):
+def test_sigma_changes_display_bounds_not_values_or_standard_uncertainties(qtbot, monkeypatch, tmp_path):
     view = ScanPlotView()
     qtbot.addWidget(view)
     view.add_scan(scan())
-    assert view.combo_sigma.currentData() == 2
+    # pySAred 1.5.3 convention defaults to 1σ display bounds
+    assert view.combo_sigma.currentData() == 1
     assert view.bottom_tabs.count() == 1
     assert view.bottom_tabs.tabText(0) == "Plotted Data Points"
     assert not hasattr(view, "stats_table")
     original = view._current_curves[0]
+    np.testing.assert_allclose(original.y_err, [1.0, 10.0, np.sqrt(200.0)])
+    np.testing.assert_allclose(original.y_upper, original.y + original.y_err)
     view.combo_sigma.setCurrentIndex(view.combo_sigma.findData(3))
     changed = view._current_curves[0]
     np.testing.assert_array_equal(changed.y, original.y)
     np.testing.assert_array_equal(changed.y_err, original.y_err)
-    assert np.all(changed.y_upper > original.y_upper)
-    assert "3 sigma equivalent" in view.processing_status
+    np.testing.assert_allclose(changed.y_upper, changed.y + 3 * changed.y_err)
+    np.testing.assert_allclose(changed.y_lower, changed.y - 3 * changed.y_err)
+    assert "displayed at 3σ" in view.processing_status
     target = tmp_path / "plot.txt"
     monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *a: (str(target), "Tab-delimited text (*.txt)"))
     monkeypatch.setattr(QMessageBox, "information", lambda *a: None)
     view.export_data()
     header, rows = read_table(target)
-    assert any("3 sigma equivalent" in line for line in header)
-    assert float(rows[0]["UpperBound"]) == changed.y_upper[0]
-    view.combo_uncertainty.setCurrentIndex(view.combo_uncertainty.findData("standard"))
+    assert any("displayed at 3σ" in line for line in header)
+    assert float(rows[0]["StdUncertainty"]) == pytest.approx(original.y_err[0])
+    assert float(rows[0]["UpperBound"]) == pytest.approx(changed.y_upper[0])
     assert view.combo_sigma.isEnabled()
-    standard = view._current_curves[0]
-    np.testing.assert_allclose(standard.y_upper, standard.y+3*standard.y_err)
 
 
 @pytest.mark.parametrize("level", range(1,7))

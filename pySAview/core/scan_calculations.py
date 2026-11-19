@@ -47,6 +47,13 @@ class PlottedCurve:
     wavelength: float | None = None
     symbol: str = "o"
     spin: str | None = None
+    resolution: np.ndarray | None = None
+    resolution_units: str = ""
+    overill_coeff: np.ndarray | None = None
+    theta_deg: np.ndarray | None = None
+    theta_offset_deg: float = 0.0
+    reduction_summary: str = ""
+    show_overillumination_curve: bool = False
 
 
 @dataclass

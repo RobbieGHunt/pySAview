@@ -9,7 +9,7 @@ import numpy as np
 import pyqtgraph as pg
 from matplotlib import colormaps
 from PyQt6.QtGui import QFont
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
@@ -28,6 +28,7 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSizePolicy,
+    QSpinBox,
     QSplitter,
     QTabWidget,
     QTableWidget,
@@ -38,15 +39,20 @@ from PyQt6.QtWidgets import (
 
 from pySAview.ui.colormap_range import ColormapRange
 from pySAview.core.waterfall import waterfall_order, display_values
-from pySAview.core.export_tables import reflectivity_table, write_table
+from pySAview.core.export_tables import reflectivity_table, write_pysared_dat, write_table
 from pySAview.core.models import ScanData
+from pySAview.core.reduction.background import bkg_roi_from_signal, default_bkg_x_bounds
+from pySAview.core.reduction.curvature import apply_curvature_by_spin
+from pySAview.core.reduction.overillumination import extract_slit_widths
+from pySAview.core.reduction.pysared import reduce_counts_pysared, trim_curve_mask
+from pySAview.core.reduction.roi_extraction import pixel_bounds
 from pySAview.core.scan_calculations import (
     PlottedCurve,
     compute_q,
     split_by_flipper,
 )
 from pySAview.core.normalization import (
-    is_count_channel, normalize_signal, log_error_bounds,
+    is_count_channel, log_error_bounds,
 )
 from pySAview.ui import icons
 from pySAview.ui.flow_layout import FlowContainer, configure_compact_combo, fit_combo_popup
@@ -63,14 +69,21 @@ OVERFLOW_NOTE = ("Offset exceeds display range; reduce spacing. Overflowing poin
 class ScanPlotView(QWidget):
     """Interactive Charting and Analysis View for scanned scan variables."""
 
+    curvature_changed = pyqtSignal(str)
+    background_toggled = pyqtSignal(str)
+    jump_to_detector_requested = pyqtSignal()
+    jump_to_offspec_requested = pyqtSignal()
+
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.loaded_scans: dict[str, ScanData] = {}
         self.scan_data: ScanData | None = None
+        self.reader_provider = lambda _path: None  # wired by MainWindow for read-only lazy BKG/curvature reads
         self.is_dark_mode: bool = False
         self._current_curves: list[PlottedCurve] = []
         self._overlay_keys: list[str] = []
         self._has_explicit_overlay_keys: bool = False
+        self._syncing_reduction_ui: bool = False
 
         # Compatibility list widget and buttons kept for test backwards-compatibility
         self.list_datasets = QListWidget()
@@ -174,18 +187,23 @@ class ScanPlotView(QWidget):
 
         proc_layout.addWidget(QLabel("Counting uncertainty:"))
         self.combo_uncertainty = configure_compact_combo(QComboBox(), min_chars=10)
-        self.combo_uncertainty.addItem("Exact count intervals", "exact")
-        self.combo_uncertainty.addItem("Propagated uncertainty", "standard")
+        self.combo_uncertainty.addItem("pySAred 1.5.3 (1σ propagated)", "pysared")
         fit_combo_popup(self.combo_uncertainty)
-        self.combo_uncertainty.setToolTip("Exact intervals assume independent unweighted Poisson counts. Supplied variances use first-order propagation.")
+        self.combo_uncertainty.setToolTip(
+            "pySAred 1.5.3 convention: dI = 1 at I = 0, sqrt(I) for I > 0, sqrt(I + I_bkg) after BKG subtraction, "
+            "propagated through monitor/time, overillumination, and scale factor. Supplied variances use first-order propagation."
+        )
         self.combo_uncertainty.currentIndexChanged.connect(self._on_axis_or_setting_changed)
         proc_layout.addWidget(self.combo_uncertainty)
         sigma_row = QFormLayout()
         self.combo_sigma = QComboBox()
         for level in range(1, 7):
             self.combo_sigma.addItem(f"{level}σ", level)
-        self.combo_sigma.setCurrentIndex(1)
-        self.combo_sigma.setToolTip("Gaussian-equivalent coverage for exact count intervals: 1σ ≈ 68.27%, 2σ ≈ 95.45%, 3σ ≈ 99.73%. Exact bounds remain asymmetric. For propagated uncertainty, displayed bounds are ± the selected number of standard uncertainties. The exported standard uncertainty itself remains 1σ.")
+        self.combo_sigma.setCurrentIndex(0)  # 1σ default matching pySAred 1.5.3
+        self.combo_sigma.setToolTip(
+            "Display width for error bars (± selected multiple of 1σ standard uncertainty). "
+            "Exported standard uncertainty and pySAred .dat dI always stay at 1σ."
+        )
         self.combo_sigma.currentIndexChanged.connect(self._on_axis_or_setting_changed)
         sigma_row.addRow("Sigma:", self.combo_sigma)
         proc_layout.addLayout(sigma_row)
@@ -202,6 +220,9 @@ class ScanPlotView(QWidget):
 
         processing_layout.addWidget(grp_processing)
         processing_layout.addStretch()
+
+        # 2b. Per-Scan Data Reduction Tab (Option A — pySAred 1.5.3)
+        self.control_tabs.addTab(self._build_reduction_tab(), "Reduction")
 
         # 3. Plot Display Options
         grp_display = QGroupBox("Chart Display Options")
@@ -459,6 +480,458 @@ class ScanPlotView(QWidget):
         splitter.setStretchFactor(1, 3)
         splitter.setSizes([320, 760])
 
+    # --------------------------------------------------------- Reduction Tab (pySAred 1.5.3)
+    def _build_reduction_tab(self) -> QWidget:
+        panel = QWidget()
+        panel.setMinimumSize(0, 0)
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(8)
+
+        # Scope banner: strictly per active scan
+        grp_scope = QGroupBox("Active Scan (per-scan reduction)")
+        grp_scope.setMinimumSize(0, 0)
+        scope_layout = QVBoxLayout(grp_scope)
+        scope_layout.setSpacing(5)
+        self.lbl_red_scan = QLabel("No active scan")
+        self.lbl_red_scan.setWordWrap(True)
+        self.lbl_red_scan.setMinimumWidth(0)
+        self.lbl_red_scan.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.lbl_red_scan.setStyleSheet("font-weight: 700; color: #0284c7;")
+        scope_layout.addWidget(self.lbl_red_scan)
+        self.lbl_red_slits = QLabel("Slits: --")
+        self.lbl_red_slits.setWordWrap(True)
+        self.lbl_red_slits.setMinimumWidth(0)
+        self.lbl_red_slits.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.lbl_red_slits.setStyleSheet("color: #64748b; font-size: 11px;")
+        scope_layout.addWidget(self.lbl_red_slits)
+        self.btn_copy_reduction = QPushButton("Copy Settings to Checked Scans")
+        self.btn_copy_reduction.setToolTip(
+            "Explicitly clone the active scan's reduction parameters onto every other checked scan (never auto-inherited)."
+        )
+        self.btn_copy_reduction.clicked.connect(self._copy_reduction_to_checked)
+        scope_layout.addWidget(self.btn_copy_reduction)
+        layout.addWidget(grp_scope)
+
+        # 1. Overillumination (Footprint)
+        grp_ovl = QGroupBox("Overillumination (Footprint)")
+        grp_ovl.setMinimumSize(0, 0)
+        ovl_layout = QVBoxLayout(grp_ovl)
+        ovl_layout.setSpacing(5)
+        self.chk_overillumination = QCheckBox("Apply overillumination correction")
+        self.chk_overillumination.setToolTip("Divide intensity and uncertainty by trapezoidal beam footprint factor c₀ (pySAred 1.5.3).")
+        ovl_layout.addWidget(self.chk_overillumination)
+        ovl_form = QFormLayout()
+        self.spin_sample_length = QDoubleSpinBox()
+        self.spin_sample_length.setRange(0.1, 500.0)
+        self.spin_sample_length.setDecimals(2)
+        self.spin_sample_length.setSingleStep(1.0)
+        self.spin_sample_length.setValue(50.0)
+        self.spin_sample_length.setSuffix(" mm")
+        self.spin_sample_length.setKeyboardTracking(False)
+        ovl_form.addRow("Sample length:", self.spin_sample_length)
+        ovl_layout.addLayout(ovl_form)
+        self.chk_show_overill_curve = QCheckBox("Show footprint factor c₀ on chart")
+        self.chk_show_overill_curve.setToolTip("Overlay the calculated footprint factor c₀ (0..1) on the chart.")
+        ovl_layout.addWidget(self.chk_show_overill_curve)
+        layout.addWidget(grp_ovl)
+
+        # 2. Background Subtraction (2nd ROI)
+        grp_bkg = QGroupBox("Background Subtraction (2nd ROI)")
+        grp_bkg.setMinimumSize(0, 0)
+        bkg_layout = QVBoxLayout(grp_bkg)
+        bkg_layout.setSpacing(5)
+        self.chk_subtract_bkg = QCheckBox("Subtract background (BKG ROI)")
+        self.chk_subtract_bkg.setToolTip("Subtract integrated counts from the 2nd ROI before monitor/time normalization (pySAred 1.5.3).")
+        bkg_layout.addWidget(self.chk_subtract_bkg)
+        bkg_form = QFormLayout()
+        self.spin_bkg_skip_qz = QDoubleSpinBox()
+        self.spin_bkg_skip_qz.setRange(0.0, 2.0)
+        self.spin_bkg_skip_qz.setDecimals(4)
+        self.spin_bkg_skip_qz.setSingleStep(0.005)
+        self.spin_bkg_skip_qz.setValue(0.0)
+        self.spin_bkg_skip_qz.setSuffix(" Å⁻¹")
+        self.spin_bkg_skip_qz.setKeyboardTracking(False)
+        self.spin_bkg_skip_qz.setToolTip("Skip background subtraction for points with Qz <= this value (default 0).")
+        bkg_form.addRow("Skip Qz ≤:", self.spin_bkg_skip_qz)
+        bkg_layout.addLayout(bkg_form)
+        self.lbl_red_bkg_bounds = QLabel("BKG X: --")
+        self.lbl_red_bkg_bounds.setMinimumWidth(0)
+        self.lbl_red_bkg_bounds.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.lbl_red_bkg_bounds.setStyleSheet("color: #64748b; font-size: 11px;")
+        bkg_layout.addWidget(self.lbl_red_bkg_bounds)
+        self.btn_jump_detector = QPushButton("Edit BKG ROI in Detector Image…")
+        self.btn_jump_detector.clicked.connect(self.jump_to_detector_requested.emit)
+        bkg_layout.addWidget(self.btn_jump_detector)
+        layout.addWidget(grp_bkg)
+
+        # 3. Sample Curvature
+        grp_curv = QGroupBox("Sample Curvature (in ROI)")
+        grp_curv.setMinimumSize(0, 0)
+        curv_layout = QVBoxLayout(grp_curv)
+        curv_layout.setSpacing(5)
+        curv_form = QFormLayout()
+        self.spin_red_curvature = QDoubleSpinBox()
+        self.spin_red_curvature.setRange(-1.5, 1.5)
+        self.spin_red_curvature.setDecimals(4)
+        self.spin_red_curvature.setSingleStep(0.005)
+        self.spin_red_curvature.setValue(0.0)
+        self.spin_red_curvature.setSuffix(" rad")
+        self.spin_red_curvature.setKeyboardTracking(False)
+        self.spin_red_curvature.setToolTip("Shear angle γ (rad) applied inside the signal (and BKG) ROI per spin state. Synced with 2D Map.")
+        curv_form.addRow("Curvature γ:", self.spin_red_curvature)
+        curv_layout.addLayout(curv_form)
+        self.btn_jump_offspec = QPushButton("Align Fringes in 2D Map…")
+        self.btn_jump_offspec.clicked.connect(self.jump_to_offspec_requested.emit)
+        curv_layout.addWidget(self.btn_jump_offspec)
+        layout.addWidget(grp_curv)
+
+        # 4. Scale Factor (Direct Beam deferred)
+        grp_scale = QGroupBox("Scale Factor")
+        grp_scale.setMinimumSize(0, 0)
+        scale_layout = QVBoxLayout(grp_scale)
+        scale_layout.setSpacing(5)
+        self.chk_scale_factor = QCheckBox("Divide intensity by scale factor")
+        self.chk_scale_factor.setToolTip("Divide reduced intensity and uncertainty by a positive scale factor (Direct Beam normalization is deferred).")
+        scale_layout.addWidget(self.chk_scale_factor)
+        scale_form = QFormLayout()
+        self.spin_scale_factor = QDoubleSpinBox()
+        self.spin_scale_factor.setRange(1e-6, 1e12)
+        self.spin_scale_factor.setDecimals(6)
+        self.spin_scale_factor.setSingleStep(1.0)
+        self.spin_scale_factor.setValue(1.0)
+        self.spin_scale_factor.setKeyboardTracking(False)
+        self.spin_scale_factor.setEnabled(False)
+        scale_form.addRow("Scale factor:", self.spin_scale_factor)
+        scale_layout.addLayout(scale_form)
+        layout.addWidget(grp_scale)
+
+        # 5. Angle Offset, Instrument Geometry & Resolution
+        grp_inst = QGroupBox("Angle Offset & Resolution")
+        grp_inst.setMinimumSize(0, 0)
+        inst_layout = QVBoxLayout(grp_inst)
+        inst_layout.setSpacing(5)
+        inst_form = QFormLayout()
+        self.spin_theta_offset = QDoubleSpinBox()
+        self.spin_theta_offset.setRange(-10.0, 10.0)
+        self.spin_theta_offset.setDecimals(4)
+        self.spin_theta_offset.setSingleStep(0.005)
+        self.spin_theta_offset.setValue(0.0)
+        self.spin_theta_offset.setSuffix(" °")
+        self.spin_theta_offset.setKeyboardTracking(False)
+        self.spin_theta_offset.setToolTip("Subtracted from incident angle: θ_corr = θ − θ₀ (pySAred 1.5.3).")
+        inst_form.addRow("θ offset (θ₀):", self.spin_theta_offset)
+
+        self.spin_wavelength_res = QDoubleSpinBox()
+        self.spin_wavelength_res.setRange(0.0, 0.5)
+        self.spin_wavelength_res.setDecimals(4)
+        self.spin_wavelength_res.setSingleStep(0.001)
+        self.spin_wavelength_res.setValue(0.004)
+        self.spin_wavelength_res.setKeyboardTracking(False)
+        inst_form.addRow("Δλ / λ:", self.spin_wavelength_res)
+
+        self.spin_d1 = QDoubleSpinBox()
+        self.spin_d1.setRange(1.0, 20000.0)
+        self.spin_d1.setDecimals(1)
+        self.spin_d1.setSingleStep(10.0)
+        self.spin_d1.setValue(2300.0)
+        self.spin_d1.setSuffix(" mm")
+        self.spin_d1.setKeyboardTracking(False)
+        inst_form.addRow("S1 → Sample:", self.spin_d1)
+
+        self.spin_d2 = QDoubleSpinBox()
+        self.spin_d2.setRange(0.0, 10000.0)
+        self.spin_d2.setDecimals(1)
+        self.spin_d2.setSingleStep(10.0)
+        self.spin_d2.setValue(290.0)
+        self.spin_d2.setSuffix(" mm")
+        self.spin_d2.setKeyboardTracking(False)
+        inst_form.addRow("S2 → Sample:", self.spin_d2)
+
+        self.combo_resolution_mode = configure_compact_combo(QComboBox(), min_chars=10)
+        self.combo_resolution_mode.addItem("pySAred (FWHM_proj)", "pysared")
+        self.combo_resolution_mode.addItem("Original Sared (0.68)", "sared")
+        fit_combo_popup(self.combo_resolution_mode)
+        inst_form.addRow("Resolution:", self.combo_resolution_mode)
+        inst_layout.addLayout(inst_form)
+
+        self.chk_include_resolution = QCheckBox("Include resolution σ column")
+        self.chk_include_resolution.setChecked(True)
+        inst_layout.addWidget(self.chk_include_resolution)
+        layout.addWidget(grp_inst)
+
+        # 6. Point Trimming & pySAred .dat Export
+        grp_trim = QGroupBox("Trimming & pySAred .dat Export")
+        grp_trim.setMinimumSize(0, 0)
+        trim_layout = QVBoxLayout(grp_trim)
+        trim_layout.setSpacing(5)
+        trim_form = QFormLayout()
+        self.spin_skip_left = QSpinBox()
+        self.spin_skip_left.setRange(0, 10000)
+        self.spin_skip_left.setKeyboardTracking(False)
+        trim_form.addRow("Skip first pts:", self.spin_skip_left)
+
+        self.spin_skip_right = QSpinBox()
+        self.spin_skip_right.setRange(0, 10000)
+        self.spin_skip_right.setKeyboardTracking(False)
+        trim_form.addRow("Skip last pts:", self.spin_skip_right)
+
+        self.combo_dat_angle = configure_compact_combo(QComboBox(), min_chars=8)
+        self.combo_dat_angle.addItem("Qz (Å⁻¹)", "Qz")
+        self.combo_dat_angle.addItem("Degrees (°)", "Degrees")
+        self.combo_dat_angle.addItem("Radians (rad)", "Radians")
+        fit_combo_popup(self.combo_dat_angle)
+        trim_form.addRow(".dat angle:", self.combo_dat_angle)
+        trim_layout.addLayout(trim_form)
+
+        self.chk_remove_zeros = QCheckBox("Remove zero-intensity points")
+        trim_layout.addWidget(self.chk_remove_zeros)
+
+        self.btn_export_dat = QPushButton("Export pySAred .dat…")
+        self.btn_export_dat.setToolTip("Write space-delimited 3- or 4-column pySAred .dat file(s) (angle  I  dI  [Resolution]).")
+        self.btn_export_dat.clicked.connect(self.export_pysared_dat)
+        trim_layout.addWidget(self.btn_export_dat)
+        layout.addWidget(grp_trim)
+
+        layout.addStretch()
+
+        # Connect reduction controls
+        for chk in (self.chk_overillumination, self.chk_show_overill_curve, self.chk_scale_factor,
+                    self.chk_include_resolution, self.chk_remove_zeros):
+            chk.toggled.connect(self._on_reduction_changed)
+        self.chk_subtract_bkg.toggled.connect(self._on_reduction_bkg_toggled)
+        self.spin_red_curvature.valueChanged.connect(self._on_reduction_curvature_changed)
+        for spin in (self.spin_sample_length, self.spin_bkg_skip_qz, self.spin_scale_factor,
+                     self.spin_theta_offset, self.spin_wavelength_res, self.spin_d1, self.spin_d2,
+                     self.spin_skip_left, self.spin_skip_right):
+            spin.valueChanged.connect(self._on_reduction_changed)
+        self.combo_resolution_mode.currentIndexChanged.connect(self._on_reduction_changed)
+
+        self._set_reduction_controls_enabled(False)
+        return panel
+
+    def _set_reduction_controls_enabled(self, enabled: bool) -> None:
+        for w in (self.btn_copy_reduction, self.chk_overillumination, self.spin_sample_length,
+                  self.chk_show_overill_curve, self.chk_subtract_bkg, self.spin_bkg_skip_qz,
+                  self.btn_jump_detector, self.spin_red_curvature, self.btn_jump_offspec,
+                  self.chk_scale_factor, self.spin_theta_offset, self.spin_wavelength_res,
+                  self.spin_d1, self.spin_d2, self.combo_resolution_mode, self.chk_include_resolution,
+                  self.spin_skip_left, self.spin_skip_right, self.chk_remove_zeros,
+                  self.combo_dat_angle, self.btn_export_dat):
+            w.setEnabled(enabled)
+        self.spin_scale_factor.setEnabled(enabled and self.chk_scale_factor.isChecked())
+
+    def set_active_scan(self, scan_data: ScanData | None) -> None:
+        """Select which scan the Reduction sub-tab edits (per-scan ownership)."""
+        self.scan_data = scan_data
+        self._sync_reduction_controls()
+
+    def refresh_reduction(self) -> None:
+        """Refresh Reduction tab widgets and re-plot after BKG ROI or curvature edits in other tabs."""
+        self._sync_reduction_controls()
+        self._update_plot()
+
+    def _sync_reduction_controls(self) -> None:
+        scan = self.scan_data
+        if scan is None:
+            self.lbl_red_scan.setText("No active scan")
+            self.lbl_red_slits.setText("Slits: --")
+            self.lbl_red_bkg_bounds.setText("BKG X: --")
+            self._set_reduction_controls_enabled(False)
+            return
+
+        p = scan.reduction_params
+        self._syncing_reduction_ui = True
+        try:
+            self.lbl_red_scan.setText(self._format_scan_label(scan))
+            n_pts = len(next(iter(scan.variables.values())).data) if scan.variables else 0
+            s1, s2, src = extract_slit_widths(scan, n_pts) if n_pts else (None, None, "unavailable")
+            if s1 is not None and s2 is not None:
+                pos = (s1 > 0) & (s2 > 0) & np.isfinite(s1) & np.isfinite(s2)
+                if np.any(pos):
+                    s1_lo, s1_hi = float(np.min(s1[pos])), float(np.max(s1[pos]))
+                    s2_lo, s2_hi = float(np.min(s2[pos])), float(np.max(s2[pos]))
+                    s1_txt = f"{s1_lo:g}" if abs(s1_hi - s1_lo) < 1e-6 else f"{s1_lo:g}..{s1_hi:g}"
+                    s2_txt = f"{s2_lo:g}" if abs(s2_hi - s2_lo) < 1e-6 else f"{s2_lo:g}..{s2_hi:g}"
+                    self.lbl_red_slits.setText(f"Slits ({src}): s1h={s1_txt} mm, s2h={s2_txt} mm")
+                else:
+                    self.lbl_red_slits.setText(f"Slits ({src}): no positive openings")
+            else:
+                self.lbl_red_slits.setText("Slits: unavailable (s1h/s2h missing)")
+
+            if p.bkg_x_bounds is not None:
+                self.lbl_red_bkg_bounds.setText(f"BKG X: [{p.bkg_x_bounds[0]:.0f} .. {p.bkg_x_bounds[1]:.0f}] px")
+            else:
+                self.lbl_red_bkg_bounds.setText("BKG X: auto [x0 − 2w, x0 − w]")
+
+            self.chk_overillumination.setChecked(bool(p.overillumination))
+            self.spin_sample_length.setValue(float(p.sample_length_mm))
+            self.chk_show_overill_curve.setChecked(bool(p.show_overillumination_curve))
+            self.chk_subtract_bkg.setChecked(bool(p.subtract_background))
+            self.spin_bkg_skip_qz.setValue(float(p.bkg_skip_qz))
+            self.spin_red_curvature.setValue(float(p.curvature_rad))
+            self.chk_scale_factor.setChecked(bool(p.use_scale_factor))
+            self.spin_scale_factor.setValue(float(p.scale_factor))
+            self.spin_theta_offset.setValue(float(p.theta_offset_deg))
+            self.spin_wavelength_res.setValue(float(p.wavelength_resolution))
+            self.spin_d1.setValue(float(p.distance_s1_mm))
+            self.spin_d2.setValue(float(p.distance_s2_mm))
+            idx_res = self.combo_resolution_mode.findData(p.resolution_mode)
+            if idx_res >= 0:
+                self.combo_resolution_mode.setCurrentIndex(idx_res)
+            self.chk_include_resolution.setChecked(bool(p.include_resolution))
+            self.spin_skip_left.setValue(int(p.skip_left))
+            self.spin_skip_right.setValue(int(p.skip_right))
+            self.chk_remove_zeros.setChecked(bool(p.remove_zeros))
+        finally:
+            self._syncing_reduction_ui = False
+        self._set_reduction_controls_enabled(True)
+
+    def _write_reduction_controls_to_scan(self) -> None:
+        scan = self.scan_data
+        if scan is None:
+            return
+        p = scan.reduction_params
+        p.overillumination = self.chk_overillumination.isChecked()
+        p.sample_length_mm = self.spin_sample_length.value()
+        p.show_overillumination_curve = self.chk_show_overill_curve.isChecked()
+        p.subtract_background = self.chk_subtract_bkg.isChecked()
+        p.bkg_skip_qz = self.spin_bkg_skip_qz.value()
+        p.curvature_rad = self.spin_red_curvature.value()
+        p.use_scale_factor = self.chk_scale_factor.isChecked()
+        p.scale_factor = self.spin_scale_factor.value()
+        p.theta_offset_deg = self.spin_theta_offset.value()
+        p.wavelength_resolution = self.spin_wavelength_res.value()
+        p.distance_s1_mm = self.spin_d1.value()
+        p.distance_s2_mm = self.spin_d2.value()
+        p.resolution_mode = self.combo_resolution_mode.currentData() or "pysared"
+        p.include_resolution = self.chk_include_resolution.isChecked()
+        p.skip_left = self.spin_skip_left.value()
+        p.skip_right = self.spin_skip_right.value()
+        p.remove_zeros = self.chk_remove_zeros.isChecked()
+        self.spin_scale_factor.setEnabled(p.use_scale_factor)
+
+    def _on_reduction_changed(self, *_args) -> None:
+        if self._syncing_reduction_ui or self.scan_data is None:
+            return
+        self._write_reduction_controls_to_scan()
+        self._update_plot()
+
+    def _on_reduction_bkg_toggled(self, checked: bool) -> None:
+        if self._syncing_reduction_ui or self.scan_data is None:
+            return
+        p = self.scan_data.reduction_params
+        p.subtract_background = bool(checked)
+        if checked and p.bkg_x_bounds is None and self.scan_data.has_detector_2d and self.scan_data.detector_shape:
+            roi = self.scan_data.working_detector_roi or self.scan_data.detector_roi
+            if roi is not None:
+                p.bkg_x_bounds = default_bkg_x_bounds(roi[0], roi[1], nx=int(self.scan_data.detector_shape[1]))
+        self.scan_data.working_bkg_counts = None
+        self._sync_reduction_controls()
+        self.background_toggled.emit(self.scan_data.file_path)
+        self._update_plot()
+
+    def _on_reduction_curvature_changed(self, value: float) -> None:
+        if self._syncing_reduction_ui or self.scan_data is None:
+            return
+        self.scan_data.reduction_params.curvature_rad = float(value)
+        self.curvature_changed.emit(self.scan_data.file_path)
+        self._update_plot()
+
+    def _copy_reduction_to_checked(self) -> None:
+        """Explicitly clone the active scan's reduction settings onto all other checked scans."""
+        src = self.scan_data
+        if src is None:
+            return
+        self._write_reduction_controls_to_scan()
+        if self._has_explicit_overlay_keys:
+            keys = list(self._overlay_keys)
+        else:
+            keys = [
+                self.list_datasets.item(i).data(Qt.ItemDataRole.UserRole)
+                for i in range(self.list_datasets.count())
+                if self.list_datasets.item(i).checkState() == Qt.CheckState.Checked
+            ]
+        for k in keys:
+            target = self.loaded_scans.get(k)
+            if target is not None and target is not src:
+                target.reduction_params = src.reduction_params.clone()
+                target.working_bkg_counts = None
+        self._update_plot()
+
+    def _effective_roi_and_bkg_counts(self, scan: ScanData, y_key: str) -> tuple[np.ndarray, np.ndarray | None, list[str]]:
+        """Return ``(signal_counts, bkg_counts, notes)`` applying per-scan curvature and BKG ROI if active."""
+        notes: list[str] = []
+        raw_y = np.asarray(scan.variables[y_key].data, dtype=float)
+        p = scan.reduction_params
+
+        if y_key != "ROI_Counts":
+            if p.subtract_background:
+                notes.append("BKG ROI subtraction applies to ROI_Counts only.")
+            if abs(p.curvature_rad) > 0.0:
+                notes.append("Sample curvature applies to ROI_Counts only.")
+            return raw_y, None, notes
+
+        if not scan.has_detector_2d or scan.detector_shape is None:
+            return raw_y, scan.working_bkg_counts if p.subtract_background else None, notes
+
+        _, nx, ny = scan.detector_shape
+        record = scan.working_roi_record
+        is_tracked = record is not None and record.mode == "tracked"
+        roi = scan.working_detector_roi or scan.detector_roi
+        if roi is None:
+            return raw_y, scan.working_bkg_counts if p.subtract_background else None, notes
+
+        sx0, sx1, sy0, sy1 = pixel_bounds(roi, nx, ny)
+        bx0, bx1, _, _ = bkg_roi_from_signal(roi, p.bkg_x_bounds, nx, ny)
+        if p.bkg_x_bounds is None:
+            p.bkg_x_bounds = (float(bx0), float(bx1))
+
+        # Curvature correction path (requires fixed ROI and cached Y-integrated detector strip)
+        if abs(p.curvature_rad) > 0.0:
+            if is_tracked:
+                notes.append("Sample curvature skipped: requires a fixed ROI (tracked ROI active).")
+            else:
+                y_map = scan.roi_y_map_cache if scan.roi_y_map_bounds == (sy0, sy1) else None
+                if y_map is None:
+                    reader = self.reader_provider(scan.file_path)
+                    if reader is not None:
+                        y_map = reader.compute_y_integrated_map((float(sy0), float(sy1)))
+                        if y_map is not None:
+                            scan.roi_y_map_cache = y_map
+                            scan.roi_y_map_bounds = (sy0, sy1)
+                if y_map is None:
+                    notes.append("Sample curvature unavailable: detector volume could not be read.")
+                else:
+                    flipper = scan.variables["Flipper1"].data if "Flipper1" in scan.variables else None
+                    bkg_win = (bx0, bx1) if p.subtract_background else None
+                    try:
+                        warped = apply_curvature_by_spin(
+                            y_map.counts, flipper, y_map.written,
+                            p.curvature_rad, (sx0, sx1), bkg_x_bounds=bkg_win,
+                        )
+                        curv_y = np.sum(warped[:, sx0:sx1], axis=1, dtype=float)
+                        curv_bkg = np.sum(warped[:, bx0:bx1], axis=1, dtype=float) if p.subtract_background else None
+                        return curv_y, curv_bkg, notes
+                    except ValueError as err:
+                        notes.append(f"Sample curvature skipped: {err}")
+
+        # Zero-curvature path: use fast cached/computed BKG ROI counts if BKG subtraction is enabled
+        bkg_counts = None
+        if p.subtract_background:
+            if scan.working_bkg_counts is not None and len(scan.working_bkg_counts) == len(raw_y):
+                bkg_counts = scan.working_bkg_counts
+            elif scan.roi_y_map_cache is not None and scan.roi_y_map_bounds == (sy0, sy1):
+                bkg_counts = np.sum(scan.roi_y_map_cache.counts[:, bx0:bx1], axis=1, dtype=float)
+                scan.working_bkg_counts = bkg_counts
+            else:
+                reader = self.reader_provider(scan.file_path)
+                if reader is not None:
+                    bkg_counts = reader.compute_full_scan_roi((float(bx0), float(bx1), float(sy0), float(sy1)))
+                    scan.working_bkg_counts = bkg_counts
+
+        return raw_y, bkg_counts, notes
+
     def _format_scan_label(self, scan: ScanData) -> str:
         name = Path(scan.file_path).name if scan.file_path else "Scan"
         run_str = f"#{scan.metadata.run_number}" if scan.metadata.run_number else ""
@@ -541,6 +1014,7 @@ class ScanPlotView(QWidget):
 
         self.list_datasets.blockSignals(False)
 
+        self._sync_reduction_controls()
         self._refresh_axis_combos()
         self._update_plot()
 
@@ -564,6 +1038,7 @@ class ScanPlotView(QWidget):
         if self.scan_data and (str(self.scan_data.file_path) == key):
             self.scan_data = next(iter(self.loaded_scans.values())) if self.loaded_scans else None
 
+        self._sync_reduction_controls()
         self._refresh_axis_combos()
         self._update_plot()
 
@@ -576,6 +1051,7 @@ class ScanPlotView(QWidget):
         self.list_datasets.blockSignals(True)
         self.list_datasets.clear()
         self.list_datasets.blockSignals(False)
+        self._sync_reduction_controls()
         self._refresh_axis_combos()
         self._update_plot()
 
@@ -683,6 +1159,7 @@ class ScanPlotView(QWidget):
 
         from pySAview.core.models import ScanVariable
         target_scan.working_detector_roi = tuple(roi_bounds)
+        target_scan.working_bkg_counts = None
         target_scan.variables["ROI_Counts"] = ScanVariable(
             index=len(target_scan.variables),
             name="ROI_Counts",
@@ -694,6 +1171,7 @@ class ScanPlotView(QWidget):
             data=roi_counts,
         )
         self._refresh_axis_combos()
+        self._sync_reduction_controls()
         if self.combo_y.findData("ROI_Counts") >= 0:
             self.combo_y.setCurrentIndex(self.combo_y.findData("ROI_Counts"))
         self._update_plot()
@@ -1000,17 +1478,25 @@ class ScanPlotView(QWidget):
                 if y_key not in scan.variables:
                     raise ValueError(f"missing selected Y channel {y_key}")
                 y_var = scan.variables[y_key]
-                raw_y = np.asarray(y_var.data, dtype=float)
+                params = scan.reduction_params
+                raw_y, bkg_counts, roi_notes = self._effective_roi_and_bkg_counts(scan, y_key)
+                for rn in roi_notes:
+                    warnings.append(f"{name}: {rn}")
+
+                th_var = scan.variables.get("th")
+                th_raw = np.asarray(th_var.data, dtype=float) if th_var is not None else None
+                th_corr = (th_raw - float(params.theta_offset_deg)) if th_raw is not None else None
+
                 if x_key == "index":
                     x_data = np.arange(len(raw_y), dtype=float)
                     current_x_units = ""
                     current_x_label = "Point Index"
                 elif x_key == "Q":
-                    if "th" not in scan.variables:
+                    if th_var is None or th_corr is None:
                         raise ValueError("missing incident-angle channel th")
-                    if canonical_unit(scan.variables["th"].unit) != "deg":
+                    if canonical_unit(th_var.unit) != "deg":
                         raise ValueError("Q conversion requires th in degrees")
-                    x_data = compute_q(scan.variables["th"].data, self.spin_wavelength.value())
+                    x_data = compute_q(th_corr, self.spin_wavelength.value())
                     current_x_units = "Å⁻¹"
                     current_x_label = "Q (Momentum Transfer)"
                 else:
@@ -1018,6 +1504,8 @@ class ScanPlotView(QWidget):
                         raise ValueError(f"missing selected X channel {x_key}")
                     x_var = scan.variables[x_key]
                     x_data = np.asarray(x_var.data, dtype=float)
+                    if x_key == "th" and abs(params.theta_offset_deg) > 0.0:
+                        x_data = x_data - float(params.theta_offset_deg)
                     current_x_units = x_var.unit
                     current_x_label = x_var.name
                 current_units = (canonical_unit(current_x_units), canonical_unit(y_var.unit))
@@ -1034,19 +1522,33 @@ class ScanPlotView(QWidget):
                     raise ValueError("dwell-time channel must have units of seconds")
                 if norm_mode == "time" and time_var is not None and time_var.unit_source not in ("file", "unspecified"):
                     assumptions.add(f"{time_var.name} in seconds: {time_var.unit_source}")
-                result = normalize_signal(
+
+                s1_mm, s2_mm, _ = extract_slit_widths(scan, len(raw_y))
+                res_angle_unit = "Degrees" if (x_key == "th" and params.resolution_mode == "pysared") else "Qz"
+                res_units = "°" if res_angle_unit == "Degrees" else "Å⁻¹"
+
+                result = reduce_counts_pysared(
                     raw_y, norm_mode,
                     monitor=mon_var.data if mon_var is not None else None,
                     time=time_var.data if time_var is not None else None,
                     count_data=is_count_channel(y_var.name, y_var.unit),
                     variance=y_var.variance,
                     monitor_variance=mon_var.variance if mon_var is not None else None,
-                    uncertainty=self.combo_uncertainty.currentData(),
                     sigma_level=self.combo_sigma.currentData(),
                     reference_monitor_rate=self.spin_reference_rate.value(),
                     numerator_is_monitor=y_key == "Monitor1",
                     input_units=y_var.unit,
+                    theta_deg=th_raw if (th_raw is not None and len(th_raw) == len(raw_y)) else None,
+                    wavelength_angstrom=self.spin_wavelength.value(),
+                    s1_mm=s1_mm,
+                    s2_mm=s2_mm,
+                    bkg_counts=bkg_counts,
+                    params=params,
+                    resolution_angle_unit=res_angle_unit,
                 )
+                for rw in (result.warnings or []):
+                    warnings.append(f"{name}: {rw}")
+
                 valid = result.valid & np.isfinite(x_data)
                 f_var = scan.variables.get("Flipper1")
                 effective_spin = spin_mode
@@ -1090,6 +1592,19 @@ class ScanPlotView(QWidget):
                 )
                 for curve in curves:
                     source_indices = original_indices[curve.indices]
+                    # Apply per-curve left/right point trimming & remove-zeros filter (pySAred 1.5.3)
+                    keep = trim_curve_mask(
+                        len(curve.x), curve.y,
+                        skip_left=params.skip_left,
+                        skip_right=params.skip_right,
+                        remove_zeros=params.remove_zeros,
+                    )
+                    if not np.any(keep):
+                        continue
+                    source_indices = source_indices[keep]
+                    curve.x = curve.x[keep]
+                    curve.y = curve.y[keep]
+                    curve.y_err = curve.y_err[keep] if curve.y_err is not None else None
                     curve.y_lower = result.lower[source_indices] if result.lower is not None else None
                     curve.y_upper = result.upper[source_indices] if result.upper is not None else None
                     curve.indices = source_indices
@@ -1099,18 +1614,22 @@ class ScanPlotView(QWidget):
                     curve.reference_monitor_rate = self.spin_reference_rate.value() if norm_mode == "monitor_time" else None
                     curve.x_units, curve.y_units = x_units, y_units
                     curve.wavelength = self.spin_wavelength.value() if x_key == "Q" else None
-                all_curves.extend(curves)
+                    curve.resolution = result.resolution[source_indices] if result.resolution is not None else None
+                    curve.resolution_units = res_units if curve.resolution is not None else ""
+                    curve.overill_coeff = result.overill_coeff[source_indices] if result.overill_coeff is not None else None
+                    curve.theta_deg = th_corr[source_indices] if th_corr is not None else None
+                    curve.theta_offset_deg = float(params.theta_offset_deg)
+                    curve.reduction_summary = params.summary()
+                    curve.show_overillumination_curve = bool(params.show_overillumination_curve)
+                    all_curves.append(curve)
             except ValueError as error:
                 warnings.append(f"{name}: skipped — {error}")
 
         self._current_curves = all_curves
         formulas = {"raw": "Y", "monitor": "N / Monitor1", "time": "N / dwell time",
                     "monitor_time": f"(N / Monitor1) × {self.spin_reference_rate.value():g} monitor counts/s (fixed reference)"}
-        status = f"Processing: {formulas.get(norm_mode, norm_mode)}; {'; '.join(sorted(methods)) or 'no compatible data'}; {excluded} invalid points excluded."
+        status = f"Processing (pySAred 1.5.3): {formulas.get(norm_mode, norm_mode)}; {'; '.join(sorted(methods)) or 'no compatible data'}; {excluded} invalid points excluded."
         notes = []  # shown under the title; the method description is not repeated there
-        if self.combo_uncertainty.currentData() == "exact" and any(m.startswith("propagated") for m in methods):
-            notes.append("Exact intervals unavailable for data with supplied variances; "
-                         "propagated uncertainty is shown instead.")
         if x_key == "Q":
             status += f" Wavelength: {self.spin_wavelength.value():g} Å."
         hidden = sum(np.count_nonzero((c.x <= 0) if self.chk_log_x.isChecked() else np.zeros(len(c.x), dtype=bool))
@@ -1165,6 +1684,7 @@ class ScanPlotView(QWidget):
         show_errors = self.chk_errors.isChecked()
 
         # Render curves
+        ovl_drawn: set[str] = set()
         for curve in all_curves:
             px = curve.x
             rank = ranks.get(curve.source_path, 0) if waterfall else 0
@@ -1209,8 +1729,23 @@ class ScanPlotView(QWidget):
                 name=curve.label + (f" [offset {rank * spacing:g} {'dec' if offset_mode == 'log' else 'Y'}]" if waterfall else ""),
             )
 
-            # Exact confidence limits remain asymmetric. Standard uncertainty
-            # is separately identified in the processing banner and export.
+            # Optional footprint factor c0 overlay (once per scan, matching pySAred "Show Overillumination")
+            if (curve.show_overillumination_curve and curve.overill_coeff is not None
+                    and curve.source_path not in ovl_drawn):
+                ovl_y = curve.overill_coeff
+                ovl_ok = np.isfinite(px) & np.isfinite(ovl_y) & (ovl_y > 0)
+                if log_x:
+                    ovl_ok &= (px > 0)
+                if np.any(ovl_ok):
+                    prefix = f"[{curve.dataset_name}] " if curve.dataset_name else ""
+                    self.plot_widget.plot(
+                        px[ovl_ok],
+                        ovl_y[ovl_ok],
+                        pen=pg.mkPen("#f59e0b", width=1.6, style=Qt.PenStyle.DashLine),
+                        name=f"{prefix}Overillumination c₀",
+                    )
+                    ovl_drawn.add(curve.source_path)
+
             if show_errors and curve.y_lower is not None and len(cx) > 0:
                 lower = lower_display[valid]
                 upper = upper_display[valid]
@@ -1235,11 +1770,19 @@ class ScanPlotView(QWidget):
 
     def _update_data_table(self, curves: list[PlottedCurve], x_label: str, y_label: str) -> None:
         total_rows = sum(len(c.x) for c in curves)
+        has_res = any(c.resolution is not None for c in curves)
+        res_units = next((c.resolution_units for c in curves if c.resolution is not None and c.resolution_units), "")
+        res_hdr = f"Resolution σ ({res_units})" if res_units else "Resolution σ"
+        headers = [
+            "Dataset", "State / Curve", "Step Index", x_label, y_label,
+            "Std uncertainty", "Lower bound", "Upper bound", "Uncertainty method",
+        ]
+        if has_res:
+            headers.append(res_hdr)
+
         self.curve_data_table.setRowCount(total_rows)
-        self.curve_data_table.setColumnCount(9)
-        self.curve_data_table.setHorizontalHeaderLabels([
-            "Dataset", "State / Curve", "Step Index", x_label, y_label, "Std uncertainty", "Lower bound", "Upper bound", "Uncertainty method"
-        ])
+        self.curve_data_table.setColumnCount(len(headers))
+        self.curve_data_table.setHorizontalHeaderLabels(headers)
         self.curve_data_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
 
         cur_row = 0
@@ -1257,6 +1800,13 @@ class ScanPlotView(QWidget):
                 for col, value in ((6, c.y_lower), (7, c.y_upper)):
                     self.curve_data_table.setItem(cur_row, col, QTableWidgetItem(f"{value[i]:.6g}" if value is not None else "--"))
                 self.curve_data_table.setItem(cur_row, 8, QTableWidgetItem(c.uncertainty_method))
+                if has_res:
+                    r_val = (
+                        f"{c.resolution[i]:.4g}"
+                        if c.resolution is not None and i < len(c.resolution) and np.isfinite(c.resolution[i])
+                        else "--"
+                    )
+                    self.curve_data_table.setItem(cur_row, 9, QTableWidgetItem(r_val))
                 cur_row += 1
 
     def _set_processing(self, status: str, notes: list[str]) -> None:
@@ -1305,3 +1855,76 @@ class ScanPlotView(QWidget):
             return None
         QMessageBox.information(self, "Export Succeeded", f"Exported {count} data points to {target.name}.")
         return target
+
+    def export_pysared_dat(self) -> list[tuple[Path, int]] | None:
+        """Save plotted curves as pySAred 1.5.3 space-delimited 3- or 4-column ``.dat`` file(s)."""
+        if not self._current_curves:
+            QMessageBox.information(self, "No Data", "No curves currently plotted to export.")
+            return None
+        angle_mode = self.combo_dat_angle.currentData() or "Qz"
+        try:
+            target = ask_output_path(
+                self,
+                "Export pySAred Reflectivity (.dat)",
+                self._default_export_name("reduced", ".dat")(),
+                "pySAred Data Files (*.dat);;All Files (*.*)",
+                self._source_paths(),
+            )
+            if target is None:
+                return None
+            # Recompute per-scan resolution in the requested .dat angle unit when enabled for that scan
+            from copy import copy as shallow_copy
+            from pySAview.core.reduction.overillumination import compute_overillumination_series
+            from pySAview.core.reduction.resolution import compute_resolution_pysared
+
+            export_curves = []
+            lam = self.spin_wavelength.value()
+            for curve in self._current_curves:
+                c = shallow_copy(curve)
+                scan = self.loaded_scans.get(curve.source_path)
+                if scan is not None:
+                    p = scan.reduction_params
+                    if p.include_resolution and c.theta_deg is not None:
+                        th_var = scan.variables.get("th")
+                        n_full = len(th_var.data) if th_var is not None else len(next(iter(scan.variables.values())).data)
+                        s1_full, s2_full, _ = extract_slit_widths(scan, n_full)
+                        if s1_full is not None and s2_full is not None:
+                            s1_c = s1_full[c.indices]
+                            s2_c = s2_full[c.indices]
+                            if p.overillumination:
+                                _, fp_c, _ = compute_overillumination_series(
+                                    s1_c, s2_c, c.theta_deg,
+                                    sample_length_mm=p.sample_length_mm,
+                                    distance_s1_mm=p.distance_s1_mm,
+                                    distance_s2_mm=p.distance_s2_mm,
+                                )
+                            else:
+                                fp_c = s2_c
+                            c.resolution = compute_resolution_pysared(
+                                c.theta_deg, s1_c, s2_c, fp_c,
+                                wavelength_angstrom=lam,
+                                wavelength_resolution=p.wavelength_resolution,
+                                distance_s1_mm=p.distance_s1_mm,
+                                distance_s2_mm=p.distance_s2_mm,
+                                mode=p.resolution_mode,
+                                angle_unit=angle_mode,
+                            )
+                    elif not p.include_resolution:
+                        c.resolution = None
+                export_curves.append(c)
+            written = write_pysared_dat(
+                target,
+                export_curves,
+                angle_mode=angle_mode,
+                include_resolution=True,
+                remove_zeros=False,
+                wavelength=lam,
+                source_paths=self._source_paths(),
+            )
+        except Exception as error:  # noqa: BLE001 - shown to the user
+            QMessageBox.critical(self, "Export Failed", f"Failed to save pySAred .dat file:\n{error}")
+            return None
+        names = ", ".join(p.name for p, _ in written)
+        total_pts = sum(cnt for _, cnt in written)
+        QMessageBox.information(self, "Export Succeeded", f"Exported {total_pts} points to {names}.")
+        return written

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pySAview.core.roi_record import ROIRecord
 from pySAview.core.angle_calibration import AngleCalibration
+from pySAview.core.reduction.pysared import ReductionParams
 
 from dataclasses import dataclass, field
 from typing import Any
@@ -106,3 +107,13 @@ class ScanData:
     working_roi_record: ROIRecord | None = None
     # In-memory, scan-specific detector angle calibration for α_i / α_f maps.
     angle_calibration: AngleCalibration | None = None
+    # In-memory, scan-specific pySAred 1.5.3 reduction parameters (never auto-inherited).
+    reduction_params: ReductionParams = field(default_factory=ReductionParams)
+    # Scalar fallback horizontal slit widths (s1h, s2h) in mm from SUPERADAM/VirtualSlit.
+    slit_defaults: tuple[float, float] | None = None
+    # In-memory cached Y-integrated detector map (OffSpecularMap) for this scan's ROI Y window,
+    # used for reversible curvature correction and background ROI integration.
+    roi_y_map_cache: Any = None
+    roi_y_map_bounds: tuple[int, int] | None = None
+    # In-memory integrated counts for this scan's background ROI (same Y as signal ROI).
+    working_bkg_counts: np.ndarray | None = None

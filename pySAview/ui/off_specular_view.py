@@ -32,6 +32,7 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSizePolicy,
+    QSlider,
     QSpinBox,
     QSplitter,
     QStackedWidget,
@@ -54,11 +55,14 @@ from pySAview.core.angle_calibration import (
     q_from_angles,
     specular_center,
 )
+from pySAview.core.reduction.background import bkg_roi_from_signal
+from pySAview.core.reduction.curvature import apply_curvature_by_spin
 from pySAview.core.reduction.kinematics import (
     constant_qx_alpha_f,
     constant_qz_alpha_f,
     qz_step_per_pixel,
 )
+from pySAview.core.reduction.roi_extraction import pixel_bounds
 from pySAview.core.models import ScanData
 from pySAview.core.nexus_reader import NexusReader
 from pySAview.core.off_specular import (
@@ -584,6 +588,8 @@ class _CompactPlotWidget(pg.PlotWidget):
 class OffSpecularView(QWidget):
     """Heatmap of Y-integrated detector intensity versus X pixel and scan point."""
 
+    curvature_changed = pyqtSignal(str)  # emits active scan file_path when curvature changes
+
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.scan_data: ScanData | None = None
@@ -817,6 +823,7 @@ class OffSpecularView(QWidget):
         right_layout.setContentsMargins(0, 0, 0, 0)
         right_layout.setSpacing(8)
         right_layout.addWidget(self._build_calibration_panel())
+        right_layout.addWidget(self._build_curvature_panel())
         group = QGroupBox("Cuts through the map")
         group.setMinimumSize(0, 0)
         group_layout = QVBoxLayout(group)
@@ -838,6 +845,12 @@ class OffSpecularView(QWidget):
         for btn in (self.btn_drop_cuts, self.btn_cut_h, self.btn_cut_v):
             btn.setStyleSheet("QPushButton { padding: 4px 8px; }")
             cut_bar.addWidget(btn)
+        self.chk_roi_sum_cut = QCheckBox("ROI-summed profile")
+        self.chk_roi_sum_cut.setToolTip(
+            "Plot the X-integrated intensity across the signal ROI (updates live as sample curvature changes)"
+        )
+        self.chk_roi_sum_cut.toggled.connect(self._on_roi_sum_cut_toggled)
+        cut_bar.addWidget(self.chk_roi_sum_cut)
         group_layout.addLayout(cut_bar)
         self.lbl_row_cut = QLabel("Horizontal cut (selected point):")
         _fixed_width_text(self.lbl_row_cut)
@@ -1041,6 +1054,83 @@ class OffSpecularView(QWidget):
         self._set_cal_status("Calibrated automatically from the direct beam when the map is computed.")
         return group
 
+    def _build_curvature_panel(self) -> QGroupBox:
+        group = self.curv_group = QGroupBox("Sample curvature (pySAred 1.5.3) — this scan")
+        group.setMinimumSize(0, 0)
+        grid = QGridLayout(group)
+        grid.setHorizontalSpacing(6)
+        grid.setVerticalSpacing(4)
+        self.spin_curvature = QDoubleSpinBox()
+        self.spin_curvature.setMinimumWidth(65)
+        self.spin_curvature.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        self.spin_curvature.setRange(-1.5, 1.5)
+        self.spin_curvature.setDecimals(4)
+        self.spin_curvature.setSingleStep(0.005)
+        self.spin_curvature.setSuffix(" rad")
+        self.spin_curvature.setKeyboardTracking(False)
+        self.spin_curvature.setToolTip(
+            "Sample curvature shear angle γ (rad) applied inside the signal ROI (and BKG ROI) per spin state. "
+            "Synced with Scan Charts ▸ Reduction."
+        )
+        self.spin_curvature.valueChanged.connect(self._on_curvature_spin_changed)
+
+        self.btn_reset_curvature = QPushButton("Reset 0")
+        self.btn_reset_curvature.setToolTip("Reset sample curvature to 0 rad (restores uncorrected baseline)")
+        self.btn_reset_curvature.clicked.connect(self._reset_curvature)
+
+        self.slider_curvature = QSlider(Qt.Orientation.Horizontal)
+        self.slider_curvature.setMinimumWidth(0)
+        self.slider_curvature.setRange(-300, 300)
+        self.slider_curvature.setValue(0)
+        self.slider_curvature.setToolTip("Fine curvature slider (−0.300 to +0.300 rad)")
+        self.slider_curvature.valueChanged.connect(self._on_curvature_slider_changed)
+
+        grid.addWidget(QLabel("γ:"), 0, 0)
+        grid.addWidget(self.spin_curvature, 0, 1)
+        grid.addWidget(self.btn_reset_curvature, 0, 2)
+        grid.addWidget(self.slider_curvature, 1, 0, 1, 3)
+        grid.setColumnStretch(1, 1)
+        return group
+
+    def _sync_curvature_controls(self) -> None:
+        curv = float(self.scan_data.reduction_params.curvature_rad) if self.scan_data is not None else 0.0
+        self.spin_curvature.blockSignals(True)
+        self.slider_curvature.blockSignals(True)
+        self.spin_curvature.setValue(curv)
+        self.slider_curvature.setValue(int(round(max(-300.0, min(300.0, curv * 1000.0)))))
+        self.spin_curvature.blockSignals(False)
+        self.slider_curvature.blockSignals(False)
+
+    def _apply_curvature_value(self, value: float) -> None:
+        if self.scan_data is None:
+            return
+        curv = float(value)
+        if self.scan_data.reduction_params.curvature_rad == curv:
+            return
+        self.scan_data.reduction_params.curvature_rad = curv
+        self._sync_curvature_controls()
+        self._redraw()
+        self.curvature_changed.emit(self.scan_data.file_path)
+
+    def _on_curvature_spin_changed(self, value: float) -> None:
+        self._apply_curvature_value(value)
+
+    def _on_curvature_slider_changed(self, tick: int) -> None:
+        self._apply_curvature_value(tick / 1000.0)
+
+    def _reset_curvature(self) -> None:
+        self._apply_curvature_value(0.0)
+
+    def refresh_reduction(self) -> None:
+        """Sync curvature & BKG ROI display after changes in Scan Charts or Detector Image."""
+        if self.scan_data is None:
+            return
+        self._sync_curvature_controls()
+        if self._map is not None:
+            self._redraw()
+        else:
+            self._draw_roi_overlay()
+
     def _detector_nx(self) -> int:
         if self._map is not None:
             return int(self._map.counts.shape[1])
@@ -1091,9 +1181,11 @@ class OffSpecularView(QWidget):
                        self.btn_export_png):
             widget.setEnabled(enabled)
         for widget in (self.spin_y0, self.spin_y1, self.btn_crosshair, self.btn_drop_cuts,
-                       self.btn_cut_h, self.btn_cut_v, self.btn_mode_direct_beam, self.btn_mode_pysared,
+                       self.btn_cut_h, self.btn_cut_v, self.chk_roi_sum_cut,
+                       self.btn_mode_direct_beam, self.btn_mode_pysared,
                        self.spin_dpp, self.spin_distance_mm, self.spin_det_width_mm, self.spin_x0,
-                       self.chk_af_increases, self.btn_fit_db, self.chk_show_db, self.spin_wavelength):
+                       self.chk_af_increases, self.btn_fit_db, self.chk_show_db, self.spin_wavelength,
+                       self.spin_curvature, self.slider_curvature, self.btn_reset_curvature):
             widget.setEnabled(enabled)
 
     # -------------------------------------------------------------- public API
@@ -1114,6 +1206,7 @@ class OffSpecularView(QWidget):
         self._clear_cuts()
         self._cal_message = ""
         self._sync_cal_controls()
+        self._sync_curvature_controls()
         has_det = bool(scan_data is not None and scan_data.has_detector_2d and scan_data.detector_shape
                        and len(scan_data.detector_shape) == 3)
         self._set_enabled(has_det)
@@ -1339,6 +1432,35 @@ class OffSpecularView(QWidget):
         exposure = None
         count = self.scan_data.variables.get("Count")
         monitor = self.scan_data.variables.get("Monitor1")
+
+        # Non-destructive per-spin sample curvature shear inside Signal (and BKG) ROI
+        effective_counts = self._map.counts
+        curv_warning = ""
+        params = self.scan_data.reduction_params
+        if abs(params.curvature_rad) > 0.0:
+            bounds = self._scan_roi_bounds()
+            if len(bounds) > 1:
+                curv_warning = "Sample curvature skipped: requires a fixed ROI (tracked ROI active)."
+            else:
+                sx0, sx1, _, _ = pixel_bounds(bounds[0], self._map.nx, max(1, self._map.y_bounds[1]))
+                bkg_win = None
+                if params.subtract_background:
+                    bx0, bx1, _, _ = bkg_roi_from_signal(
+                        bounds[0], params.bkg_x_bounds, self._map.nx, max(1, self._map.y_bounds[1])
+                    )
+                    bkg_win = (bx0, bx1)
+                try:
+                    effective_counts = apply_curvature_by_spin(
+                        self._map.counts,
+                        flipper,
+                        self._map.written,
+                        params.curvature_rad,
+                        (sx0, sx1),
+                        bkg_x_bounds=bkg_win,
+                    )
+                except ValueError as err:
+                    curv_warning = f"Sample curvature skipped: {err}"
+
         try:
             if mode == "time":
                 # Same exposure rule as the Scan Charts: seconds only, no raw fallback.
@@ -1359,13 +1481,13 @@ class OffSpecularView(QWidget):
                     self._show_unavailable(f"{label_name}: no u/d frame pairs at matching θ and 2θ.")
                     return
                 if spin == "asym":
-                    norm = spin_asymmetry(self._map.counts, up, down, mode,
+                    norm = spin_asymmetry(effective_counts, up, down, mode,
                                           min_counts=self.spin_min_counts.value(), **kw)
                 else:
-                    norm = sum_spin_frames(self._map.counts, up, down, mode, **kw)
+                    norm = sum_spin_frames(effective_counts, up, down, mode, **kw)
             else:
                 frames = select_frames(self._map.n_frames, flipper, spin)
-                norm = normalize_map(self._map.counts, frames, mode, **kw)
+                norm = normalize_map(effective_counts, frames, mode, **kw)
         except ValueError as error:
             self._show_unavailable(f"{error}. Choose another normalization.")
             return
@@ -1423,6 +1545,8 @@ class OffSpecularView(QWidget):
         notes = []
         if asym and mode == "raw":
             notes.append("Raw-count asymmetry assumes equal u/d exposure; Counts / Monitor1 corrects for this.")
+        if curv_warning:
+            notes.append(curv_warning)
         notes.extend(norm.warnings)
         if alpha_note:
             notes.append(alpha_note)
@@ -1436,6 +1560,8 @@ class OffSpecularView(QWidget):
             self._place_crosshair(*self._cell_center(self._sel_row, self._sel_x))
         elif self.btn_cut_h.isChecked() or self.btn_cut_v.isChecked():
             self._place_crosshair(*self._default_cut_pos())
+        elif self.chk_roi_sum_cut.isChecked():
+            self._update_roi_sum_cut()
 
     def _apply_no_data_background(self) -> None:
         # Neutral slate behind the map: blank (log-omitted / excluded) pixels stay
@@ -1588,6 +1714,14 @@ class OffSpecularView(QWidget):
             item.setZValue(10)
             self.plot.addItem(item)
             self._roi_items.append(item)
+        # Dashed cyan Background ROI boundaries when BKG subtraction is active (pySAred 1.5.3)
+        params = self.scan_data.reduction_params
+        if params.subtract_background:
+            bx0, bx1, _, _ = bkg_roi_from_signal(
+                bounds[0], params.bkg_x_bounds, self._map.nx, max(1, self._map.y_bounds[1])
+            )
+            for xb in (float(bx0), float(bx1)):
+                self._add_overlay([xb, xb], [0.0, float(frames.size)], "#06b6d4")
 
     def _draw_theta_overlay(self) -> None:
         g = self._th_geom
@@ -1608,9 +1742,9 @@ class OffSpecularView(QWidget):
         if not self.chk_show_roi.isChecked():
             return
         bounds = self._scan_roi_bounds()
+        y0, y1 = float(strips[:, 0].min()), float(strips[:, 1].max())
         if len(bounds) == 1:
             x_lo, x_hi = min(bounds[0][0], bounds[0][1]), max(bounds[0][0], bounds[0][1])
-            y0, y1 = float(strips[:, 0].min()), float(strips[:, 1].max())
             for xb in (x_lo, x_hi):
                 self._add_overlay([xb, xb], [y0, y1], "#facc15")
         else:
@@ -1619,6 +1753,13 @@ class OffSpecularView(QWidget):
             for col in (0, 1):
                 xb = np.minimum(per_row[:, 0], per_row[:, 1]) if col == 0 else np.maximum(per_row[:, 0], per_row[:, 1])
                 self._add_overlay(np.repeat(xb, 2), ys, "#facc15")
+        params = self.scan_data.reduction_params
+        if params.subtract_background:
+            bx0, bx1, _, _ = bkg_roi_from_signal(
+                bounds[0], params.bkg_x_bounds, self._map.nx, max(1, self._map.y_bounds[1])
+            )
+            for xb in (float(bx0), float(bx1)):
+                self._add_overlay([xb, xb], [y0, y1], "#06b6d4")
 
     # ------------------------------------------------------------- crosshair
     def _map_ready(self) -> bool:
@@ -1841,13 +1982,59 @@ class OffSpecularView(QWidget):
             plot.setYRange(lo - pad, hi + pad, padding=0)
             plot.getViewBox().disableAutoRange()
 
+    def _on_roi_sum_cut_toggled(self, checked: bool) -> None:
+        if checked:
+            self._update_roi_sum_cut()
+        else:
+            self._update_cuts()
+
+    def _update_roi_sum_cut(self) -> None:
+        """Plot X-integrated intensity across the Signal ROI in plot_col (live curvature feedback)."""
+        if not self._map_ready() or self._cut_values is None:
+            self._col_curve.setData([], [])
+            self._col_curve.setVisible(False)
+            return
+        bounds = self._scan_roi_bounds()
+        sx0, sx1, _, _ = pixel_bounds(bounds[0], self._map.nx, max(1, self._map.y_bounds[1]))
+        if sx1 <= sx0:
+            self._col_curve.setData([], [])
+            self._col_curve.setVisible(False)
+            return
+        roi_sum = np.nansum(self._cut_values[:, sx0:sx1], axis=1)
+        log = self._log_active()
+        vals = np.where(roi_sum > 0, roi_sum, np.nan) if log else roi_sum
+        if self._theta_mode() and self._th_geom is not None:
+            g = self._th_geom
+            order = np.argsort(g["theta"], kind="stable")
+            xs = g["theta"][order]
+            ys = vals[g["rows"][order]]
+        elif self._alpha_mode() and self._alpha_geom is not None:
+            g = self._alpha_geom
+            order = np.argsort(g["alpha_i"], kind="stable")
+            xs = g["alpha_i"][order]
+            ys = vals[g["rows"][order]]
+        else:
+            xs = np.arange(vals.size, dtype=float) + 0.5
+            ys = vals
+        self._col_curve.setPen(pg.mkPen("#f59e0b", width=2))
+        self._col_curve.setData(xs, ys)
+        self._col_curve.setVisible(True)
+        self.plot_col.setLogMode(y=log)
+        self.plot_col.getViewBox().enableAutoRange()
+        curv = self.scan_data.reduction_params.curvature_rad if self.scan_data is not None else 0.0
+        self.lbl_col_cut.setText(f"ROI-summed profile (X [{sx0}..{sx1}], γ = {curv:+.4f} rad):")
+
     def _update_cuts(self) -> None:
         if not self._crosshair_placed or not self._map_ready():
             self._clear_cuts()
+            if self.chk_roi_sum_cut.isChecked() and self._map_ready():
+                self._update_roi_sum_cut()
             return
         row_active, col_active = self._cut_curve_flags()
         if not (row_active or col_active):
             self._clear_cuts()
+            if self.chk_roi_sum_cut.isChecked():
+                self._update_roi_sum_cut()
             return
         row = min(self._sel_row, self._norm.frame_indices.size - 1)
         x = min(self._sel_x, self._map.nx - 1)
@@ -1861,6 +2048,8 @@ class OffSpecularView(QWidget):
         self._col_curve.setPen(pg.mkPen("#f43f5e" if self.is_dark_mode else "#e11d48", width=2))
         if self._alpha_mode():
             self._update_alpha_cuts(positive)
+            if self.chk_roi_sum_cut.isChecked():
+                self._update_roi_sum_cut()
             return
         frame = int(self._norm.frame_indices[row])
         if row_active:
@@ -1871,7 +2060,9 @@ class OffSpecularView(QWidget):
             self._row_curve.setData([], [])
             self._row_curve.setVisible(False)
             self.lbl_row_cut.setText("Horizontal cut (toggle Horizontal above):")
-        if col_active:
+        if self.chk_roi_sum_cut.isChecked():
+            self._update_roi_sum_cut()
+        elif col_active:
             if self._theta_mode():
                 g = self._th_geom
                 order = np.argsort(g["theta"], kind="stable")
@@ -2061,6 +2252,9 @@ class OffSpecularView(QWidget):
         if asym:
             header.append(f"Display blanks pixels with u+d < {norm.min_counts:g} raw counts; "
                           "exported values are not blanked.")
+        curv = self.scan_data.reduction_params.curvature_rad
+        if abs(curv) > 0.0:
+            header.append(f"Sample curvature correction (pySAred 1.5.3): gamma = {curv!r} rad (applied inside ROI per spin state).")
         if self._log_active():
             header.append("Log colour scale is display-only; values are linear.")
         if norm.warnings:
@@ -2743,3 +2937,13 @@ class OffSpecularView(QWidget):
             af = g["base"] + alpha_f_offset_for_pixel(xb, self._map.nx, cal)
             vx, vy = self._to_view(ai_pairs, np.repeat(af, 2))
             self._add_overlay(vx, vy, "#facc15", connect="pairs")
+        params = self.scan_data.reduction_params
+        if params.subtract_background:
+            bx0, bx1, _, _ = bkg_roi_from_signal(
+                bounds[0], params.bkg_x_bounds, self._map.nx, max(1, self._map.y_bounds[1])
+            )
+            for xb_val in (float(bx0), float(bx1)):
+                xb_arr = np.full(frames.size, xb_val, dtype=float)
+                af = g["base"] + alpha_f_offset_for_pixel(xb_arr, self._map.nx, cal)
+                vx, vy = self._to_view(ai_pairs, np.repeat(af, 2))
+                self._add_overlay(vx, vy, "#06b6d4", connect="pairs")

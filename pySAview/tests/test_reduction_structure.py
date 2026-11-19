@@ -13,9 +13,14 @@ import pySAview.core.normalization as legacy_norm
 import pySAview.core.off_specular as legacy_offspec
 import pySAview.core.reduction as reduction
 import pySAview.core.reduction.angle_calibration as red_angle_cal
+import pySAview.core.reduction.background as red_background
+import pySAview.core.reduction.curvature as red_curvature
 import pySAview.core.reduction.kinematics as red_kinematics
 import pySAview.core.reduction.normalization as red_norm
+import pySAview.core.reduction.overillumination as red_overillumination
 import pySAview.core.reduction.polarization as red_pol
+import pySAview.core.reduction.pysared as red_pysared
+import pySAview.core.reduction.resolution as red_resolution
 import pySAview.core.reduction.roi_extraction as red_roi
 import pySAview.core.roi as legacy_roi
 import pySAview.core.scan_calculations as legacy_scan_calc
@@ -63,7 +68,18 @@ def test_reduction_package_ast_purity():
 
 def test_reduction_public_exports_complete():
     """pySAview.core.reduction.__all__ exposes every submodule's public API."""
-    submodules = (red_angle_cal, red_kinematics, red_norm, red_pol, red_roi)
+    submodules = (
+        red_angle_cal,
+        red_background,
+        red_curvature,
+        red_kinematics,
+        red_norm,
+        red_overillumination,
+        red_pol,
+        red_pysared,
+        red_resolution,
+        red_roi,
+    )
     expected = set()
     for mod in submodules:
         expected.update(mod.__all__)

@@ -31,6 +31,7 @@ from PyQt6.QtWidgets import (
 
 from pySAview.core.models import ScanData
 from pySAview.core.off_specular import _written_frames, pair_spin_frames
+from pySAview.core.reduction.background import bkg_roi_from_signal, default_bkg_x_bounds, rois_overlap_x
 from pySAview.core.roi_record import ROIRecord, save_roi, load_roi
 from pySAview.core.nexus_reader import NexusReader
 from pySAview.core.scan_calculations import integrate_roi_2d
@@ -59,6 +60,8 @@ class DetectorView(QWidget):
 
     # Signal emitted when user applies a new ROI: passes (roi_counts_array, (x0, x1, y0, y1))
     roi_applied = pyqtSignal(object, tuple)
+    # Signal emitted when background ROI state or X bounds change for the active scan
+    bkg_roi_changed = pyqtSignal(str)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -82,7 +85,9 @@ class DetectorView(QWidget):
         self._play_timer.timeout.connect(self._step_forward)
 
         self._roi_rect_item: pg.RectROI | None = None
+        self._bkg_roi_rect_item: pg.RectROI | None = None
         self._updating_roi_internally: bool = False
+        self._updating_bkg_internally: bool = False
 
         # Per-frame auto-fit tracking state
         self._per_frame_rois: list[tuple[float, float, float, float]] | None = None
@@ -332,6 +337,54 @@ class DetectorView(QWidget):
 
         sidebar_layout.addWidget(roi_ctrl_group)
 
+        # 1b. Background ROI Card (pySAred 1.5.3: same Y & same width as Signal ROI)
+        bkg_ctrl_group = QGroupBox("Background ROI (pySAred 1.5.3)")
+        bkg_ctrl_group.setMinimumSize(0, 0)
+        bkg_layout = QVBoxLayout(bkg_ctrl_group)
+        bkg_layout.setSpacing(6)
+
+        self.chk_enable_bkg = QCheckBox("Enable background ROI subtraction")
+        self.chk_enable_bkg.setToolTip(
+            "Use a second ROI of equal width and same Y rows to subtract background counts (pySAred 1.5.3)."
+        )
+        self.chk_enable_bkg.toggled.connect(self._on_bkg_toggled)
+        bkg_layout.addWidget(self.chk_enable_bkg)
+
+        bkg_row = QHBoxLayout()
+        bkg_row.setSpacing(6)
+        bkg_row.addWidget(QLabel("BKG X0:"))
+        self.spin_bkg_x0 = QSpinBox()
+        self.spin_bkg_x0.setMinimumWidth(50)
+        self.spin_bkg_x0.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        self.spin_bkg_x0.setRange(0, 1024)
+        self.spin_bkg_x0.setReadOnly(True)
+        self.spin_bkg_x0.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
+        self.spin_bkg_x0.setToolTip("Background X Min (locked to BKG X1 minus signal ROI width, as in pySAred 1.5.3).")
+        bkg_row.addWidget(self.spin_bkg_x0, 1)
+
+        bkg_row.addWidget(QLabel("X1:"))
+        self.spin_bkg_x1 = QSpinBox()
+        self.spin_bkg_x1.setMinimumWidth(55)
+        self.spin_bkg_x1.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        self.spin_bkg_x1.setRange(1, 1024)
+        self.spin_bkg_x1.setToolTip("Background X Max (slides the cyan BKG box horizontally while keeping width locked).")
+        self.spin_bkg_x1.valueChanged.connect(self._on_bkg_spin_changed)
+        bkg_row.addWidget(self.spin_bkg_x1, 1)
+
+        self.btn_bkg_auto = QPushButton("Auto")
+        self.btn_bkg_auto.setToolTip("Place BKG ROI at pySAred default [x0 - 2w, x0 - w]")
+        self.btn_bkg_auto.clicked.connect(self._reset_bkg_to_default)
+        bkg_row.addWidget(self.btn_bkg_auto)
+        bkg_layout.addLayout(bkg_row)
+
+        self.lbl_bkg_metrics = QLabel("BKG ROI inactive (enable to subtract background in Scan Charts).")
+        self.lbl_bkg_metrics.setWordWrap(True)
+        self.lbl_bkg_metrics.setMinimumWidth(0)
+        self.lbl_bkg_metrics.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.lbl_bkg_metrics.setStyleSheet("color: #64748b; font-size: 11px;")
+        bkg_layout.addWidget(self.lbl_bkg_metrics)
+        sidebar_layout.addWidget(bkg_ctrl_group)
+
         # 2. 1D Horizontal Cut
         lbl_x_cut = QLabel("Horizontal Profile (X-Cut through ROI):")
         lbl_x_cut.setMinimumWidth(0)
@@ -414,6 +467,12 @@ class DetectorView(QWidget):
             self.btn_auto_fit.setEnabled(False)
             self.btn_apply_roi.setEnabled(False)
             self.combo_spin_filter.setEnabled(False)
+            self.chk_enable_bkg.setEnabled(False)
+            self.spin_bkg_x1.setEnabled(False)
+            self.btn_bkg_auto.setEnabled(False)
+            if self._bkg_roi_rect_item is not None:
+                self.plot_2d.removeItem(self._bkg_roi_rect_item)
+                self._bkg_roi_rect_item = None
             return
 
         self._per_frame_rois = None
@@ -467,6 +526,38 @@ class DetectorView(QWidget):
 
         self.plot_2d.addItem(self._roi_rect_item)
         self._roi_rect_item.setVisible(self.chk_show_roi.isChecked())
+
+        # Setup 2nd Background RectROI (cyan dashed, width & Y locked to Signal ROI)
+        if self._bkg_roi_rect_item is not None:
+            self.plot_2d.removeItem(self._bkg_roi_rect_item)
+            self._bkg_roi_rect_item = None
+
+        nx = int(scan_data.detector_shape[1])
+        params = scan_data.reduction_params
+        if params.bkg_x_bounds is None:
+            params.bkg_x_bounds = default_bkg_x_bounds(pos_x, pos_x + size_x, nx=nx)
+        bx0, bx1 = params.bkg_x_bounds
+        bx_min = min(float(bx0), float(bx1))
+
+        self._bkg_roi_rect_item = pg.RectROI(
+            pos=[bx_min, pos_y],
+            size=[size_x, size_y],
+            pen=pg.mkPen("#06b6d4", width=2, style=Qt.PenStyle.DashLine),
+            movable=True,
+            resizable=False,
+        )
+        self._bkg_roi_rect_item.sigRegionChanged.connect(self._on_bkg_roi_dragged)
+        self.plot_2d.addItem(self._bkg_roi_rect_item)
+        self._bkg_roi_rect_item.setVisible(self.chk_show_roi.isChecked() and params.subtract_background)
+
+        self.chk_enable_bkg.setEnabled(True)
+        self.spin_bkg_x1.setEnabled(True)
+        self.btn_bkg_auto.setEnabled(True)
+        self._updating_bkg_internally = True
+        self.chk_enable_bkg.setChecked(bool(params.subtract_background))
+        self.spin_bkg_x0.setValue(max(0, min(nx, int(round(bx_min)))))
+        self.spin_bkg_x1.setValue(max(1, min(nx, int(round(bx_min + size_x)))))
+        self._updating_bkg_internally = False
 
         self._sync_spinboxes_from_bounds(pos_x, pos_x + size_x, pos_y, pos_y + size_y)
 
@@ -694,6 +785,9 @@ class DetectorView(QWidget):
     def _toggle_roi_visibility(self, visible: bool) -> None:
         if self._roi_rect_item is not None:
             self._roi_rect_item.setVisible(visible)
+        if self._bkg_roi_rect_item is not None:
+            bkg_on = bool(self.scan_data is not None and self.scan_data.reduction_params.subtract_background)
+            self._bkg_roi_rect_item.setVisible(visible and bkg_on)
 
     def _refresh_current_frame(self) -> None:
         if self._frame_dirty or self._frame_data is None:
@@ -733,6 +827,7 @@ class DetectorView(QWidget):
 
         x0, x1, y0, y1 = self._get_current_roi_bounds()
         self._sync_spinboxes_from_bounds(x0, x1, y0, y1)
+        self._sync_bkg_geometry_to_signal(x0, x1, y0, y1)
         self._update_profiles_and_counts(x0, x1, y0, y1)
 
     def _on_spin_roi_changed(self) -> None:
@@ -762,6 +857,7 @@ class DetectorView(QWidget):
         self._roi_rect_item.setSize([size_x, size_y])
         self._updating_roi_internally = False
 
+        self._sync_bkg_geometry_to_signal(min_x, min_x + size_x, min_y, min_y + size_y)
         self._update_profiles_and_counts(min_x, min_x + size_x, min_y, min_y + size_y)
 
     def _reset_to_file_roi(self) -> None:
@@ -786,9 +882,166 @@ class DetectorView(QWidget):
             self._updating_roi_internally = False
 
         self._sync_spinboxes_from_bounds(min_x, min_x + size_x, min_y, min_y + size_y)
+        self._sync_bkg_geometry_to_signal(min_x, min_x + size_x, min_y, min_y + size_y)
         self._apply_roi_to_scan_chart()
         self.lbl_roi_status.setText("Reset to default file ROI.")
         self.lbl_roi_status.setStyleSheet("color: #64748b; font-size: 11px;")
+
+    # ------------------------------------------------------------------ Background ROI (pySAred 1.5.3)
+    def _detector_nx(self) -> int:
+        if self.scan_data is not None and self.scan_data.detector_shape is not None:
+            return int(self.scan_data.detector_shape[1])
+        return 1024
+
+    def _sync_bkg_geometry_to_signal(self, sx0: float, sx1: float, sy0: float, sy1: float) -> None:
+        """Keep the Background ROI width and Y range locked to the Signal ROI (pySAred 1.5.3)."""
+        if self.scan_data is None or self._bkg_roi_rect_item is None:
+            return
+        nx = self._detector_nx()
+        w = max(1.0, abs(sx1 - sx0))
+        y_min = min(sy0, sy1)
+        h = max(1.0, abs(sy1 - sy0))
+
+        params = self.scan_data.reduction_params
+        if params.bkg_x_bounds is None:
+            bx0, bx1 = default_bkg_x_bounds(sx0, sx1, nx=nx)
+        else:
+            _, prev_x1 = params.bkg_x_bounds
+            bx1 = max(w, min(float(nx), float(prev_x1)))
+            bx0 = max(0.0, bx1 - w)
+            bx1 = bx0 + w
+        params.bkg_x_bounds = (bx0, bx1)
+        self.scan_data.working_bkg_counts = None
+
+        self._updating_bkg_internally = True
+        self._bkg_roi_rect_item.setPos([bx0, y_min])
+        self._bkg_roi_rect_item.setSize([w, h])
+        self.spin_bkg_x0.setValue(max(0, min(nx, int(round(bx0)))))
+        self.spin_bkg_x1.setValue(max(1, min(nx, int(round(bx1)))))
+        self._updating_bkg_internally = False
+
+    def _on_bkg_toggled(self, checked: bool) -> None:
+        if self._updating_bkg_internally or self.scan_data is None:
+            return
+        self.scan_data.reduction_params.subtract_background = bool(checked)
+        self.scan_data.working_bkg_counts = None
+        if self._bkg_roi_rect_item is not None:
+            self._bkg_roi_rect_item.setVisible(bool(checked) and self.chk_show_roi.isChecked())
+        x0, x1, y0, y1 = self._get_current_roi_bounds()
+        if self._frame_data is not None:
+            self._update_profiles_and_counts(x0, x1, y0, y1)
+        else:
+            self._refresh_bkg_metrics(x0, x1, y0, y1)
+        self.bkg_roi_changed.emit(self.scan_data.file_path)
+
+    def _on_bkg_roi_dragged(self) -> None:
+        """Horizontal drag of cyan BKG ROI: lock Y and width to Signal ROI."""
+        if self._updating_bkg_internally or self.scan_data is None or self._bkg_roi_rect_item is None:
+            return
+        sx0, sx1, sy0, sy1 = self._get_current_roi_bounds()
+        nx = self._detector_nx()
+        w = max(1.0, abs(sx1 - sx0))
+        y_min = min(sy0, sy1)
+        h = max(1.0, abs(sy1 - sy0))
+
+        bx0 = max(0.0, min(float(nx) - w, float(self._bkg_roi_rect_item.pos().x())))
+        bx1 = bx0 + w
+
+        self._updating_bkg_internally = True
+        self._bkg_roi_rect_item.setPos([bx0, y_min])
+        self._bkg_roi_rect_item.setSize([w, h])
+        self.spin_bkg_x0.setValue(max(0, min(nx, int(round(bx0)))))
+        self.spin_bkg_x1.setValue(max(1, min(nx, int(round(bx1)))))
+        self._updating_bkg_internally = False
+
+        self.scan_data.reduction_params.bkg_x_bounds = (bx0, bx1)
+        self.scan_data.working_bkg_counts = None
+        if self._frame_data is not None:
+            self._update_profiles_and_counts(sx0, sx1, sy0, sy1)
+        else:
+            self._refresh_bkg_metrics(sx0, sx1, sy0, sy1)
+        self.bkg_roi_changed.emit(self.scan_data.file_path)
+
+    def _on_bkg_spin_changed(self, value: int) -> None:
+        if self._updating_bkg_internally or self.scan_data is None or self._bkg_roi_rect_item is None:
+            return
+        sx0, sx1, sy0, sy1 = self._get_current_roi_bounds()
+        nx = self._detector_nx()
+        w = max(1.0, abs(sx1 - sx0))
+        bx1 = max(w, min(float(nx), float(value)))
+        bx0 = max(0.0, bx1 - w)
+        bx1 = bx0 + w
+
+        self._updating_bkg_internally = True
+        self._bkg_roi_rect_item.setPos([bx0, min(sy0, sy1)])
+        self._bkg_roi_rect_item.setSize([w, max(1.0, abs(sy1 - sy0))])
+        self.spin_bkg_x0.setValue(max(0, min(nx, int(round(bx0)))))
+        self.spin_bkg_x1.setValue(max(1, min(nx, int(round(bx1)))))
+        self._updating_bkg_internally = False
+
+        self.scan_data.reduction_params.bkg_x_bounds = (bx0, bx1)
+        self.scan_data.working_bkg_counts = None
+        if self._frame_data is not None:
+            self._update_profiles_and_counts(sx0, sx1, sy0, sy1)
+        else:
+            self._refresh_bkg_metrics(sx0, sx1, sy0, sy1)
+        self.bkg_roi_changed.emit(self.scan_data.file_path)
+
+    def _reset_bkg_to_default(self) -> None:
+        if self.scan_data is None or self._bkg_roi_rect_item is None:
+            return
+        sx0, sx1, sy0, sy1 = self._get_current_roi_bounds()
+        nx = self._detector_nx()
+        bx0, bx1 = default_bkg_x_bounds(sx0, sx1, nx=nx)
+        self.scan_data.reduction_params.bkg_x_bounds = (bx0, bx1)
+        self.scan_data.working_bkg_counts = None
+        self._sync_bkg_geometry_to_signal(sx0, sx1, sy0, sy1)
+        if self._frame_data is not None:
+            self._update_profiles_and_counts(sx0, sx1, sy0, sy1)
+        else:
+            self._refresh_bkg_metrics(sx0, sx1, sy0, sy1)
+        self.bkg_roi_changed.emit(self.scan_data.file_path)
+
+    def sync_from_scan(self) -> None:
+        """Refresh BKG ROI controls & overlay from ``scan_data.reduction_params`` (e.g. toggled in Scan Charts)."""
+        if self.scan_data is None or self._bkg_roi_rect_item is None:
+            return
+        params = self.scan_data.reduction_params
+        sx0, sx1, sy0, sy1 = self._get_current_roi_bounds()
+        self._sync_bkg_geometry_to_signal(sx0, sx1, sy0, sy1)
+        self._updating_bkg_internally = True
+        self.chk_enable_bkg.setChecked(bool(params.subtract_background))
+        self._updating_bkg_internally = False
+        self._bkg_roi_rect_item.setVisible(bool(params.subtract_background) and self.chk_show_roi.isChecked())
+        if self._frame_data is not None:
+            self._update_profiles_and_counts(sx0, sx1, sy0, sy1)
+        else:
+            self._refresh_bkg_metrics(sx0, sx1, sy0, sy1)
+
+    def _refresh_bkg_metrics(self, sx0: float, sx1: float, sy0: float, sy1: float) -> None:
+        if self.scan_data is None:
+            return
+        params = self.scan_data.reduction_params
+        if not params.subtract_background:
+            self.lbl_bkg_metrics.setText("BKG ROI inactive (enable to subtract background in Scan Charts).")
+            self.lbl_bkg_metrics.setStyleSheet("color: #64748b; font-size: 11px;")
+            return
+        nx = self._detector_nx()
+        bx_bounds = params.bkg_x_bounds or default_bkg_x_bounds(sx0, sx1, nx=nx)
+        overlap = rois_overlap_x((sx0, sx1), bx_bounds, nx=nx)
+        if self._frame_data is not None:
+            ny_f, nx_f = self._frame_data.shape
+            bx0, bx1, by0, by1 = bkg_roi_from_signal((sx0, sx1, sy0, sy1), bx_bounds, nx_f, ny_f)
+            bkg_cnt, _, _ = integrate_roi_2d(self._frame_data, (float(bx0), float(bx1), float(by0), float(by1)))
+            count_txt = f"BKG Frame Counts: <b>{bkg_cnt:,.0f}</b> (X [{bx0}..{bx1}], Y [{by0}..{by1}])"
+        else:
+            count_txt = f"BKG X [{bx_bounds[0]:.0f}..{bx_bounds[1]:.0f}] (width- & Y-locked)"
+        if overlap:
+            self.lbl_bkg_metrics.setText(f"⚠ BKG ROI overlaps Signal ROI! {count_txt}")
+            self.lbl_bkg_metrics.setStyleSheet("color: #d97706; font-weight: 600; font-size: 11px;")
+        else:
+            self.lbl_bkg_metrics.setText(count_txt)
+            self.lbl_bkg_metrics.setStyleSheet("color: #0891b2; font-size: 11px;")
 
     def _current_roi_record(self):
         shape = self.scan_data.detector_shape
@@ -839,6 +1092,7 @@ class DetectorView(QWidget):
         self._roi_rect_item.setSize([abs(x1-x0), abs(y1-y0)])
         self._updating_roi_internally = False
         self._sync_spinboxes_from_bounds(*bounds)
+        self._sync_bkg_geometry_to_signal(*bounds)
         self._update_profiles_and_counts(*bounds)
         self.lbl_roi_status.setText("Loaded into this scan only. Review for drift, then Apply ROI to Scan Chart.")
 
@@ -924,6 +1178,7 @@ class DetectorView(QWidget):
                 self._updating_roi_internally = False
 
             self._sync_spinboxes_from_bounds(min_x, min_x + size_x, min_y, min_y + size_y)
+            self._sync_bkg_geometry_to_signal(min_x, min_x + size_x, min_y, min_y + size_y)
             self._update_profiles_and_counts(min_x, min_x + size_x, min_y, min_y + size_y)
 
         centers = [(r[0] + r[1]) / 2.0 for r in rois]
@@ -964,13 +1219,32 @@ class DetectorView(QWidget):
             f"<b>Peak in ROI:</b> {np.max(x_profile) if len(x_profile) else 0:.0f} cts"
         )
         self.lbl_roi_metrics.setText(roi_text)
+        self._refresh_bkg_metrics(x0, x1, y0, y1)
 
-        # Plot horizontal cut
+        # Plot horizontal cut (expand to show both Signal and BKG windows when BKG ROI is active)
         self.plot_x_cut.clear()
         pen_x = "#38bdf8" if self.is_dark_mode else "#0284c7"
         ix0, ix1, iy0, iy1 = pixel_bounds((x0, x1, y0, y1), frame.shape[1], frame.shape[0])
-        x_coords = np.arange(ix0, ix1)
-        self.plot_x_cut.plot(x_coords, x_profile, pen=pg.mkPen(pen_x, width=2), symbol="o", symbolSize=3)
+        bkg_on = bool(self.scan_data is not None and self.scan_data.reduction_params.subtract_background)
+        if bkg_on and iy1 > iy0:
+            bx0, bx1, _, _ = bkg_roi_from_signal(
+                (x0, x1, y0, y1),
+                self.scan_data.reduction_params.bkg_x_bounds,
+                frame.shape[1],
+                frame.shape[0],
+            )
+            pad = max(10, (ix1 - ix0) // 2)
+            vx0 = max(0, min(ix0, bx0) - pad)
+            vx1 = min(frame.shape[1], max(ix1, bx1) + pad)
+            wide_prof = np.sum(frame[iy0:iy1, vx0:vx1], axis=0, dtype=float)
+            self.plot_x_cut.plot(np.arange(vx0, vx1), wide_prof, pen=pg.mkPen(pen_x, width=2))
+            sig_band = pg.LinearRegionItem([ix0, ix1], movable=False, brush=pg.mkBrush(250, 204, 21, 55), pen=pg.mkPen("#facc15", width=1))
+            bkg_band = pg.LinearRegionItem([bx0, bx1], movable=False, brush=pg.mkBrush(6, 182, 212, 55), pen=pg.mkPen("#06b6d4", width=1, style=Qt.PenStyle.DashLine))
+            self.plot_x_cut.addItem(sig_band)
+            self.plot_x_cut.addItem(bkg_band)
+        else:
+            x_coords = np.arange(ix0, ix1)
+            self.plot_x_cut.plot(x_coords, x_profile, pen=pg.mkPen(pen_x, width=2), symbol="o", symbolSize=3)
         self.plot_x_cut.setLabel("bottom", "X Pixel", color="#f1f5f9" if self.is_dark_mode else "#0f172a")
         self.plot_x_cut.setLabel("left", "Counts", color="#f1f5f9" if self.is_dark_mode else "#0f172a")
 

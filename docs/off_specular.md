@@ -102,9 +102,19 @@ consistent with such an offset.
 The mapping from pixel to angle is linear, which is the form the calibration
 fits. In the example scans the detector covers about −3° to +5.4° around x₀;
 over that range the linear mapping differs from flat-detector atan geometry by
-at most ~0.006°, less than one pixel (0.0082°). Fitting the direct beam with
-atan geometry instead does not reduce the residuals, so the data cannot tell
-the two apart. No sample-curvature correction is applied.
+at most ~0.006°, less than one pixel (0.0082°). Fitting the direct beam with atan geometry instead does not reduce the residuals,
+so the data cannot tell the two apart.
+
+## Sample curvature and background ROI overlay
+
+Per-scan **Sample curvature** (`γ`, in radians, following pySAred 1.5.3) can be
+adjusted directly in **2D Map** (synced bidirectionally with
+**Scan Charts ▸ Reduction**). Shearing is applied non-destructively per spin state
+inside the signal ROI columns (and independently inside the background ROI columns
+when enabled); resetting `γ = 0` restores the exact uncorrected map. Enable
+**ROI-summed profile** in the cuts panel to watch Kiessig fringes sharpen live as
+`γ` is tuned. When background ROI subtraction is active, dashed cyan lines mark
+the background ROI boundaries on the map. See [Data reduction](reduction.md).
 
 **Sample-to-detector distance.** In **Direct-beam fit** mode no distance is
 needed or entered: Δ is measured directly in degrees per pixel, and α_f, Qx and
