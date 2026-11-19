@@ -37,6 +37,7 @@ from pySAview.core.scan_calculations import integrate_roi_2d
 from pySAview.core.roi import pixel_bounds
 from pySAview.ui import icons
 from pySAview.ui.flow_layout import (
+    FlowContainer,
     FlowLayout,
     configure_compact_combo,
     fit_combo_popup,
@@ -97,7 +98,7 @@ class DetectorView(QWidget):
         main_layout.setSpacing(8)
 
         # ---------------- Top Controls / Scrubber Bar ----------------
-        ctrl_bar = FlowLayout(margin=0, h_spacing=8, v_spacing=6)
+        ctrl_bar = FlowContainer(margin=0, h_spacing=8, v_spacing=6)
 
         self.btn_play = tool_button("Play / pause through the frames")
         self.btn_play.setIcon(icons.get_icon("play", is_dark=self.is_dark_mode))
@@ -110,7 +111,8 @@ class DetectorView(QWidget):
         self.btn_next = tool_button("Next frame")
         self.btn_next.setIcon(icons.get_icon("chevron_right", is_dark=self.is_dark_mode))
         self.btn_next.clicked.connect(self._step_forward)
-        ctrl_bar.addWidget(make_flow_group(self.btn_play, self.btn_prev, self.btn_next, spacing=4))
+        for btn in (self.btn_play, self.btn_prev, self.btn_next):
+            ctrl_bar.addWidget(btn)
 
         self.combo_spin_filter = configure_compact_combo(QComboBox(), min_chars=14)
         self.combo_spin_filter.addItem("All Frames", "all")
@@ -151,7 +153,7 @@ class DetectorView(QWidget):
         self.combo_cmap.currentTextChanged.connect(self._on_cmap_changed)
         ctrl_bar.addWidget(make_flow_group(QLabel("Colormap:"), self.combo_cmap, spacing=6))
 
-        main_layout.addLayout(ctrl_bar)
+        main_layout.addWidget(ctrl_bar)
 
         # ---------------- Central Splitter: 2D Image + ROI Controls & 1D Profiles ----------------
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -168,7 +170,7 @@ class DetectorView(QWidget):
         img_layout.setSpacing(6)
 
         # Interactive 2D Image Toolbar
-        img_toolbar = FlowLayout(margin=0, h_spacing=6, v_spacing=4)
+        img_toolbar = FlowContainer(margin=0, h_spacing=6, v_spacing=4)
 
         # Icon-only tools, matching the Scan Charts and Off-Specular toolbars.
         self.btn_img_pan = tool_button("Pan: drag to move the detector image", checkable=True)
@@ -187,17 +189,15 @@ class DetectorView(QWidget):
         self.btn_img_reset.clicked.connect(self._img_reset_view)
         self.btn_img_export = tool_button("Export the frame as a PNG or SVG image")
         self.btn_img_export.clicked.connect(self.export_image)
-        img_toolbar.addWidget(
-            make_flow_group(
-                self.btn_img_pan,
-                self.btn_img_box_zoom,
-                self.btn_img_zoom_in,
-                self.btn_img_zoom_out,
-                self.btn_img_reset,
-                self.btn_img_export,
-                spacing=4,
-            )
-        )
+        for btn in (
+            self.btn_img_pan,
+            self.btn_img_box_zoom,
+            self.btn_img_zoom_in,
+            self.btn_img_zoom_out,
+            self.btn_img_reset,
+            self.btn_img_export,
+        ):
+            img_toolbar.addWidget(btn)
 
         # Per-frame angles, spin and counts (the step itself is in the controls above).
         self.lbl_frame_info = QLabel("")
@@ -212,10 +212,11 @@ class DetectorView(QWidget):
         self.lbl_img_coords.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         img_toolbar.addWidget(self.lbl_img_coords)
 
-        img_layout.addLayout(img_toolbar)
+        img_layout.addWidget(img_toolbar)
 
         self.plot_2d = pg.PlotWidget()
         self.plot_2d.setMinimumSize(0, 0)
+        self.plot_2d.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
         self.plot_2d.setAspectLocked(True)
         self.plot_2d.showGrid(x=False, y=False)
         self.plot_2d.getViewBox().setMouseMode(pg.ViewBox.PanMode)

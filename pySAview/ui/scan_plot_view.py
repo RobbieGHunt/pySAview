@@ -49,7 +49,7 @@ from pySAview.core.normalization import (
     is_count_channel, normalize_signal, log_error_bounds,
 )
 from pySAview.ui import icons
-from pySAview.ui.flow_layout import FlowLayout, configure_compact_combo, fit_combo_popup
+from pySAview.ui.flow_layout import FlowContainer, configure_compact_combo, fit_combo_popup
 from pySAview.ui.plot_tools import (
     TABLE_FILTERS, ask_output_path, export_plot_image, install_context_export, tool_button,
 )
@@ -344,6 +344,7 @@ class ScanPlotView(QWidget):
         self.lbl_title.setWordWrap(True)
         self.lbl_title.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         self.lbl_title.setMinimumWidth(0)
+        self.lbl_title.setMaximumHeight(44)
         self.lbl_title.setTextFormat(Qt.TextFormat.PlainText)
         self.lbl_title.setStyleSheet("font-weight: 700; font-size: 14px; color: #0284c7;")
         header_row.addWidget(self.lbl_title, 1)
@@ -368,7 +369,7 @@ class ScanPlotView(QWidget):
         right_layout.addWidget(self.lbl_processing)
 
         # Interactive Plot Toolbar (Pan, Box Zoom, Zoom In, Zoom Out, Auto-scale, Log Toggles)
-        toolbar_row = FlowLayout(margin=0, h_spacing=6, v_spacing=4)
+        toolbar_row = FlowContainer(margin=0, h_spacing=6, v_spacing=4)
 
         self.btn_pan = tool_button("Pan: drag to move the chart", checkable=True)
         self.btn_pan.setChecked(True)
@@ -403,11 +404,12 @@ class ScanPlotView(QWidget):
             toolbar_row.addWidget(btn)
         # The cursor readout shares the toolbar row, as in the other plot tabs.
         toolbar_row.addWidget(self.lbl_coords)
-        right_layout.addLayout(toolbar_row)
+        right_layout.addWidget(toolbar_row)
 
         # pyqtgraph Plot
         self.plot_widget = pg.PlotWidget()
         self.plot_widget.setMinimumSize(0, 0)
+        self.plot_widget.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
         install_context_export(self.plot_widget, self._default_export_name("reflectivity", ".png"), self._source_paths)
         self.legend = self.plot_widget.addLegend()
         self.legend.anchor(itemPos=(1, 0), parentPos=(1, 0), offset=(-15, 15))
@@ -435,6 +437,7 @@ class ScanPlotView(QWidget):
         right_layout.addLayout(data_header)
         bottom_tabs = self.bottom_tabs = QTabWidget()
         bottom_tabs.setMinimumSize(0, 0)
+        bottom_tabs.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
         bottom_tabs.setUsesScrollButtons(True)
         bottom_tabs.tabBar().setExpanding(False)
         self.chk_show_data_panel.toggled.connect(self._update_data_panel_toggle)

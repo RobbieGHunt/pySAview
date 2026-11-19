@@ -211,6 +211,38 @@ class FlowLayout(QLayout):
         return max(margins.top() + margins.bottom(), total_h)
 
 
+class FlowContainer(QWidget):
+    """Transparent QWidget hosting a FlowLayout so wrapped controls clip cleanly to their band."""
+
+    def __init__(
+        self,
+        parent: QWidget | None = None,
+        *,
+        margin: int = 0,
+        h_spacing: int = -1,
+        v_spacing: int = -1,
+    ) -> None:
+        super().__init__(parent)
+        self.setObjectName("flowContainer")
+        self.setStyleSheet("QWidget#flowContainer { background: transparent; }")
+        self.flow_layout = FlowLayout(
+            self, margin=margin, h_spacing=h_spacing, v_spacing=v_spacing
+        )
+        self.setMinimumSize(0, 0)
+        policy = QSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        policy.setHeightForWidth(True)
+        self.setSizePolicy(policy)
+
+    def addWidget(self, widget: QWidget) -> None:
+        self.flow_layout.addWidget(widget)
+
+    def hasHeightForWidth(self) -> bool:
+        return True
+
+    def heightForWidth(self, width: int) -> int:
+        return self.flow_layout.heightForWidth(width)
+
+
 def make_flow_group(
     *widgets: QWidget,
     spacing: int = 6,

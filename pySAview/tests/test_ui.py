@@ -614,9 +614,48 @@ def test_window_unrestricted_compression_empty_and_loaded(qtbot, qapp, example_n
 
 
 def test_flow_layout_wraps_control_bars_without_overlap(qtbot, qapp, main_window: MainWindow):
-    """Wide top control bars in DetectorView and OffSpecularView wrap smoothly without overlap."""
-    from PyQt6.QtWidgets import QComboBox
-    from pySAview.ui.flow_layout import FlowLayout
+    """Wide top control bars and plot toolbars wrap smoothly with zero sibling overlap across sizes."""
+    from PyQt6.QtWidgets import (
+        QAbstractScrollArea,
+        QComboBox,
+        QScrollBar,
+        QSpinBox,
+        QSplitterHandle,
+        QTabBar,
+        QWidget,
+    )
+    from pySAview.ui.flow_layout import FlowContainer
+
+    def assert_no_sibling_overlaps(root: QWidget) -> None:
+        def walk(parent: QWidget) -> None:
+            if isinstance(parent, (QAbstractScrollArea, QSpinBox, QComboBox, QTabBar)):
+                return
+            kids = []
+            for child in parent.children():
+                if not isinstance(child, QWidget):
+                    continue
+                if isinstance(child, (QSplitterHandle, QScrollBar, QTabBar)):
+                    continue
+                if child.objectName().startswith("qt_"):
+                    continue
+                if child.isHidden() or not child.isVisible():
+                    continue
+                rect = child.geometry()
+                if rect.width() <= 0 or rect.height() <= 0:
+                    continue
+                kids.append((child, rect))
+            for a in range(len(kids)):
+                for b in range(a + 1, len(kids)):
+                    inter = kids[a][1].intersected(kids[b][1])
+                    assert not (inter.width() > 1 and inter.height() > 1), (
+                        f"Overlap inside {type(parent).__name__}: "
+                        f"{type(kids[a][0]).__name__} {kids[a][1]} vs "
+                        f"{type(kids[b][0]).__name__} {kids[b][1]}"
+                    )
+            for child, _ in kids:
+                walk(child)
+
+        walk(root)
 
     main_window.show()
     qapp.processEvents()
@@ -639,31 +678,27 @@ def test_flow_layout_wraps_control_bars_without_overlap(qtbot, qapp, main_window
         # Toggle optional asymmetry spinbox visible so FlowLayout wrapping is exercised with it too
         main_window.view_offspec.spin_min_counts.setVisible(True)
 
+        # Top control bars in DetectorView & OffSpecularView wrap onto more rows as width narrows
         for tab_idx in (2, 3):
             main_window.tabs.setCurrentIndex(tab_idx)
             view = main_window.tabs.widget(tab_idx)
-            top_flow = view.layout().itemAt(0).layout()
-            assert isinstance(top_flow, FlowLayout)
-
+            top_bar = view.layout().itemAt(0).widget()
+            assert isinstance(top_bar, FlowContainer)
             heights = {}
-            for width, height in ((1600, 860), (1300, 860), (500, 350)):
+            for width, height in ((1600, 860), (500, 350)):
                 main_window.resize(width, height)
                 qapp.processEvents()
-                heights[width] = top_flow.geometry().height()
-
-                # No overlapping visible sibling widgets in any FlowLayout inside the tab
-                for flow in view.findChildren(FlowLayout):
-                    visible_rects = []
-                    for i in range(flow.count()):
-                        w = flow.itemAt(i).widget()
-                        if w is not None and not w.isHidden() and w.isVisibleTo(view):
-                            visible_rects.append(w.geometry())
-                    for a in range(len(visible_rects)):
-                        for b in range(a + 1, len(visible_rects)):
-                            inter = visible_rects[a].intersected(visible_rects[b])
-                            assert not (inter.width() > 0 and inter.height() > 0)
-
+                heights[width] = top_bar.height()
             assert heights[500] > heights[1600]
+
+        # Full sibling-overlap sweep across ALL 5 tabs at normal, intermediate, and compressed sizes
+        # (catches toolbar-over-plot overlap AND toolbar-button pileup when narrow)
+        for width, height in ((1300, 860), (600, 450), (500, 350), (400, 420), (320, 380), (320, 240)):
+            main_window.resize(width, height)
+            for tab_idx in range(main_window.tabs.count()):
+                main_window.tabs.setCurrentIndex(tab_idx)
+                qapp.processEvents()
+                assert_no_sibling_overlaps(main_window.tabs.widget(tab_idx))
     finally:
         main_window.view_offspec.shutdown()
         main_window.close()

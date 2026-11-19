@@ -78,6 +78,7 @@ from pySAview.core.off_specular import (
 from pySAview.core.export_tables import map_table, write_table
 from pySAview.ui import icons
 from pySAview.ui.flow_layout import (
+    FlowContainer,
     FlowLayout,
     configure_compact_combo,
     fit_combo_popup,
@@ -618,7 +619,7 @@ class OffSpecularView(QWidget):
         main.setContentsMargins(10, 10, 10, 10)
         main.setSpacing(8)
 
-        bar = FlowLayout(margin=0, h_spacing=8, v_spacing=6)
+        bar = FlowContainer(margin=0, h_spacing=8, v_spacing=6)
         self.combo_spin = configure_compact_combo(QComboBox(), min_chars=14)
         self.combo_spin.addItem("All Frames", "all")
         self.combo_spin.addItem("u — Spin Up (Flipper OFF / 1)", "up")
@@ -662,7 +663,8 @@ class OffSpecularView(QWidget):
             spin.setKeyboardTracking(False)
             spin.setToolTip(tip + ". Editing switches to Custom Y range.")
             spin.valueChanged.connect(self._on_row_spin_changed)
-        bar.addWidget(make_flow_group(QLabel("Rows:"), self.spin_y0, self.spin_y1, spacing=6))
+        bar.addWidget(make_flow_group(QLabel("Rows:"), self.spin_y0, spacing=6))
+        bar.addWidget(self.spin_y1)
         self._row_timer = QTimer(self)
         self._row_timer.setSingleShot(True)
         self._row_timer.setInterval(350)  # wait for arrow-key/click bursts before recomputing
@@ -701,7 +703,7 @@ class OffSpecularView(QWidget):
         fit_combo_popup(self.combo_cmap)
         self.combo_cmap.currentTextChanged.connect(self._on_cmap_changed)
         bar.addWidget(make_flow_group(QLabel("Colormap:"), self.combo_cmap, spacing=6))
-        main.addLayout(bar)
+        main.addWidget(bar)
 
         # Only problems and caveats are shown here (hidden otherwise); the settings
         # above already describe what the map shows.
@@ -723,8 +725,7 @@ class OffSpecularView(QWidget):
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.setSpacing(6)
-        tools = QHBoxLayout()
-        tools.setSpacing(6)
+        tools = FlowContainer(margin=0, h_spacing=6, v_spacing=4)
         # Icon-only map tools (names in tooltips) to leave room for the readout.
         self.btn_pan = _tool_button("Pan: drag to move the map")
         self.btn_box_zoom = _tool_button("Box zoom: drag a rectangle to zoom")
@@ -752,22 +753,23 @@ class OffSpecularView(QWidget):
         self.btn_export_png.clicked.connect(self.export_image)
         for btn in (self.btn_zoom_in, self.btn_zoom_out, self.btn_fit, self.btn_export_png):
             tools.addWidget(btn)
-        tools.addSpacing(8)
         self.lbl_coords = QLabel("")
         self.lbl_coords.setStyleSheet("color: #64748b; font-size: 11px;")
         self.lbl_coords.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         _fixed_width_text(self.lbl_coords)
-        tools.addWidget(self.lbl_coords, 1)
+        tools.addWidget(self.lbl_coords)
         self.progress = QProgressBar()
-        self.progress.setFixedWidth(160)
+        self.progress.setMinimumWidth(0)
+        self.progress.setMaximumWidth(160)
         self.progress.setTextVisible(False)
         self.progress.setToolTip("Integrating detector frames")
         self.progress.setVisible(False)
         tools.addWidget(self.progress)
-        left_layout.addLayout(tools)
+        left_layout.addWidget(tools)
 
         self.plot = pg.PlotWidget()
         self.plot.setMinimumSize(0, 0)
+        self.plot.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
         self.plot.getViewBox().setMouseMode(pg.ViewBox.PanMode)
         self.plot.getViewBox().setCursor(QCursor(Qt.CursorShape.CrossCursor))
         self.plot.setLabel("bottom", "Detector X pixel")

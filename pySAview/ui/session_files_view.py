@@ -240,6 +240,8 @@ class SessionFilesView(QWidget):
             if splitter is not None:
                 tot = sum(splitter.sizes())
                 target_w = self._last_expanded_width if self._last_expanded_width >= 180 else 280
+                if tot > 0:
+                    target_w = min(target_w, max(40, tot // 3))
                 splitter.setSizes([target_w, max(50, tot - target_w)])
 
         self.minimized_changed.emit(self.is_minimized)

@@ -223,6 +223,7 @@ class FileStructureView(QWidget):
 
         self.plot_widget = pg.PlotWidget()
         self.plot_widget.setMinimumSize(0, 0)
+        self.plot_widget.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
         self.plot_widget.showGrid(x=True, y=True, alpha=0.3)
         apply_plot_theme(self.plot_widget, self.is_dark_mode)
         vis_layout.addWidget(self.plot_widget, 1)
@@ -233,6 +234,7 @@ class FileStructureView(QWidget):
 
         self.text_preview = QTextEdit()
         self.text_preview.setMinimumSize(0, 0)
+        self.text_preview.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
         self.text_preview.setReadOnly(True)
         self.text_preview.setVisible(False)
         vis_layout.addWidget(self.text_preview, 1)
@@ -286,6 +288,8 @@ class FileStructureView(QWidget):
             self.tree_expanded_container.setVisible(True)
             tot = sum(self.splitter.sizes())
             target_w = self._last_tree_width if self._last_tree_width >= 200 else 390
+            if tot > 0:
+                target_w = min(target_w, max(40, tot // 2))
             self.splitter.setSizes([target_w, max(50, tot - target_w)])
 
     def showEvent(self, event) -> None:
