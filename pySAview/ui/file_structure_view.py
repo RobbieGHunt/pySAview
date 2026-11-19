@@ -42,6 +42,8 @@ class FileStructureView(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.reader: NexusReader | None = None
+        self._owns_reader: bool = False
+        self._pending_root_expand: bool = False
         self.session_source_paths = lambda: []  # every loaded file; set by the main window
         self.is_dark_mode: bool = False
         self._current_node: NodeInfo | None = None
@@ -253,12 +255,23 @@ class FileStructureView(QWidget):
             target_w = self._last_tree_width if self._last_tree_width >= 200 else 390
             self.splitter.setSizes([target_w, max(50, tot - target_w)])
 
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        if self._pending_root_expand and self.reader is not None:
+            self._expand_root_items()
+
+    def set_reader(self, reader: NexusReader | None, *, owned: bool = False) -> None:
+        """Bind an existing read-only NexusReader (or None) to the hierarchy viewer."""
+        if self.reader is not None and self._owns_reader and self.reader is not reader:
+            self.reader.close()
+        self.reader = reader
+        self._owns_reader = bool(owned and reader is not None)
+        self._current_node = None
+        self._populate_root()
+
     def set_file(self, path: Path | str) -> None:
         """Load a new NeXus file into the hierarchy viewer."""
-        if self.reader is not None:
-            self.reader.close()
-        self.reader = NexusReader(path)
-        self._populate_root()
+        self.set_reader(NexusReader(path), owned=True)
 
     def set_theme(self, is_dark: bool) -> None:
         """Update styling for dark or light mode."""
@@ -277,16 +290,27 @@ class FileStructureView(QWidget):
             self._display_node(self._current_node)
 
     def close(self) -> None:
-        """Close underlying HDF5 file handle."""
+        """Detach (and close if owned) the underlying HDF5 file handle."""
         if self.reader is not None:
-            self.reader.close()
+            if self._owns_reader:
+                self.reader.close()
             self.reader = None
+            self._owns_reader = False
+        self._pending_root_expand = False
 
     def _collapse_all(self) -> None:
         self.tree.collapseAll()
 
+    def _expand_root_items(self) -> None:
+        self._pending_root_expand = False
+        for i in range(self.tree.topLevelItemCount()):
+            top = self.tree.topLevelItem(i)
+            if top:
+                top.setExpanded(True)
+
     def _populate_root(self) -> None:
         self.tree.clear()
+        self._pending_root_expand = False
         if self.reader is None:
             return
 
@@ -297,11 +321,11 @@ class FileStructureView(QWidget):
                 item.addChild(QTreeWidgetItem(["Loading...", "", ""]))
             self.tree.addTopLevelItem(item)
 
-        # Expand root top-level items by default
-        for i in range(self.tree.topLevelItemCount()):
-            top = self.tree.topLevelItem(i)
-            if top:
-                top.setExpanded(True)
+        # Defer expanding /entry0 (which walks all child nodes and attributes) until the tab is visible.
+        if self.isVisible():
+            self._expand_root_items()
+        else:
+            self._pending_root_expand = True
 
     def _create_tree_item(self, node: NodeInfo) -> QTreeWidgetItem:
         nx_class = node.attrs.get("NX_class", "")
@@ -366,6 +390,8 @@ class FileStructureView(QWidget):
 
     def _on_search_text_changed(self, text: str) -> None:
         query = text.strip().lower()
+        if query and self._pending_root_expand and self.reader is not None:
+            self._expand_root_items()
         if not query:
             for i in range(self.tree.topLevelItemCount()):
                 self._filter_tree_item(self.tree.topLevelItem(i), "")

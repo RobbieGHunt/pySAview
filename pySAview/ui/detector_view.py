@@ -52,7 +52,10 @@ class DetectorView(QWidget):
         self.is_dark_mode: bool = False
         self._current_frame_idx: int = 0
         self._total_frames: int = 0
-        self._current_frame_data: np.ndarray | None = None
+        self._frame_data: np.ndarray | None = None
+        self._frame_dirty: bool = False
+        self._frame_total_counts: float | None = None
+        self._loaded_cmap_name: str = "turbo"
         self._filtered_indices: list[int] = []
         self._paired_frames: dict[int, int] = {}
         self._current_filtered_pos: int = 0
@@ -310,12 +313,39 @@ class DetectorView(QWidget):
 
         main_layout.addWidget(splitter, 1)
 
+    @property
+    def _current_frame_data(self) -> np.ndarray | None:
+        if self._frame_dirty:
+            self._ensure_frame_loaded()
+        return self._frame_data
+
+    @_current_frame_data.setter
+    def _current_frame_data(self, value: np.ndarray | None) -> None:
+        self._frame_data = value
+        self._frame_dirty = False
+        self._frame_total_counts = None
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        if self._frame_dirty:
+            self._ensure_frame_loaded()
+
+    def _ensure_frame_loaded(self) -> None:
+        if not self._frame_dirty:
+            return
+        self._frame_dirty = False
+        if 0 <= self._current_filtered_pos < len(self._filtered_indices):
+            self._load_frame(self._filtered_indices[self._current_filtered_pos])
+
     def set_data(self, reader: NexusReader, scan_data: ScanData) -> None:
         """Assign reader and scan data to detector view."""
         self.reader = reader
         self.scan_data = scan_data
 
         if not scan_data.has_detector_2d or scan_data.detector_shape is None:
+            self._frame_data = None
+            self._frame_dirty = False
+            self._frame_total_counts = None
             self.lbl_frame_info.setText("No 2D detector data found in this NeXus file.")
             self.slider_step.setEnabled(False)
             self.spin_step.setEnabled(False)
@@ -380,7 +410,7 @@ class DetectorView(QWidget):
         self._sync_spinboxes_from_bounds(pos_x, pos_x + size_x, pos_y, pos_y + size_y)
 
         self._update_spin_filter_options()
-        self._update_filtered_indices(reset_pos=True)
+        self._update_filtered_indices(reset_pos=True, defer_if_hidden=True)
 
     def _update_spin_filter_options(self) -> None:
         has_flipper = (
@@ -393,7 +423,7 @@ class DetectorView(QWidget):
     def _on_spin_filter_changed(self) -> None:
         self._update_filtered_indices(reset_pos=False)
 
-    def _update_filtered_indices(self, reset_pos: bool = False) -> None:
+    def _update_filtered_indices(self, reset_pos: bool = False, *, defer_if_hidden: bool = False) -> None:
         self._paired_frames = {}
         if self.scan_data is None or self._total_frames <= 0:
             self._filtered_indices = []
@@ -474,6 +504,12 @@ class DetectorView(QWidget):
         self.spin_step.blockSignals(False)
 
         raw_idx = self._filtered_indices[self._current_filtered_pos]
+        if defer_if_hidden and not self.isVisible():
+            self._current_frame_idx = raw_idx
+            self._frame_data = None
+            self._frame_total_counts = None
+            self._frame_dirty = True
+            return
         self._load_frame(raw_idx)
 
     def _source_paths(self) -> list[str]:
@@ -590,6 +626,7 @@ class DetectorView(QWidget):
             self._load_frame(self._filtered_indices[val])
 
     def _on_cmap_changed(self, cmap_name: str) -> None:
+        self._loaded_cmap_name = cmap_name
         cm = get_safe_colormap(cmap_name)
         self.img_item.setColorMap(cm)
 
@@ -598,7 +635,9 @@ class DetectorView(QWidget):
             self._roi_rect_item.setVisible(visible)
 
     def _refresh_current_frame(self) -> None:
-        self._load_frame(self._current_frame_idx)
+        if self._frame_dirty or self._frame_data is None:
+            return
+        self._render_current_frame(total_counts=self._frame_total_counts)
 
     def _get_current_roi_bounds(self) -> tuple[float, float, float, float]:
         if self._roi_rect_item is None:
@@ -838,12 +877,23 @@ class DetectorView(QWidget):
         cur_roi = rois[self._current_frame_idx] if 0 <= self._current_frame_idx < len(rois) else initial_roi
         self._emit_roi(counts, cur_roi)
 
-    def _update_profiles_and_counts(self, x0: float, x1: float, y0: float, y1: float) -> None:
-        if self._current_frame_data is None:
+    def _update_profiles_and_counts(
+        self,
+        x0: float,
+        x1: float,
+        y0: float,
+        y1: float,
+        *,
+        total_counts: float | None = None,
+    ) -> None:
+        frame = self._current_frame_data
+        if frame is None:
             return
 
-        frame = self._current_frame_data
-        total_counts = float(np.sum(frame))
+        if total_counts is None:
+            total_counts = self._frame_total_counts
+        if total_counts is None:
+            total_counts = float(np.sum(frame))
         roi_counts, x_profile, y_profile = integrate_roi_2d(frame, (x0, x1, y0, y1))
 
         pct = (roi_counts / total_counts * 100.0) if total_counts > 0 else 0.0
@@ -871,10 +921,37 @@ class DetectorView(QWidget):
         self.plot_y_cut.setLabel("bottom", "Y Pixel", color="#f1f5f9" if self.is_dark_mode else "#0f172a")
         self.plot_y_cut.setLabel("left", "Counts", color="#f1f5f9" if self.is_dark_mode else "#0f172a")
 
+    def _render_current_frame(
+        self,
+        *,
+        raw_combined: np.ndarray | None = None,
+        total_counts: float | None = None,
+    ) -> None:
+        frame = self._frame_data
+        if frame is None:
+            return
+
+        # In pyqtgraph ImageItem displays array with transposed axis mapping, so raw_combined == frame.T.
+        img_src = raw_combined if raw_combined is not None else frame.T
+        if self.chk_log_img.isChecked():
+            img_display = np.log10(np.maximum(img_src, 1.0))
+        else:
+            img_display = img_src
+
+        self.img_item.setImage(img_display)
+        cmap_name = self.combo_cmap.currentText()
+        if cmap_name != self._loaded_cmap_name:
+            self._loaded_cmap_name = cmap_name
+            self.img_item.setColorMap(get_safe_colormap(cmap_name))
+
+        x0, x1, y0, y1 = self._get_current_roi_bounds()
+        self._update_profiles_and_counts(x0, x1, y0, y1, total_counts=total_counts)
+
     def _load_frame(self, frame_idx: int) -> None:
         if self.reader is None or self.scan_data is None:
             return
 
+        self._frame_dirty = False
         self._current_frame_idx = frame_idx
         partner_idx = self._paired_frames.get(frame_idx) if self.combo_spin_filter.currentData() == "sum" else None
         try:
@@ -892,12 +969,12 @@ class DetectorView(QWidget):
         else:
             raw_combined = np.asarray(raw_frame, dtype=float)
 
-        # Rotate 90 degrees clockwise and mirror horizontally as requested:
-        # np.fliplr(np.rot90(raw_frame, -1)) is equivalent to raw_frame.T
-        frame_rot = np.rot90(raw_combined, -1)
-        frame_mir = np.fliplr(frame_rot)
-        frame = np.asarray(frame_mir, dtype=float)
-        self._current_frame_data = frame
+        # Rotate 90 degrees clockwise and mirror horizontally:
+        # np.fliplr(np.rot90(raw_combined, -1)) is identical to raw_combined.T (zero-copy view).
+        frame = raw_combined.T
+        total_counts = float(np.sum(raw_combined))
+        self._frame_data = frame
+        self._frame_total_counts = total_counts
 
         # If auto-fit is active, update displayed ROI box to current frame's fitted position
         if self._auto_fit_active and self._per_frame_rois is not None and frame_idx < len(self._per_frame_rois):
@@ -918,7 +995,6 @@ class DetectorView(QWidget):
         th_val = self.scan_data.variables["th"].data[frame_idx] if "th" in self.scan_data.variables else 0.0
         tth_val = self.scan_data.variables["tth"].data[frame_idx] if "tth" in self.scan_data.variables else 0.0
         flip_val = self.scan_data.variables["Flipper1"].data[frame_idx] if "Flipper1" in self.scan_data.variables else np.nan
-        total_counts = float(np.sum(frame))
 
         if partner_idx is not None:
             self.lbl_frame_info.setText(
@@ -928,20 +1004,4 @@ class DetectorView(QWidget):
             self.lbl_frame_info.setText(
                 f"Frame {frame_idx}   θ {th_val:.4f}°   2θ {tth_val:.4f}°   {spin_str}   {total_counts:,.0f} counts")
 
-        # Prepare 2D Image
-        img_display = frame
-        if self.chk_log_img.isChecked():
-            img_display = np.log10(np.maximum(img_display, 1.0))
-
-        # In pyqtgraph ImageItem displays array with transposed axis mapping
-        self.img_item.setImage(img_display.T)
-        cm = get_safe_colormap(self.combo_cmap.currentText())
-        self.img_item.setColorMap(cm)
-
-        # Compute ROI integration & 1D profiles on the frame
-        x0, x1, y0, y1 = self._get_current_roi_bounds()
-        self._update_profiles_and_counts(x0, x1, y0, y1)
-
-        apply_plot_theme(self.plot_2d, self.is_dark_mode)
-        apply_plot_theme(self.plot_x_cut, self.is_dark_mode)
-        apply_plot_theme(self.plot_y_cut, self.is_dark_mode)
+        self._render_current_frame(raw_combined=raw_combined, total_counts=total_counts)

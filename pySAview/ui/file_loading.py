@@ -1,8 +1,50 @@
-"""Background scan parsing; HDF5 handles never leave their owning worker."""
+"""Background scan parsing and async scipy.stats warm-up; HDF5 handles never leave their owning worker."""
+from __future__ import annotations
+
+import atexit
+import sys
 from pathlib import Path
-from threading import Event
+from threading import Event, Lock, Thread
+
 from PyQt6.QtCore import QThread, pyqtSignal
+
 from pySAview.core.nexus_reader import NexusReader
+
+_STATS_WARM_LOCK = Lock()
+_STATS_WARM_THREAD: Thread | None = None
+_STATS_ATEXIT_REGISTERED = False
+
+
+def _import_scipy_stats() -> None:
+    try:
+        import scipy.stats  # noqa: F401
+    except Exception:
+        pass
+
+
+def _join_stats_warm_at_exit() -> None:
+    thread = _STATS_WARM_THREAD
+    if thread is not None and thread.is_alive():
+        thread.join(timeout=5.0)
+
+
+def warm_scipy_stats_async() -> Thread | None:
+    """Import scipy.stats once on a background thread so the first exact-interval plot never stalls the GUI."""
+    global _STATS_WARM_THREAD, _STATS_ATEXIT_REGISTERED
+    if "scipy.stats" in sys.modules:
+        return None
+    with _STATS_WARM_LOCK:
+        if "scipy.stats" in sys.modules:
+            return None
+        if _STATS_WARM_THREAD is not None and _STATS_WARM_THREAD.is_alive():
+            return _STATS_WARM_THREAD
+        if not _STATS_ATEXIT_REGISTERED:
+            atexit.register(_join_stats_warm_at_exit)
+            _STATS_ATEXIT_REGISTERED = True
+        thread = Thread(target=_import_scipy_stats, name="scipy-stats-warmup", daemon=True)
+        _STATS_WARM_THREAD = thread
+        thread.start()
+        return thread
 
 
 class FileLoadThread(QThread):
@@ -17,6 +59,7 @@ class FileLoadThread(QThread):
         self.errors = []
 
     def run(self):
+        any_parsed = False
         for index, path in enumerate(self.paths):
             if self.cancelled.is_set():
                 break
@@ -26,6 +69,7 @@ class FileLoadThread(QThread):
                 reader = NexusReader(path, cancelled=self.cancelled.is_set)
                 scan = reader.parse_scan()
                 if not self.cancelled.is_set():
+                    any_parsed = True
                     self.parsed.emit(self.token, scan)
             except InterruptedError:
                 if not self.cancelled.is_set():
@@ -36,3 +80,10 @@ class FileLoadThread(QThread):
                 if reader is not None:
                     reader.close()
             self.progress.emit(self.token, index + 1, "")
+        # Warm scipy.stats off the GUI thread *after* parallel ROI inflation finishes
+        # to avoid GIL contention with zlib workers while keeping the UI responsive.
+        if any_parsed and not self.cancelled.is_set():
+            warm_thread = warm_scipy_stats_async()
+            if warm_thread is not None:
+                while warm_thread.is_alive() and not self.cancelled.is_set():
+                    warm_thread.join(0.02)
