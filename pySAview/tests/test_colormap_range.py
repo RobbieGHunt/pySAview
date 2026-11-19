@@ -22,7 +22,6 @@ def test_drag_handles_shared_and_data_unchanged(qtbot):
     before = [c.y.copy() for c in view._current_curves]
     down = view.spin_style_controls["d"]["preview"]
     up = view.spin_style_controls["u"]["preview"]
-    qtbot.addWidget(down)
     down.resize(215, 34)
     down.show()
     qtbot.mousePress(down, Qt.MouseButton.LeftButton, pos=QPoint(7, 22))

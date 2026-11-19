@@ -315,7 +315,8 @@ class MainWindow(QMainWindow):
         app = QApplication.instance()
         if app is not None:
             theme_qss = DARK_THEME if self.is_dark_mode else LIGHT_THEME
-            app.setStyleSheet(theme_qss)
+            if app.styleSheet() != theme_qss:
+                app.setStyleSheet(theme_qss)
 
         # Tab vector icons
         is_d = self.is_dark_mode
