@@ -50,6 +50,11 @@ def decode_attr_str(val: Any) -> str:
     return str(decoded)
 
 
+_INFLATE_STEP_BYTES = 131_072  # 128 KiB: stays in L2 cache and below Windows VirtualAlloc threshold
+_MAX_BATCH_FRAMES = 512
+_MAX_BATCH_BYTES = 16 * 1024 * 1024
+
+
 def _roi_fast_path_supported(dataset: h5py.Dataset) -> bool:
     """Integer frame-per-chunk deflate volumes, where per-frame sums are exact."""
     from pySAview.core.off_specular import _supports_parallel_gzip
@@ -57,54 +62,161 @@ def _roi_fast_path_supported(dataset: h5py.Dataset) -> bool:
     return dataset.dtype.kind in "iu" and _supports_parallel_gzip(dataset)
 
 
+def _can_use_raw_deflate(raw: bytes, needed: int, frame_bytes: int) -> bool:
+    """True when a partial read can safely use raw deflate without unverified Adler-32."""
+    if needed >= frame_bytes or len(raw) < 2:
+        return False
+    cmf = raw[0]
+    flg = raw[1]
+    return (
+        (cmf & 0x0F) == 8
+        and (cmf >> 4) <= 7
+        and ((cmf << 8) | flg) % 31 == 0
+        and (flg & 0x20) == 0
+    )
+
+
 def _integrate_roi_gzip_parallel(dataset: h5py.Dataset, bounds, cancelled) -> np.ndarray:
     """Integrate one raw-pixel box per frame by inflating stored chunks on worker threads.
 
     ``bounds[i]`` is ``(ix0, ix1, iy0, iy1)`` in raw (axis 1, axis 2) pixels.
     Frames are row-major, so inflation stops after raw row ``ix1``: the rest of
-    the frame cannot contribute. zlib releases the GIL, so frames inflate in
-    parallel. Results equal ``np.sum(dataset[i, ix0:ix1, iy0:iy1])`` exactly:
-    integer sums, unwritten chunks read as the fill value, and a chunk whose
-    deflate filter was skipped is used as stored. Source data is only read.
+    the frame cannot contribute. Chunks are read serially in memory-bounded
+    macro-batches (avoiding h5py global-lock contention across workers) and
+    inflated in 128 KiB row-aligned strips on worker threads where zlib
+    releases the GIL. For partial frames with standard RFC-1950 zlib headers,
+    raw deflate (``wbits=-15``) skips computing an Adler-32 checksum whose
+    trailer is never reached. Results equal ``np.sum(dataset[i, ix0:ix1, iy0:iy1])``
+    exactly: integer sums, unwritten chunks read as the fill value, and a chunk
+    whose deflate filter was skipped is used as stored. Source data is only read.
     """
-    n_frames, _, ny = dataset.shape
-    itemsize = dataset.dtype.itemsize
-    row_bytes = ny * itemsize
+    n_frames, nx, ny = dataset.shape
+    dtype = dataset.dtype
+    row_bytes = ny * dtype.itemsize
+    frame_bytes = nx * row_bytes
     fill = int(dataset.fillvalue)
     dsid = dataset.id
+    step = _INFLATE_STEP_BYTES
+    strip_rows = max(1, step // row_bytes)
 
-    def integrate(i: int) -> float:
-        if cancelled():
-            raise InterruptedError("File loading cancelled")
-        ix0, ix1, iy0, iy1 = bounds[i]
-        if ix1 <= ix0 or iy1 <= iy0:
-            return 0.0
-        if dsid.get_chunk_info_by_coord((i, 0, 0)).byte_offset is None:
-            return float(fill * (ix1 - ix0) * (iy1 - iy0))
-        mask, raw = dsid.read_direct_chunk((i, 0, 0))
-        needed = ix1 * row_bytes
-        data = raw[:needed] if mask & 1 else zlib.decompressobj().decompress(raw, needed)
-        if len(data) != needed:
-            raise ValueError(f"Detector frame {i} has an unexpected stored size")
-        rows = np.frombuffer(data, dtype=dataset.dtype).reshape(ix1, ny)
-        return float(np.sum(rows[ix0:ix1, iy0:iy1]))
+    def _integrate_batch(
+        batch: list[tuple[int, int, int, int, int, int, bytes]],
+    ) -> list[tuple[int, float]]:
+        results: list[tuple[int, float]] = []
+        for i, ix0, ix1, iy0, iy1, mask, raw in batch:
+            if cancelled():
+                raise InterruptedError("File loading cancelled")
+            needed = ix1 * row_bytes
+            if mask & 1:
+                if len(raw) < needed:
+                    raise ValueError(f"Detector frame {i} has an unexpected stored size")
+                rows = np.frombuffer(
+                    raw,
+                    dtype=dtype,
+                    count=(ix1 - ix0) * ny,
+                    offset=ix0 * row_bytes,
+                ).reshape(ix1 - ix0, ny)
+                results.append((i, float(int(np.sum(rows[:, iy0:iy1])))))
+                continue
+
+            if _can_use_raw_deflate(raw, needed, frame_bytes):
+                decompressor = zlib.decompressobj(-15)
+                buf: bytes | memoryview = memoryview(raw)[2:]
+            else:
+                decompressor = zlib.decompressobj()
+                buf = raw
+
+            # Discard leading rows 0..ix0 in bounded chunks without allocating the whole prefix.
+            rem = ix0 * row_bytes
+            while rem > 0:
+                out = decompressor.decompress(buf, step if rem > step else rem)
+                if not out:
+                    raise ValueError(f"Detector frame {i} has an unexpected stored size")
+                buf = decompressor.unconsumed_tail
+                rem -= len(out)
+
+            # Inflate ROI rows ix0..ix1 in bounded row-aligned strips and sum exactly.
+            rows_left = ix1 - ix0
+            total = 0
+            while rows_left > 0:
+                take_rows = strip_rows if rows_left > strip_rows else rows_left
+                take_bytes = take_rows * row_bytes
+                chunk = decompressor.decompress(buf, take_bytes)
+                buf = decompressor.unconsumed_tail
+                if len(chunk) < take_bytes:
+                    parts = [chunk]
+                    got = len(chunk)
+                    while got < take_bytes:
+                        more = decompressor.decompress(buf, take_bytes - got)
+                        if not more:
+                            raise ValueError(f"Detector frame {i} has an unexpected stored size")
+                        parts.append(more)
+                        got += len(more)
+                        buf = decompressor.unconsumed_tail
+                    chunk = b"".join(parts)
+                rows = np.frombuffer(chunk, dtype=dtype).reshape(take_rows, ny)
+                total += int(np.sum(rows[:, iy0:iy1]))
+                rows_left -= take_rows
+            results.append((i, float(total)))
+        return results
 
     counts = np.empty(n_frames, dtype=float)
     workers = max(1, min(8, os.cpu_count() or 2))
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = [pool.submit(integrate, i) for i in range(n_frames)]
+    pool: ThreadPoolExecutor | None = None
+
+    def _flush_work(work: list[tuple[int, int, int, int, int, int, bytes]]) -> None:
+        nonlocal pool
+        if not work:
+            return
+        if len(work) <= 8 or workers == 1:
+            for idx, val in _integrate_batch(work):
+                counts[idx] = val
+            return
+        if pool is None:
+            pool = ThreadPoolExecutor(max_workers=workers)
+        # Strided round-robin balances dense low-angle and sparse high-angle frames evenly.
+        batches = [work[t::workers] for t in range(workers) if work[t::workers]]
+        futures = [pool.submit(_integrate_batch, batch) for batch in batches]
         try:
-            for i, future in enumerate(futures):
-                counts[i] = future.result()
+            for future in futures:
+                for idx, val in future.result():
+                    counts[idx] = val
         except BaseException:
             for future in futures:
                 future.cancel()
             raise
+
+    work: list[tuple[int, int, int, int, int, int, bytes]] = []
+    batch_bytes = 0
+    try:
+        for i in range(n_frames):
+            if cancelled():
+                raise InterruptedError("File loading cancelled")
+            ix0, ix1, iy0, iy1 = bounds[i]
+            if ix1 <= ix0 or iy1 <= iy0:
+                counts[i] = 0.0
+                continue
+            if dsid.get_chunk_info_by_coord((i, 0, 0)).byte_offset is None:
+                counts[i] = float(fill * (ix1 - ix0) * (iy1 - iy0))
+                continue
+            mask, raw = dsid.read_direct_chunk((i, 0, 0))
+            work.append((i, ix0, ix1, iy0, iy1, mask, raw))
+            batch_bytes += len(raw)
+            if len(work) >= _MAX_BATCH_FRAMES or batch_bytes >= _MAX_BATCH_BYTES:
+                _flush_work(work)
+                work.clear()
+                batch_bytes = 0
+        _flush_work(work)
+    finally:
+        if pool is not None:
+            pool.shutdown(wait=True)
     return counts
 
 
 class NexusReader:
     """Read-only lazy accessor for NeXus (.nxs) files."""
+
+    _DETECTOR_PATH = "entry0/data_scan/detector_data/data"
 
     def __init__(self, path: str | Path, *, cancelled=None) -> None:
         self._cancelled = cancelled or (lambda: False)
@@ -112,14 +224,27 @@ class NexusReader:
         if not self.path.exists():
             raise FileNotFoundError(f"File not found: {self.path}")
         self._file: h5py.File | None = h5py.File(self.path, "r")
+        self._detector_ds: h5py.Dataset | None = None
+        self._detector_ds_checked: bool = False
 
     def close(self) -> None:
+        self._detector_ds = None
+        self._detector_ds_checked = False
         if self._file is not None:
             try:
                 self._file.close()
             except Exception:
                 pass
             self._file = None
+
+    def _get_detector_dataset(self) -> h5py.Dataset | None:
+        """Return cached read-only detector 3D dataset handle (or None)."""
+        f = self.file
+        if not self._detector_ds_checked:
+            ds = f.get(self._DETECTOR_PATH)
+            self._detector_ds = ds if isinstance(ds, h5py.Dataset) else None
+            self._detector_ds_checked = True
+        return self._detector_ds
 
     def __enter__(self) -> NexusReader:
         return self
@@ -312,11 +437,8 @@ class NexusReader:
 
     def read_detector_frame(self, frame_index: int = 0) -> np.ndarray | None:
         """Read a single 2D detector frame by index from entry0/data_scan/detector_data/data."""
-        path = "entry0/data_scan/detector_data/data"
-        if path not in self.file:
-            return None
-        ds = self.file[path]
-        if ds.ndim != 3:
+        ds = self._get_detector_dataset()
+        if ds is None or ds.ndim != 3:
             return None
         total_frames = ds.shape[0]
         if frame_index < 0 or frame_index >= total_frames:
@@ -325,10 +447,9 @@ class NexusReader:
 
     def get_detector_roi(self) -> tuple[float, float, float, float] | None:
         """Get (roi_x0, roi_x1, roi_y0, roi_y1) if present in SUPERADAM/Detector1."""
-        det_path = "entry0/SUPERADAM/Detector1"
-        if det_path not in self.file:
+        det = self.file.get("entry0/SUPERADAM/Detector1")
+        if det is None:
             return None
-        det = self.file[det_path]
         try:
             x0 = float(det["roi_x0"][()][0])
             x1 = float(det["roi_x1"][()][0])
@@ -346,11 +467,8 @@ class NexusReader:
         Coordinates (x, y) are in the displayed frame orientation (where displayed_frame = raw_frame.T),
         so the raw 3D volume is sliced along raw_data[:, ix0:ix1, iy0:iy1].
         """
-        path = "entry0/data_scan/detector_data/data"
-        if path not in self.file:
-            return None
-        ds = self.file[path]
-        if ds.ndim != 3:
+        ds = self._get_detector_dataset()
+        if ds is None or ds.ndim != 3:
             return None
 
         ix0, ix1, iy0, iy1 = pixel_bounds(roi, ds.shape[1], ds.shape[2])
@@ -376,11 +494,8 @@ class NexusReader:
         self, rois: list[tuple[float, float, float, float]], *, parallel: bool = True
     ) -> np.ndarray | None:
         """Compute integrated counts for each scan frame given per-frame ROIs [(x0, x1, y0, y1), ...]."""
-        path = "entry0/data_scan/detector_data/data"
-        if path not in self.file:
-            return None
-        ds = self.file[path]
-        if ds.ndim != 3:
+        ds = self._get_detector_dataset()
+        if ds is None or ds.ndim != 3:
             return None
 
         n_frames = ds.shape[0]
@@ -405,11 +520,8 @@ class NexusReader:
         skip_first_n: int = 6,
     ) -> tuple[list[tuple[float, float, float, float]], np.ndarray] | None:
         """Automatically find reflection ROI for each frame and calculate integrated counts."""
-        path = "entry0/data_scan/detector_data/data"
-        if path not in self.file:
-            return None
-        ds = self.file[path]
-        if ds.ndim != 3:
+        ds = self._get_detector_dataset()
+        if ds is None or ds.ndim != 3:
             return None
 
         if initial_roi is None:
@@ -426,18 +538,24 @@ class NexusReader:
 
     def parse_scan(self) -> ScanData:
         """Parse complete scan data: metadata, scanned variables, motors."""
+        if self._cancelled():
+            raise InterruptedError("File loading cancelled")
         f = self.file
-        entry = f["entry0"] if "entry0" in f else f[list(f.keys())[0]]
+        entry = f.get("entry0")
+        if entry is None:
+            entry = f[next(iter(f.keys()))]
 
         # 1. Metadata
+        def _read_ds_scalar(ds: Any, default: Any = None) -> Any:
+            if ds is None:
+                return default
+            try:
+                return decode_val(ds[()])
+            except Exception:
+                return default
+
         def _get_scalar(group: h5py.Group, key: str, default: Any = None) -> Any:
-            if key in group:
-                try:
-                    val = group[key][()]
-                    return decode_val(val)
-                except Exception:
-                    return default
-            return default
+            return _read_ds_scalar(group.get(key), default)
 
         run_num = _get_scalar(entry, "run_number")
         if isinstance(run_num, (list, np.ndarray)) and len(run_num) > 0:
@@ -466,15 +584,15 @@ class NexusReader:
         )
 
         # User metadata
-        if "user" in entry and isinstance(entry["user"], h5py.Group):
-            u = entry["user"]
+        u = entry.get("user")
+        if isinstance(u, h5py.Group):
             meta.user = str(_get_scalar(u, "name", ""))
             meta.local_contact = str(_get_scalar(u, "namelocalcontact", ""))
             meta.proposal = str(_get_scalar(u, "proposal", ""))
 
         # Sample metadata
-        if "sample" in entry and isinstance(entry["sample"], h5py.Group):
-            s = entry["sample"]
+        s = entry.get("sample")
+        if isinstance(s, h5py.Group):
             meta.chemical_formula = str(_get_scalar(s, "chemicalFormula", ""))
             meta.sample_consistance = str(_get_scalar(s, "consistance", ""))
             meta.sample_id = str(_get_scalar(s, "sampleId", ""))
@@ -483,39 +601,48 @@ class NexusReader:
             meta.surface_area = str(_get_scalar(s, "surfaceArea", ""))
 
             # Environment variables
-            if "additional_environment" in s and isinstance(s["additional_environment"], h5py.Group):
-                env = s["additional_environment"]
-                for env_name in env.keys():
-                    sub = env[env_name]
+            env = s.get("additional_environment")
+            if isinstance(env, h5py.Group):
+                for env_name, sub in env.items():
                     if isinstance(sub, h5py.Group):
-                        for k in sub.keys():
-                            if isinstance(sub[k], h5py.Dataset):
+                        for k, sub_item in sub.items():
+                            if isinstance(sub_item, h5py.Dataset):
                                 try:
-                                    meta.environment_variables[f"{env_name}/{k}"] = float(sub[k][()][0])
+                                    meta.environment_variables[f"{env_name}/{k}"] = float(sub_item[()][0])
                                 except Exception:
                                     pass
 
+        sa = entry.get("SUPERADAM")
+        has_superadam = isinstance(sa, h5py.Group)
+
         # 2. Scanned Variables
         variables: dict[str, ScanVariable] = {}
-        if "data_scan" in entry and "scanned_variables" in entry["data_scan"]:
-            sv = entry["data_scan/scanned_variables"]
-            if "data" in sv and "variables_names" in sv:
-                raw_data = sv["data"][()]  # shape (N_vars, N_steps)
-                vn = sv["variables_names"]
+        sv = entry.get("data_scan/scanned_variables")
+        if isinstance(sv, h5py.Group):
+            sv_data = sv.get("data")
+            vn = sv.get("variables_names")
+            if sv_data is not None and isinstance(vn, h5py.Group):
+                raw_data = sv_data[()]  # shape (N_vars, N_steps)
                 names = [decode_attr_str(x) for x in vn["name"][()]]
-                labels = [decode_attr_str(x) for x in vn["label"][()]] if "label" in vn else names
-                units = [decode_attr_str(x) for x in vn["unit"][()]] if "unit" in vn else [""] * len(names)
-                props = [decode_attr_str(x) for x in vn["property"][()]] if "property" in vn else [""] * len(names)
-                axes = vn["axis"][()].tolist() if "axis" in vn else [0] * len(names)
-                scanneds = vn["scanned"][()].tolist() if "scanned" in vn else [0] * len(names)
+                lbl_ds = vn.get("label")
+                labels = [decode_attr_str(x) for x in lbl_ds[()]] if lbl_ds is not None else names
+                unit_ds = vn.get("unit")
+                units = [decode_attr_str(x) for x in unit_ds[()]] if unit_ds is not None else [""] * len(names)
+                prop_ds = vn.get("property")
+                props = [decode_attr_str(x) for x in prop_ds[()]] if prop_ds is not None else [""] * len(names)
+                axis_ds = vn.get("axis")
+                axes = axis_ds[()].tolist() if axis_ds is not None else [0] * len(names)
+                scanned_ds = vn.get("scanned")
+                scanneds = scanned_ds[()].tolist() if scanned_ds is not None else [0] * len(names)
 
                 # Explicit sibling arrays only: do not guess uncertainty channels
                 # from their names. NeXus errors are standard deviations;
                 # variance already contains squared uncertainties.
                 variances = None
                 for error_key in ("variance", "errors"):
-                    if error_key in sv:
-                        error_data = np.asarray(sv[error_key][()], dtype=float)
+                    err_ds = sv.get(error_key)
+                    if err_ds is not None:
+                        error_data = np.asarray(err_ds[()], dtype=float)
                         if error_data.shape != raw_data.shape:
                             raise ValueError(f"{sv.name}/{error_key} does not match scan data shape")
                         if error_key == "errors":
@@ -529,7 +656,7 @@ class NexusReader:
                     unit_source = "file" if unit else "unspecified"
                     # SuperADAM writes its measured exposure as Count/Time
                     # with an empty unit field. Keep this interpretation explicit.
-                    if (not unit and name == "Count" and "SUPERADAM" in entry
+                    if (not unit and name == "Count" and has_superadam
                             and i < len(labels) and labels[i] == "Time"
                             and i < len(props) and props[i] == "Time"):
                         unit = "s"
@@ -549,18 +676,19 @@ class NexusReader:
 
         # 3. Motors from entry0/SUPERADAM
         motors: dict[str, MotorInfo] = {}
-        if "SUPERADAM" in entry and isinstance(entry["SUPERADAM"], h5py.Group):
-            sa = entry["SUPERADAM"]
-            for m_name in sa.keys():
-                m_obj = sa[m_name]
+        if has_superadam:
+            for m_name, m_obj in sa.items():
                 if isinstance(m_obj, h5py.Group):
-                    val = _get_scalar(m_obj, "value")
-                    tgt = _get_scalar(m_obj, "target_value")
-                    off = _get_scalar(m_obj, "offset_value")
-                    # Try units attribute
+                    val_ds = m_obj.get("value")
+                    val = _read_ds_scalar(val_ds)
+                    tgt = _read_ds_scalar(m_obj.get("target_value"))
+                    off = _read_ds_scalar(m_obj.get("offset_value"))
+                    # Try units attribute without re-opening the value dataset
                     units_val = ""
-                    if "value" in m_obj and "units" in m_obj["value"].attrs:
-                        units_val = decode_attr_str(m_obj["value"].attrs["units"])
+                    if val_ds is not None:
+                        units_attr = val_ds.attrs.get("units")
+                        if units_attr is not None:
+                            units_val = decode_attr_str(units_attr)
                     motors[m_name] = MotorInfo(
                         name=m_name,
                         value=float(val[0]) if isinstance(val, (list, np.ndarray)) and len(val) > 0 else (float(val) if isinstance(val, (int, float)) else val),
@@ -570,9 +698,10 @@ class NexusReader:
                     )
 
         # 4. Detector 2D status
-        det_path = "entry0/data_scan/detector_data/data"
-        has_det = det_path in f
-        det_shape = f[det_path].shape if has_det else None
+        det_path = self._DETECTOR_PATH
+        det_ds = self._get_detector_dataset()
+        has_det = det_ds is not None
+        det_shape = det_ds.shape if has_det else None
         roi = self.get_detector_roi()
 
         if has_det and roi:
