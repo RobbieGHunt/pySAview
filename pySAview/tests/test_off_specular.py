@@ -663,3 +663,107 @@ def test_offspec_map_all_modes_stay_upright_during_pan_and_zoom(qtbot, window, a
     corr_hflip = float(np.corrcoef(d_blk[:, ::-1].ravel(), a_blk.ravel())[0, 1])
     assert corr > 0.95 and corr > corr_vflip + 0.1 and corr > corr_hflip + 0.1
     window.hide()
+
+
+def test_cached_mesh_fast_paths_recolor_and_export(qtbot):
+    """CachedMeshItem uses rectilinear strip fast path for uniform-X grids, chunked paths for
+    curved grids, swaps Indexed8 color tables in-place on colormap change, and draws exact cells on export."""
+    import pyqtgraph as pg
+    from PyQt6.QtGui import QImage, QPainter
+    from pySAview.ui.off_specular_view import CachedMeshItem, _diverging_rdbu_r
+    from pySAview.ui.theme import get_safe_colormap
+
+    # 1. Rectilinear mesh (like X pixel vs θ)
+    w_rect = pg.PlotWidget()
+    qtbot.addWidget(w_rect)
+    w_rect.resize(300, 240)
+    x_r, y_r = np.meshgrid(np.arange(11, dtype=float), np.array([0.0, 0.2, 0.5, 1.0, 2.0]))
+    z_r = np.arange(40, dtype=float).reshape(4, 10)
+    z_r[1, :] = np.nan
+    m_rect = CachedMeshItem(x_r, y_r, z_r, colorMap=get_safe_colormap("gray"), enableAutoLevels=False)
+    m_rect.setLevels((0.0, 40.0))
+    w_rect.addItem(m_rect)
+    w_rect.show()
+    qtbot.waitUntil(lambda: m_rect._detail is not None, timeout=5000)
+    assert m_rect._render_plan[0] == "rect"
+    assert m_rect._overview[0].format() == QImage.Format.Format_Indexed8
+    assert m_rect._detail[0].format() == QImage.Format.Format_Indexed8
+
+    # Colormap swap recolors cached Indexed8 images in-place without dropping _render_plan or _detail.
+    plan_before = m_rect._render_plan
+    detail_before = m_rect._detail
+    before_px = _grab_rgba(w_rect)
+    m_rect.setColorMap(get_safe_colormap("turbo"))
+    after_px = _grab_rgba(w_rect)
+    assert m_rect._render_plan is plan_before
+    assert m_rect._detail is detail_before
+    ys, xs = _data_box_slice(w_rect, after_px.shape)
+    assert np.mean(np.abs(after_px[ys, xs, :3].astype(float) - before_px[ys, xs, :3].astype(float))) > 10.0
+
+    # Same levels are a no-op (prevents ColorBarItem.setColorMap from invalidating caches).
+    m_rect.setLevels((0.0, 40.0))
+    assert m_rect._render_plan is plan_before
+
+    # Export mode paints exact cells without touching _detail or starting _detail_timer.
+    m_rect.setExportMode(True, {})
+    exp_img = QImage(80, 60, QImage.Format.Format_ARGB32)
+    exp_img.fill(0)
+    p = QPainter(exp_img)
+    p.scale(8.0, 30.0)
+    m_rect.paint(p, None, None)
+    p.end()
+    m_rect.setExportMode(False)
+    assert m_rect._detail is detail_before and not m_rect._detail_timer.isActive()
+    assert exp_img.pixelColor(60, 45).alpha() == 255
+
+    # 2. Curved/skewed mesh must NOT take the rectilinear path.
+    w_curv = pg.PlotWidget()
+    qtbot.addWidget(w_curv)
+    w_curv.resize(300, 240)
+    m_curv = CachedMeshItem(x_r, y_r + 0.1 * x_r, z_r, colorMap=_diverging_rdbu_r(), enableAutoLevels=False)
+    m_curv.setLevels((0.0, 40.0))
+    w_curv.addItem(m_curv)
+    w_curv.show()
+    qtbot.waitUntil(lambda: m_curv._detail is not None, timeout=5000)
+    assert m_curv._render_plan[0] == "paths"
+    curv_plan = m_curv._render_plan
+    m_curv.setColorMap(get_safe_colormap("viridis"))
+    assert m_curv._render_plan is curv_plan
+
+
+def test_offspec_settings_reuse_items_and_preserve_values(qtbot, window):
+    """Toggling log scale / normalization reuses map items in-place in θ, α, and Q views
+    without changing underlying normalized values."""
+    view = window.view_offspec
+    window.tabs.setCurrentWidget(view)
+    view._request_compute()
+    _wait_for_map(qtbot, view)
+
+    # θ mode reuses its single CachedMeshItem across log/normalization toggles.
+    assert view.combo_y_axis.currentData() == "th"
+    th_mesh = view._alpha_items[0]
+    raw_vals = view._norm.values.copy()
+    view.chk_log.setChecked(False)
+    assert view._alpha_items[0] is th_mesh
+    np.testing.assert_array_equal(view._norm.values, raw_vals)
+    view.chk_log.setChecked(True)
+    assert view._alpha_items[0] is th_mesh
+
+    # α mode reuses all 151 ImageItems in-place across log/normalization toggles.
+    view.combo_y_axis.setCurrentIndex(view.combo_y_axis.findData("alpha"))
+    alpha_items_before = list(view._alpha_items)
+    assert len(alpha_items_before) == 151
+    view.chk_log.setChecked(False)
+    assert view._alpha_items == alpha_items_before
+    view.combo_norm.setCurrentIndex(view.combo_norm.findData("monitor"))
+    assert view._alpha_items == alpha_items_before
+    view.combo_norm.setCurrentIndex(view.combo_norm.findData("raw"))
+    view.chk_log.setChecked(True)
+
+    # Q mode reuses its single CachedMeshItem across log/normalization toggles.
+    view.combo_y_axis.setCurrentIndex(view.combo_y_axis.findData("q"))
+    q_mesh = view._alpha_items[0]
+    view.chk_log.setChecked(False)
+    assert view._alpha_items[0] is q_mesh
+    view.chk_log.setChecked(True)
+    assert view._alpha_items[0] is q_mesh

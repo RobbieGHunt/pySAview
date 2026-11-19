@@ -14,7 +14,7 @@ from threading import Event
 import numpy as np
 import pyqtgraph as pg
 from PyQt6.QtCore import QPointF, QRectF, QSize, Qt, QThread, QTimer, pyqtSignal
-from PyQt6.QtGui import QCursor, QImage, QPainter, QPainterPath, QTransform
+from PyQt6.QtGui import QColor, QCursor, QImage, QPainter, QPainterPath, QPicture, QTransform, qRgba
 from PyQt6.QtWidgets import (
     QApplication,
     QButtonGroup,
@@ -101,6 +101,50 @@ def _fixed_width_text(label: QLabel) -> None:
     label.setMinimumWidth(0)
 
 
+_RDBU_R_POS = np.linspace(0.0, 1.0, 11)
+_RDBU_R_RGBA = np.array(
+    [
+        [5, 48, 97, 255],
+        [33, 102, 172, 255],
+        [67, 147, 195, 255],
+        [146, 197, 222, 255],
+        [209, 229, 240, 255],
+        [247, 247, 247, 255],
+        [253, 219, 199, 255],
+        [244, 165, 130, 255],
+        [214, 96, 77, 255],
+        [178, 24, 43, 255],
+        [103, 0, 31, 255],
+    ],
+    dtype=np.ubyte,
+)
+_CMAP_CACHE: dict[str, pg.ColorMap] = {}
+_IDENTITY_GRAY_ALPHA_TABLE = [qRgba(0, 0, 0, 0)] + [qRgba(i, i, i, 255) for i in range(1, 256)]
+
+
+def _diverging_rdbu_r() -> pg.ColorMap:
+    """ColorBrewer RdBu_r diverging map without importing matplotlib."""
+    cmap = _CMAP_CACHE.get("__rdbu_r__")
+    if cmap is None:
+        cmap = pg.ColorMap(pos=_RDBU_R_POS, color=_RDBU_R_RGBA)
+        _CMAP_CACHE["__rdbu_r__"] = cmap
+    return cmap
+
+
+def _color_table_from_colormap(cmap: pg.ColorMap) -> list[int]:
+    """256-entry ARGB color table for Format_Indexed8: index 0 transparent, 1..255 LUT."""
+    lut = cmap.getLookupTable(nPts=255, alpha=True)
+    return [qRgba(0, 0, 0, 0)] + [qRgba(int(r), int(g), int(b), int(a)) for r, g, b, a in lut]
+
+
+def _color_table_from_qcolors(lut) -> list[int]:
+    n = len(lut)
+    if n == 0:
+        return [qRgba(0, 0, 0, 0)] + [qRgba(0, 0, 0, 255)] * 255
+    idx = np.linspace(0, n - 1, 255).round().astype(int)
+    return [qRgba(0, 0, 0, 0)] + [QColor(lut[int(i)]).rgba() for i in idx]
+
+
 def _same_transform(a: QTransform, b: QTransform, tol: float = 1e-6) -> bool:
     va = (a.m11(), a.m12(), a.m21(), a.m22(), a.dx(), a.dy())
     vb = (b.m11(), b.m12(), b.m21(), b.m22(), b.dx(), b.dy())
@@ -108,24 +152,41 @@ def _same_transform(a: QTransform, b: QTransform, tol: float = 1e-6) -> bool:
 
 
 class CachedMeshItem(pg.PColorMeshItem):
-    """Exact-cell mesh that blits rendered images while the view moves.
+    """Exact-cell mesh that blits cached indexed-color images while the view moves.
 
     ``PColorMeshItem`` replays one polygon per cell on every repaint (~150k for a
-    Qx–Qz map, tens of ms), which makes panning, zooming and crosshair dragging
-    stutter. Here the same cells are rendered once into images: a whole-map
-    overview and a screen-resolution image of the current view (plus a margin).
-    While the view moves those images are only transformed; once it has been
-    still for ``DETAIL_DELAY_MS`` the view image is re-rendered pixel-exact.
-    Display only: the cell geometry and values are unchanged, and exports always
-    draw the cells directly.
+    Qx–Qz or θ map, ~1–2 s), which makes panning, zooming, and adjusting plot
+    settings sluggish. Here the exact cells are rasterized into ``Format_Indexed8``
+    images (a whole-map overview and a screen-resolution image of the current view
+    plus a margin):
+    - Rectilinear uniform-X meshes (such as ``X pixel vs θ``) blit per-row strips
+      directly without allocating 300k polygons (~100× faster).
+    - Curved meshes (such as ``Qx vs Qz``) bin finite quads into chunked
+      ``QPainterPath``s without ``QuadInstances`` Python overhead.
+    - Colormap switches swap the 256-entry color table in-place (<1 ms, zero
+      re-rasterization).
+    Display only: cell geometry and values are unchanged, and exports always draw
+    the exact cells directly.
     """
 
     DETAIL_DELAY_MS = 120
     MARGIN = 0.25  # fraction of the view rendered beyond each edge, so short pans stay sharp
     OVERVIEW_MAX_PX = 4096
+    PATH_CHUNK_QUADS = 4096
 
     def __init__(self, *args, **kwargs) -> None:
+        self._color_table: list[int] | None = None
+        self._geom_cache = None  # ("rect", x0, x1, y_lo, y_hi) or ("quads",)
+        self._render_plan = None  # ("empty",) | ("rect", ...) | ("paths", [...]) | ("picture", QPicture)
+        self._conn_buf = np.ones((self.PATH_CHUNK_QUADS, 5), dtype=np.int32)
+        self._conn_buf[:, 4] = 0
+        self._conn_flat = self._conn_buf.ravel()
         super().__init__(*args, **kwargs)
+        self._color_table = (
+            _color_table_from_colormap(self.cmap)
+            if self.cmap is not None
+            else _color_table_from_qcolors(self.lut_qcolor)
+        )
         self._picture_used = None
         self._overview = None  # (QImage, item-coordinate rect)
         self._detail = None  # (QImage, inverse device transform, device transform, device offset)
@@ -135,14 +196,244 @@ class CachedMeshItem(pg.PColorMeshItem):
         self._detail_timer.setInterval(self.DETAIL_DELAY_MS)
         self._detail_timer.timeout.connect(self._render_detail)
 
+    def _prepareData(self, args):
+        dirty = super()._prepareData(args)
+        # Invalidate cached XY geometry only when XY coordinates or dimensions actually changed.
+        if len(args) != 3 or args[0] is not None or args[1] is not None:
+            self._geom_cache = None
+        self._render_plan = None
+        return dirty
+
+    def _rerender(self, *, autoLevels):
+        super()._rerender(autoLevels=autoLevels)
+        self._render_plan = None
+
+    def setLevels(self, levels, update=True):
+        if (
+            self.levels is not None
+            and levels is not None
+            and len(levels) == 2
+            and float(levels[0]) == float(self.levels[0])
+            and float(levels[1]) == float(self.levels[1])
+        ):
+            return
+        super().setLevels(levels, update=update)
+
+    def _apply_color_table(self, table: list[int], *, update: bool) -> None:
+        self._color_table = table
+        if self.edgecolors is not None:
+            if update:
+                self._rerender(autoLevels=False)
+                self.update()
+            return
+        recolored = False
+        if self._overview is not None and self._overview[0].format() == QImage.Format.Format_Indexed8:
+            self._overview[0].setColorTable(table)
+            recolored = True
+        if self._detail is not None and self._detail[0].format() == QImage.Format.Format_Indexed8:
+            self._detail[0].setColorTable(table)
+            recolored = True
+        if update:
+            if not recolored:
+                self.qpicture = None
+                self._render_plan = None
+            self.update()
+
+    def setColorMap(self, cmap):
+        self.cmap = cmap
+        self.lut_qcolor = cmap.getLookupTable(nPts=256, mode=cmap.QCOLOR)
+        if self.glstate is not None:
+            self.setLookupTable(self.lut_qcolor, update=True)
+            self.cmap = cmap
+            return
+        self._apply_color_table(_color_table_from_colormap(cmap), update=True)
+
+    def setLookupTable(self, lut, update=True):
+        self.cmap = None
+        self.lut_qcolor = lut[:]
+        if self.glstate is not None:
+            super().setLookupTable(lut, update=update)
+            return
+        self._apply_color_table(_color_table_from_qcolors(lut), update=update)
+
+    def _ensure_geom(self):
+        if self._geom_cache is not None:
+            return self._geom_cache
+        x, y = self.x, self.y
+        if x is None or y is None or self.z is None or self.z.size == 0:
+            self._geom_cache = ("empty",)
+            return self._geom_cache
+        # O(1) quick check before scanning arrays: rectilinear uniform-X strip mesh?
+        r_count, c_count = self.z.shape
+        is_rect = False
+        if (
+            c_count > 0
+            and r_count > 0
+            and x[0, 0] == x[-1, 0]
+            and x[0, -1] == x[-1, -1]
+            and x[0, -1] > x[0, 0]
+            and y[0, 0] == y[0, -1]
+            and y[-1, 0] == y[-1, -1]
+            and np.all(np.isfinite(x))
+            and np.all(np.isfinite(y))
+        ):
+            expected_x = np.linspace(float(x[0, 0]), float(x[0, -1]), c_count + 1)
+            if np.allclose(x, expected_x[None, :], rtol=1e-7, atol=1e-9) and np.allclose(
+                y, y[:, :1], rtol=1e-7, atol=1e-9
+            ):
+                is_rect = True
+        if is_rect:
+            y_col = np.asarray(y[:, 0], dtype=float)
+            self._geom_cache = ("rect", float(x[0, 0]), float(x[0, -1]), y_col[:-1].copy(), y_col[1:].copy())
+        else:
+            self._geom_cache = ("quads",)
+        return self._geom_cache
+
+    def _build_render_plan(self):
+        if self.edgecolors is not None:
+            return ("picture", super()._drawPicture())
+        if self.z is None or self.z.size == 0:
+            return ("empty",)
+        geom = self._ensure_geom()
+        if geom[0] == "empty":
+            return ("empty",)
+        if self.levels is None:
+            finite = self.z[np.isfinite(self.z)]
+            if finite.size == 0:
+                return ("empty",)
+            lo, hi = float(finite.min()), float(finite.max())
+        else:
+            lo, hi = float(self.levels[0]), float(self.levels[1])
+        rng = hi - lo
+        if rng == 0.0:
+            rng = 1.0
+        scale = 254.0 / rng
+
+        if geom[0] == "rect":
+            _, x0, x1, y_lo, y_hi = geom
+            valid = np.isfinite(self.z)
+            active_rows = np.flatnonzero(np.any(valid, axis=1))
+            if active_rows.size == 0:
+                return ("empty",)
+            z_act = self.z[active_rows]
+            v_act = valid[active_rows]
+            bins = np.zeros(z_act.shape, dtype=np.uint8)
+            scaled = np.clip(np.rint((z_act[v_act] - lo) * scale), 0.0, 254.0).astype(np.uint8)
+            bins[v_act] = scaled + 1
+            bins = np.ascontiguousarray(bins)
+            rects = [
+                (
+                    QRectF(x0, float(min(y_lo[r], y_hi[r])), x1 - x0, float(abs(y_hi[r] - y_lo[r]))),
+                    QRectF(0.0, float(k), float(bins.shape[1]), 1.0),
+                )
+                for k, r in enumerate(active_rows)
+                if y_hi[r] != y_lo[r]
+            ]
+            if not rects:
+                return ("empty",)
+            src_img = QImage(bins.data, bins.shape[1], bins.shape[0], bins.shape[1], QImage.Format.Format_Indexed8)
+            src_img.setColorTable(_IDENTITY_GRAY_ALPHA_TABLE)
+            return ("rect", bins, src_img, rects)
+
+        # Curved / general quadrilateral mesh: group finite cells by quantized color bin into chunked paths.
+        valid = np.isfinite(self.z)
+        rows, cols = np.nonzero(valid)
+        if rows.size == 0:
+            return ("empty",)
+        zv = self.z[rows, cols]
+        bins = np.clip(np.rint((zv - lo) * scale), 0.0, 254.0).astype(np.int32) + 1
+        order = np.argsort(bins, kind="mergesort")
+        sbins = bins[order]
+        srows = rows[order]
+        scols = cols[order]
+        u_bins, starts, counts = np.unique(sbins, return_index=True, return_counts=True)
+
+        x, y = self.x, self.y
+        chunk = self.PATH_CHUNK_QUADS
+        qx = np.empty((chunk, 5), dtype=np.float64)
+        qy = np.empty((chunk, 5), dtype=np.float64)
+        paths: list[tuple[int, QPainterPath]] = []
+        for b_val, st, cnt in zip(u_bins, starts, counts):
+            b_int = int(b_val)
+            st_i = int(st)
+            cnt_i = int(cnt)
+            for off in range(0, cnt_i, chunk):
+                end = min(cnt_i, off + chunk)
+                k = end - off
+                rr = srows[st_i + off : st_i + end]
+                cc = scols[st_i + off : st_i + end]
+                qx[:k, 0] = x[rr, cc]
+                qy[:k, 0] = y[rr, cc]
+                qx[:k, 1] = x[rr + 1, cc]
+                qy[:k, 1] = y[rr + 1, cc]
+                qx[:k, 2] = x[rr + 1, cc + 1]
+                qy[:k, 2] = y[rr + 1, cc + 1]
+                qx[:k, 3] = x[rr, cc + 1]
+                qy[:k, 3] = y[rr, cc + 1]
+                qx[:k, 4] = qx[:k, 0]
+                qy[:k, 4] = qy[:k, 0]
+                path = pg.arrayToQPath(qx[:k].ravel(), qy[:k].ravel(), connect=self._conn_flat[: 5 * k])
+                paths.append((b_int, path))
+        return ("paths", paths)
+
+    def _ensure_plan(self):
+        if self._render_plan is None:
+            self._render_plan = self._build_render_plan()
+        return self._render_plan
+
+    def _paint_exact(self, painter: QPainter) -> None:
+        """Draw exact cells directly to ``painter`` (used for PNG/SVG exports)."""
+        plan = self._ensure_plan()
+        kind = plan[0]
+        if kind == "empty":
+            return
+        if kind == "picture":
+            painter.drawPicture(0, 0, plan[1])
+            return
+        table = self._color_table or _IDENTITY_GRAY_ALPHA_TABLE
+        if kind == "rect":
+            _, bins, _, rects = plan
+            export_img = QImage(bins.data, bins.shape[1], bins.shape[0], bins.shape[1], QImage.Format.Format_Indexed8)
+            export_img.setColorTable(table)
+            for dst_rect, src_rect in rects:
+                painter.drawImage(dst_rect, export_img, src_rect)
+            return
+        # kind == "paths"
+        painter.save()
+        painter.setPen(Qt.PenStyle.NoPen)
+        for b_int, path in plan[1]:
+            painter.fillPath(path, QColor.fromRgba(table[b_int]))
+        painter.restore()
+
     def _render(self, size: QSize, dpr: float, transform: QTransform) -> QImage:
-        image = QImage(size * dpr, QImage.Format.Format_ARGB32_Premultiplied)
+        plan = self._ensure_plan()
+        kind = plan[0]
+        if kind == "picture":
+            image = QImage(size * dpr, QImage.Format.Format_ARGB32_Premultiplied)
+            image.setDevicePixelRatio(dpr)
+            image.fill(Qt.GlobalColor.transparent)
+            painter = QPainter(image)
+            painter.setTransform(transform)
+            painter.drawPicture(0, 0, plan[1])
+            painter.end()
+            return image
+        image = QImage(size * dpr, QImage.Format.Format_Grayscale8)
         image.setDevicePixelRatio(dpr)
-        image.fill(Qt.GlobalColor.transparent)
-        painter = QPainter(image)
-        painter.setTransform(transform)
-        painter.drawPicture(0, 0, self.qpicture)
-        painter.end()
+        image.fill(0)
+        if kind != "empty":
+            painter = QPainter(image)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setTransform(transform)
+            if kind == "rect":
+                _, _, src_img, rects = plan
+                for dst_rect, src_rect in rects:
+                    painter.drawImage(dst_rect, src_img, src_rect)
+            else:  # kind == "paths"
+                for b_int, path in plan[1]:
+                    painter.fillPath(path, QColor(b_int, b_int, b_int))
+            painter.end()
+        image.reinterpretAsFormat(QImage.Format.Format_Indexed8)
+        image.setColorTable(self._color_table or _IDENTITY_GRAY_ALPHA_TABLE)
         return image
 
     def _render_overview(self, viewport: QSize, dpr: float) -> None:
@@ -150,8 +441,8 @@ class CachedMeshItem(pg.PColorMeshItem):
         if rect.width() <= 0 or rect.height() <= 0:
             return
         limit = self.OVERVIEW_MAX_PX / dpr
-        w = int(min(limit, max(64, 2 * viewport.width())))
-        h = int(min(limit, max(64, 2 * viewport.height())))
+        w = int(min(limit, max(64, viewport.width())))
+        h = int(min(limit, max(64, viewport.height())))
         transform = QTransform.fromScale(w / rect.width(), h / rect.height())
         transform.translate(-rect.left(), -rect.top())
         self._overview = (self._render(QSize(w, h), dpr, transform), QRectF(rect))
@@ -172,12 +463,13 @@ class CachedMeshItem(pg.PColorMeshItem):
     def paint(self, painter, opt, widget):
         if self.z is None:
             return
-        if self.qpicture is None:
-            self.qpicture = self._drawPicture()
         if self._exportOpts is not False or widget is None:
-            painter.drawPicture(0, 0, self.qpicture)  # exports: draw the exact cells
+            self._paint_exact(painter)  # exports: draw the exact cells
             return
-        if self._picture_used is not self.qpicture:  # new data, levels or colours
+        if self.qpicture is None:
+            self._ensure_plan()
+            self.qpicture = self._render_plan[1] if self._render_plan[0] == "picture" else QPicture()
+        if self._picture_used is not self.qpicture:  # new data or levels
             self._picture_used = self.qpicture
             self._overview = self._detail = None
         transform = painter.transform()
@@ -292,6 +584,9 @@ class OffSpecularView(QWidget):
         self._th_geom: dict | None = None
         self._cal_message = ""
         self._colorbar_on_strips = False
+        self._applied_cmap_key: tuple[bool, str] | None = None
+        self._colorbar_items_rebuilt = True
+        self._last_tick_key = None
         self.session_source_paths = lambda: []  # every loaded file; set by the main window
         self._cut_values: np.ndarray | None = None  # what the map shows (asymmetry: low counts blanked)
         self._init_ui()
@@ -663,6 +958,7 @@ class OffSpecularView(QWidget):
         # (laggy pan/zoom/crosshair) and hide the data. The cut plots keep theirs.
         self.plot.showGrid(x=False, y=False)
         self._apply_no_data_background()
+        self._last_tick_key = None
         self._update_y_ticks()
         self._update_cuts()
 
@@ -914,8 +1210,14 @@ class OffSpecularView(QWidget):
             if self._colorbar_on_strips:  # re-link only when coming back from mesh/strip views
                 self.colorbar.setImageItem(self.img_item)
                 self._colorbar_on_strips = False
+                self._colorbar_items_rebuilt = True
+        cmap = self._current_colormap()
+        cmap_key = (asym, "__rdbu_r__" if asym else self.combo_cmap.currentText())
         self.colorbar.setLevels((lo, hi))
-        self.colorbar.setColorMap(self._current_colormap())
+        if self._colorbar_items_rebuilt or cmap_key != self._applied_cmap_key:
+            self.colorbar.setColorMap(cmap)
+            self._applied_cmap_key = cmap_key
+            self._colorbar_items_rebuilt = False
         label = f"log₁₀({norm.units})" if self._log_active() else norm.units
         axis = getattr(self.colorbar, "axis", None)
         if axis is not None:
@@ -959,11 +1261,13 @@ class OffSpecularView(QWidget):
 
     def _current_colormap(self) -> pg.ColorMap:
         if self._asym_mode():
-            try:  # diverging map centred on zero asymmetry
-                return pg.colormap.getFromMatplotlib("RdBu_r")
-            except Exception:
-                return get_safe_colormap("cividis")
-        return get_safe_colormap(self.combo_cmap.currentText())
+            return _diverging_rdbu_r()
+        name = self.combo_cmap.currentText()
+        cmap = _CMAP_CACHE.get(name)
+        if cmap is None:
+            cmap = get_safe_colormap(name)
+            _CMAP_CACHE[name] = cmap
+        return cmap
 
     def _on_spin_changed(self) -> None:
         asym = self._asym_mode()
@@ -974,6 +1278,8 @@ class OffSpecularView(QWidget):
 
     def _on_cmap_changed(self, name: str) -> None:
         self.colorbar.setColorMap(self._current_colormap())
+        asym = self._asym_mode()
+        self._applied_cmap_key = (asym, "__rdbu_r__" if asym else self.combo_cmap.currentText())
 
     def _row_label(self, row: int) -> str:
         frame = int(self._norm.frame_indices[row])
@@ -983,9 +1289,22 @@ class OffSpecularView(QWidget):
         axis = self.plot.getPlotItem().getAxis("left")
         col_axis = self.plot_col.getPlotItem().getAxis("bottom")
         if self._norm is None or self._norm.frame_indices.size == 0:
-            axis.setTicks(None)
-            col_axis.setTicks(None)
+            if self._last_tick_key is not None:
+                axis.setTicks(None)
+                col_axis.setTicks(None)
+                self._last_tick_key = None
             return
+        mode = self.combo_y_axis.currentData()
+        frames = self._norm.frame_indices
+        if mode == "point":
+            step = max(1, int(np.ceil(frames.size / 12)))
+            tick_sig = tuple(int(frames[r]) for r in range(0, frames.size, step))
+            tick_key = (mode, frames.size, tick_sig, self.is_dark_mode)
+        else:
+            tick_key = (mode, self.is_dark_mode)
+        if tick_key == self._last_tick_key:
+            return
+        self._last_tick_key = tick_key
         if self._alpha_mode():
             axis.setTicks(None)
             col_axis.setTicks(None)
@@ -1010,9 +1329,8 @@ class OffSpecularView(QWidget):
             return
         self.plot.setLabel("bottom", "Detector X pixel")
         self.plot_row.setLabel("bottom", "Detector X pixel")
-        n = self._norm.frame_indices.size
+        n = frames.size
         self.plot.setLabel("left", "Point (frame index)")
-        step = max(1, int(np.ceil(n / 12)))
         major = [(row + 0.5, self._row_label(row)) for row in range(0, n, step)]
         minor = [(row + 0.5, "") for row in range(n) if row % step]
         axis.setTicks([major, minor])
@@ -1613,8 +1931,16 @@ class OffSpecularView(QWidget):
         self._redraw()
 
     def _clear_alpha_items(self) -> None:
-        for item in self._alpha_items:
-            self.plot.removeItem(item)
+        if len(self._alpha_items) > 1:
+            self.plot.setUpdatesEnabled(False)
+            try:
+                for item in self._alpha_items:
+                    self.plot.removeItem(item)
+            finally:
+                self.plot.setUpdatesEnabled(True)
+        else:
+            for item in self._alpha_items:
+                self.plot.removeItem(item)
         self._alpha_items = []
         self._alpha_geom = None
         self._th_geom = None
@@ -1641,29 +1967,54 @@ class OffSpecularView(QWidget):
         if rows.size == 0:
             self._show_unavailable("X pixel vs θ: no measured frames with valid θ angles.")
             return None
-        self.img_item.clear()
-        self._clear_alpha_items()
+        if self.img_item.image is not None:
+            self.img_item.clear()
         theta = th[frames[rows]]
-        strips = alpha_i_strip_edges(theta)
         n = rows.size
         nx = self._map.nx
-        x_edges = np.arange(nx + 1, dtype=float)
-        X = np.broadcast_to(x_edges[None, :], (2 * n, nx + 1)).copy()
-        Y = np.broadcast_to(strips.reshape(-1, 1), (2 * n, nx + 1)).copy()
+        prev_th = self._th_geom
+        can_reuse_mesh = (
+            len(self._alpha_items) == 1
+            and isinstance(self._alpha_items[0], CachedMeshItem)
+        )
+        same_th_geom = (
+            can_reuse_mesh
+            and prev_th is not None
+            and prev_th["theta"].shape == theta.shape
+            and np.array_equal(prev_th["theta"], theta)
+            and self._alpha_items[0].z is not None
+            and self._alpha_items[0].z.shape == (2 * n - 1, nx)
+        )
+        strips = prev_th["strips"] if same_th_geom else alpha_i_strip_edges(theta)
         Z = np.full((2 * n - 1, nx), np.nan)
         Z[0::2] = display[rows]
-        mesh = CachedMeshItem(X, Y, Z, enableAutoLevels=False)
-        self.plot.addItem(mesh)
-        items = [mesh]
-        self._alpha_items = items
+        if same_th_geom:
+            mesh = self._alpha_items[0]
+            mesh.setData(None, None, Z, autoLevels=False)
+            self._colorbar_items_rebuilt = False
+        else:
+            x_edges = np.arange(nx + 1, dtype=float)
+            X = np.broadcast_to(x_edges[None, :], (2 * n, nx + 1)).copy()
+            Y = np.broadcast_to(strips.reshape(-1, 1), (2 * n, nx + 1)).copy()
+            if can_reuse_mesh:
+                mesh = self._alpha_items[0]
+                mesh.setData(X, Y, Z, autoLevels=False)
+                self._colorbar_items_rebuilt = False
+            else:
+                self._clear_alpha_items()
+                mesh = CachedMeshItem(X, Y, Z, colorMap=self._current_colormap(), enableAutoLevels=False)
+                self.plot.addItem(mesh)
+                self._alpha_items = [mesh]
+                self.colorbar.setImageItem(self._alpha_items)
+                self._colorbar_on_strips = True
+                self._colorbar_items_rebuilt = True
+        self._alpha_geom = None
         self._th_geom = dict(
             rows=rows,
             theta=theta,
             strips=strips,
             extent=(0.0, float(nx), float(strips[:, 0].min()), float(strips[:, 1].max())),
         )
-        self.colorbar.setImageItem(items)
-        self._colorbar_on_strips = True
         skipped = frames.size - rows.size
         return f"X pixel vs θ: {skipped} unwritten/invalid frame(s) omitted." if skipped else ""
 
@@ -1696,41 +2047,116 @@ class OffSpecularView(QWidget):
         if rows.size == 0:
             self._show_unavailable(f"{name}: no measured frames with valid angles.")
             return None
-        self.img_item.clear()
-        self._clear_alpha_items()
+        if self.img_item.image is not None:
+            self.img_item.clear()
         sel = frames[rows]
         alpha_i = th[sel]
         base = tth[sel] - th[sel]
-        strips = alpha_i_strip_edges(alpha_i)
-        edges = alpha_f_offsets(self._map.nx, cal, edges=True)
+        prev_geom = self._alpha_geom
+        same_angles = (
+            prev_geom is not None
+            and prev_geom["alpha_i"].shape == alpha_i.shape
+            and np.array_equal(prev_geom["alpha_i"], alpha_i)
+            and np.array_equal(prev_geom["base"], base)
+            and prev_geom["cal"] == cal
+            and prev_geom.get("nx") == self._map.nx
+        )
+        strips = prev_geom["strips"] if same_angles else alpha_i_strip_edges(alpha_i)
+        edges = prev_geom["edges"] if same_angles else alpha_f_offsets(self._map.nx, cal, edges=True)
         span = abs(edges[-1] - edges[0])
-        geom = dict(rows=rows, alpha_i=alpha_i, base=base, strips=strips, cal=cal,
-                    af_lo=float(base.min() + edges.min()), af_hi=float(base.max() + edges.max()))
-        items = []
+        edges_min = float(edges.min())
+        geom = dict(
+            rows=rows,
+            alpha_i=alpha_i,
+            base=base,
+            strips=strips,
+            edges=edges,
+            cal=cal,
+            nx=self._map.nx,
+            af_lo=float(base.min() + edges_min),
+            af_hi=float(base.max() + float(edges.max())),
+        )
         if self._q_mode():
             # Exact cells: every pixel's four (α_i, α_f) corners mapped to (Qx, Qz). One mesh;
             # the NaN rows between strips keep points separate (no interpolation).
+            lam = self.spin_wavelength.value()
+            geom["wavelength"] = lam
             n = rows.size
-            ai_corners = np.broadcast_to(strips.reshape(-1, 1), (2 * n, edges.size))  # strip lo/hi edges
-            af_corners = np.repeat(base, 2)[:, None] + edges[None, :]  # pixel edges at each strip's 2θ − θ
-            X, Y = self._to_view(ai_corners, af_corners)
             Z = np.full((2 * n - 1, self._map.nx), np.nan)
             Z[0::2] = display[rows]
-            mesh = CachedMeshItem(X, Y, Z, enableAutoLevels=False)
-            self.plot.addItem(mesh)
-            items.append(mesh)
-            geom["extent"] = (float(np.nanmin(X)), float(np.nanmax(X)), float(np.nanmin(Y)), float(np.nanmax(Y)))
+            can_reuse_mesh = (
+                len(self._alpha_items) == 1
+                and isinstance(self._alpha_items[0], CachedMeshItem)
+            )
+            same_q_geom = (
+                can_reuse_mesh
+                and same_angles
+                and prev_geom.get("wavelength") == lam
+                and "extent" in prev_geom
+                and self._alpha_items[0].z is not None
+                and self._alpha_items[0].z.shape == Z.shape
+            )
+            if same_q_geom:
+                mesh = self._alpha_items[0]
+                mesh.setData(None, None, Z, autoLevels=False)
+                geom["extent"] = prev_geom["extent"]
+                self._colorbar_items_rebuilt = False
+            else:
+                ai_corners = np.broadcast_to(strips.reshape(-1, 1), (2 * n, edges.size))  # strip lo/hi edges
+                af_corners = np.repeat(base, 2)[:, None] + edges[None, :]  # pixel edges at each strip's 2θ − θ
+                X, Y = self._to_view(ai_corners, af_corners)
+                geom["extent"] = (float(np.nanmin(X)), float(np.nanmax(X)), float(np.nanmin(Y)), float(np.nanmax(Y)))
+                if can_reuse_mesh:
+                    mesh = self._alpha_items[0]
+                    mesh.setData(X, Y, Z, autoLevels=False)
+                    self._colorbar_items_rebuilt = False
+                else:
+                    self._clear_alpha_items()
+                    mesh = CachedMeshItem(X, Y, Z, colorMap=self._current_colormap(), enableAutoLevels=False)
+                    self.plot.addItem(mesh)
+                    self._alpha_items = [mesh]
+                    self.colorbar.setImageItem(self._alpha_items)
+                    self._colorbar_on_strips = True
+                    self._colorbar_items_rebuilt = True
         else:
-            for k, r in enumerate(rows):
-                values = display[r] if cal.sign > 0 else display[r][::-1]  # image runs to increasing α_f
-                item = pg.ImageItem(values[None, :], autoLevels=False)
-                item.setRect(strips[k, 0], base[k] + edges.min(), strips[k, 1] - strips[k, 0], span)
-                self.plot.addItem(item)
-                items.append(item)
-        self._alpha_items = items
+            can_reuse_strips = (
+                len(self._alpha_items) == rows.size
+                and rows.size > 0
+                and isinstance(self._alpha_items[0], pg.ImageItem)
+            )
+            if can_reuse_strips:
+                self.plot.setUpdatesEnabled(False)
+                try:
+                    for k, r in enumerate(rows):
+                        values = display[r] if cal.sign > 0 else display[r][::-1]
+                        item = self._alpha_items[k]
+                        item.setImage(values[None, :], autoLevels=False)
+                        if not same_angles:
+                            item.setRect(strips[k, 0], base[k] + edges_min, strips[k, 1] - strips[k, 0], span)
+                finally:
+                    self.plot.setUpdatesEnabled(True)
+                self._colorbar_items_rebuilt = False
+            else:
+                self._clear_alpha_items()
+                items = []
+                cmap = self._current_colormap()
+                self.plot.setUpdatesEnabled(False)
+                try:
+                    for k, r in enumerate(rows):
+                        values = display[r] if cal.sign > 0 else display[r][::-1]  # image runs to increasing α_f
+                        item = pg.ImageItem(values[None, :], autoLevels=False)
+                        item.setColorMap(cmap)
+                        item.setRect(strips[k, 0], base[k] + edges_min, strips[k, 1] - strips[k, 0], span)
+                        self.plot.addItem(item)
+                        items.append(item)
+                finally:
+                    self.plot.setUpdatesEnabled(True)
+                self._alpha_items = items
+                self.colorbar.setImageItem(items)
+                self._colorbar_on_strips = True
+                self._colorbar_items_rebuilt = True
+        self._th_geom = None
         self._alpha_geom = geom
-        self.colorbar.setImageItem(items)
-        self._colorbar_on_strips = True
         skipped = frames.size - rows.size
         return f"{name}: {skipped} unwritten/invalid frame(s) omitted." if skipped else ""
 
@@ -1856,13 +2282,15 @@ class OffSpecularView(QWidget):
             return
         bounds = self._scan_roi_bounds()
         frames = self._norm.frame_indices[g["rows"]]
-        for col in (0, 1):
-            xs, ys = [], []
-            for k, f in enumerate(frames):
-                b = bounds[0] if len(bounds) == 1 else bounds[min(int(f), len(bounds) - 1)]
-                xb = min(b[0], b[1]) if col == 0 else max(b[0], b[1])
-                af = g["base"][k] + cal.sign * (xb - cal.x0) * cal.deg_per_pixel
-                vx, vy = self._to_view([g["strips"][k, 0], g["strips"][k, 1]], [af, af])
-                xs += list(vx)
-                ys += list(vy)
-            self._add_overlay(xs, ys, "#facc15", connect="pairs")
+        if len(bounds) == 1:
+            x_lo = np.full(frames.size, min(bounds[0][0], bounds[0][1]), dtype=float)
+            x_hi = np.full(frames.size, max(bounds[0][0], bounds[0][1]), dtype=float)
+        else:
+            per_row = np.array([bounds[min(int(f), len(bounds) - 1)] for f in frames], dtype=float)
+            x_lo = np.minimum(per_row[:, 0], per_row[:, 1])
+            x_hi = np.maximum(per_row[:, 0], per_row[:, 1])
+        ai_pairs = g["strips"].reshape(-1)
+        for xb in (x_lo, x_hi):
+            af = g["base"] + cal.sign * (xb - cal.x0) * cal.deg_per_pixel
+            vx, vy = self._to_view(ai_pairs, np.repeat(af, 2))
+            self._add_overlay(vx, vy, "#facc15", connect="pairs")
