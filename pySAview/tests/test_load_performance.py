@@ -92,9 +92,26 @@ def test_example_files_parallel_roi_is_exact(name):
 
 
 def test_launch_does_not_import_scipy_stats():
-    code = "import sys, pySAview.ui.main_window; print('scipy.stats' in sys.modules)"
+    code = (
+        "import sys, pySAview.ui.main_window; "
+        "print('scipy.stats' in sys.modules, 'scipy.special' in sys.modules, 'matplotlib' in sys.modules)"
+    )
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
-    assert out.stdout.strip() == "False"
+    assert out.stdout.strip() == "False False False"
+
+
+def test_app_help_does_not_import_qt():
+    code = (
+        "import sys, pySAview.app; "
+        "sys.argv = ['pySAview', '--help'];\n"
+        "try:\n"
+        "    pySAview.app.main()\n"
+        "except SystemExit:\n"
+        "    pass\n"
+        "print('PyQt6' in sys.modules)"
+    )
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
+    assert out.stdout.strip().endswith("False")
 
 
 def test_parallel_roi_multi_strip_and_uncompressed_chunks(tmp_path):
@@ -288,7 +305,7 @@ def test_hidden_tabs_defer_heavy_reads_until_shown(qtbot):
 
 
 def test_async_load_warms_scipy_stats_off_gui_thread():
-    """First async load warms scipy.stats in FileLoadThread so _on_load_finished never stalls importing it."""
+    """First async load warms scipy.special in FileLoadThread without importing scipy.stats."""
     example_path = str((EXAMPLE_DIR / "005572.nxs").resolve())
     code = f"""
 import sys
@@ -298,12 +315,15 @@ from PyQt6.QtWidgets import QApplication
 from pySAview.ui.main_window import MainWindow
 
 assert "scipy.stats" not in sys.modules
+assert "scipy.special" not in sys.modules
 app = QApplication([])
 win = MainWindow()
 warm_before_gui_finish = []
+stats_loaded = []
 orig_finish = win._on_load_finished
 def spy_finish():
-    warm_before_gui_finish.append("scipy.stats" in sys.modules)
+    warm_before_gui_finish.append("scipy.special" in sys.modules)
+    stats_loaded.append("scipy.stats" in sys.modules)
     orig_finish()
 win._on_load_finished = spy_finish
 
@@ -313,9 +333,9 @@ loop = QEventLoop()
 next(iter(win._load_jobs.values())).finished.connect(loop.quit)
 loop.exec()
 win.close()
-print("WARM=" + str(warm_before_gui_finish))
+print("WARM=" + str(warm_before_gui_finish) + " STATS=" + str(stats_loaded))
 """
     env = os.environ.copy()
     env["QT_QPA_PLATFORM"] = "offscreen"
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env, check=True)
-    assert "WARM=[True]" in out.stdout
+    assert "WARM=[True] STATS=[False]" in out.stdout
