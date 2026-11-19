@@ -367,12 +367,13 @@ class ScanPlotView(QWidget):
         self.btn_zoom_out.clicked.connect(self._zoom_out)
         self.btn_reset_view = tool_button("Fit all curves")
         self.btn_reset_view.clicked.connect(self._reset_zoom)
-        self.btn_tool_log_y = tool_button("Log Y: logarithmic / linear Y axis", checkable=True)
+        self.btn_tool_log_y = self._make_log_tool_button("Log Y", "Log Y: logarithmic / linear Y axis")
         self.btn_tool_log_y.setChecked(self.chk_log_y.isChecked())
         self.btn_tool_log_y.toggled.connect(self._on_tool_log_y_toggled)
-        self.btn_tool_log_x = tool_button("Log X: logarithmic / linear X axis", checkable=True)
+        self.btn_tool_log_x = self._make_log_tool_button("Log X", "Log X: logarithmic / linear X axis")
         self.btn_tool_log_x.setChecked(self.chk_log_x.isChecked())
         self.btn_tool_log_x.toggled.connect(self._on_tool_log_x_toggled)
+        self._apply_log_button_styles()
         self.btn_toggle_q = tool_button("X axis: toggle incident angle θ (°) / momentum transfer Q (Å⁻¹)",
                                         checkable=True)
         self._set_x_symbol("θ")
@@ -668,6 +669,86 @@ class ScanPlotView(QWidget):
             self.combo_y.setCurrentIndex(self.combo_y.findData("ROI_Counts"))
         self._update_plot()
 
+    @staticmethod
+    def _make_log_tool_button(label: str, tooltip: str) -> QPushButton:
+        """Compact text-labelled toolbar toggle button for logarithmic axis scaling."""
+        button = QPushButton(label)
+        button.setToolTip(tooltip)
+        button.setAccessibleName(label)
+        button.setCheckable(True)
+        button.setFixedHeight(30)
+        button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        return button
+
+    def _apply_log_button_styles(self) -> None:
+        """Apply theme-aware high-contrast styling to the Log Y / Log X text toolbar toggles."""
+        if self.is_dark_mode:
+            style = (
+                "QPushButton {"
+                " background-color: #1e293b;"
+                " color: #cbd5e1;"
+                " border: 1.5px solid #475569;"
+                " border-radius: 6px;"
+                " padding: 0px 10px;"
+                " min-width: 36px;"
+                " font-size: 12px;"
+                " font-weight: 600;"
+                "}"
+                "QPushButton:hover {"
+                " background-color: #334155;"
+                " color: #f8fafc;"
+                " border-color: #64748b;"
+                "}"
+                "QPushButton:pressed {"
+                " background-color: #475569;"
+                " color: #ffffff;"
+                "}"
+                "QPushButton:checked {"
+                " background-color: #0369a1;"
+                " color: #ffffff;"
+                " border: 1.5px solid #38bdf8;"
+                "}"
+                "QPushButton:checked:hover {"
+                " background-color: #0284c7;"
+                " color: #ffffff;"
+                " border-color: #7dd3fc;"
+                "}"
+            )
+        else:
+            style = (
+                "QPushButton {"
+                " background-color: #ffffff;"
+                " color: #334155;"
+                " border: 1.5px solid #cbd5e1;"
+                " border-radius: 6px;"
+                " padding: 0px 10px;"
+                " min-width: 36px;"
+                " font-size: 12px;"
+                " font-weight: 600;"
+                "}"
+                "QPushButton:hover {"
+                " background-color: #f1f5f9;"
+                " color: #0f172a;"
+                " border-color: #94a3b8;"
+                "}"
+                "QPushButton:pressed {"
+                " background-color: #e2e8f0;"
+                " color: #0f172a;"
+                "}"
+                "QPushButton:checked {"
+                " background-color: #0369a1;"
+                " color: #ffffff;"
+                " border: 1.5px solid #075985;"
+                "}"
+                "QPushButton:checked:hover {"
+                " background-color: #075985;"
+                " color: #ffffff;"
+                " border-color: #0c4a6e;"
+                "}"
+            )
+        for btn in (self.btn_tool_log_y, self.btn_tool_log_x):
+            btn.setStyleSheet(style)
+
     def set_theme(self, is_dark: bool) -> None:
         """Update chart styling for theme."""
         self.is_dark_mode = is_dark
@@ -678,8 +759,7 @@ class ScanPlotView(QWidget):
         self.btn_zoom_in.setIcon(icons.get_icon("zoom_in", is_dark=is_dark))
         self.btn_zoom_out.setIcon(icons.get_icon("zoom_out", is_dark=is_dark))
         self.btn_reset_view.setIcon(icons.get_icon("maximize", is_dark=is_dark))
-        self.btn_tool_log_y.setIcon(icons.get_icon("log_y", is_dark=is_dark))
-        self.btn_tool_log_x.setIcon(icons.get_icon("log_x", is_dark=is_dark))
+        self._apply_log_button_styles()
         self.btn_export_plot.setIcon(icons.get_icon("download", is_dark=is_dark))
         self._set_x_symbol(getattr(self, "_x_symbol", "θ"))
         apply_plot_theme(self.plot_widget, is_dark)

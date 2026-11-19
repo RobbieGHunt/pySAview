@@ -466,5 +466,79 @@ def test_flipper_labels_and_detector_sum_mode(main_window: MainWindow):
     np.testing.assert_array_equal(det._current_frame_data, frame_0 + frame_1)
 
 
+def test_scan_charts_log_toolbar_buttons(qtbot, main_window: MainWindow):
+    main_window.tabs.setCurrentWidget(main_window.view_charts)
+    main_window.show()
+    qtbot.wait(10)
+
+    charts = main_window.view_charts
+    plot_item = charts.plot_widget.getPlotItem()
+
+    # Clear text labels, no icons, checkable, preserved tooltips & accessible names
+    for btn, label in ((charts.btn_tool_log_y, "Log Y"), (charts.btn_tool_log_x, "Log X")):
+        assert btn.text() == label
+        assert btn.icon().isNull()
+        assert btn.isCheckable() is True
+        assert label in btn.toolTip()
+        assert btn.accessibleName() == label
+        # Flush with adjacent toolbar buttons and wide enough to never clip text
+        assert btn.height() == charts.btn_pan.height()
+        assert btn.width() >= btn.sizeHint().width()
+        assert btn.width() >= btn.fontMetrics().horizontalAdvance(label) + 16
+        assert btn.height() >= btn.fontMetrics().height() + 4
+
+    # Initial states: Log Y on, Log X off
+    assert charts.btn_tool_log_y.isChecked() is True
+    assert charts.btn_tool_log_x.isChecked() is False
+    assert plot_item.getAxis("left").logMode is True
+    assert plot_item.getAxis("bottom").logMode is False
+
+    # Toggling Log Y button updates checkbox, plot log mode, and keeps button width stable
+    w_y_checked = charts.btn_tool_log_y.width()
+    charts.btn_tool_log_y.click()
+    assert charts.btn_tool_log_y.isChecked() is False
+    assert charts.chk_log_y.isChecked() is False
+    assert plot_item.getAxis("left").logMode is False
+    assert charts.btn_tool_log_y.width() == w_y_checked
+
+    charts.chk_log_y.setChecked(True)
+    assert charts.btn_tool_log_y.isChecked() is True
+    assert plot_item.getAxis("left").logMode is True
+
+    # Toggling Log X button updates checkbox, plot log mode, and keeps button width stable
+    w_x_unchecked = charts.btn_tool_log_x.width()
+    charts.btn_tool_log_x.click()
+    assert charts.btn_tool_log_x.isChecked() is True
+    assert charts.chk_log_x.isChecked() is True
+    assert plot_item.getAxis("bottom").logMode is True
+    assert charts.btn_tool_log_x.width() == w_x_unchecked
+
+    charts.btn_tool_log_x.click()
+    assert charts.btn_tool_log_x.isChecked() is False
+    assert charts.chk_log_x.isChecked() is False
+    assert plot_item.getAxis("bottom").logMode is False
+
+    # Light & dark themes keep text labels, keep icon null, and preserve obvious checked/unchecked contrast
+    for dark in (False, True):
+        main_window.act_dark_mode.setChecked(dark)
+        qtbot.wait(10)
+        for btn, label in ((charts.btn_tool_log_y, "Log Y"), (charts.btn_tool_log_x, "Log X")):
+            assert btn.text() == label
+            assert btn.icon().isNull()
+        # Log Y is checked and Log X is unchecked: rendered center fill colors must clearly differ
+        img_checked = charts.btn_tool_log_y.grab().toImage()
+        img_unchecked = charts.btn_tool_log_x.grab().toImage()
+        bg_checked = img_checked.pixelColor(4, img_checked.height() // 2)
+        bg_unchecked = img_unchecked.pixelColor(4, img_unchecked.height() // 2)
+        color_dist = (
+            abs(bg_checked.red() - bg_unchecked.red())
+            + abs(bg_checked.green() - bg_unchecked.green())
+            + abs(bg_checked.blue() - bg_unchecked.blue())
+        )
+        assert color_dist > 150
+    main_window.act_dark_mode.setChecked(False)
+
+
+
 
 
