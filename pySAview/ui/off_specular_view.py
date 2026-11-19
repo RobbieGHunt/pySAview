@@ -14,7 +14,7 @@ from threading import Event
 import numpy as np
 import pyqtgraph as pg
 from PyQt6.QtCore import QPointF, QRectF, QSize, Qt, QThread, QTimer, pyqtSignal
-from PyQt6.QtGui import QCursor, QImage, QPainter, QTransform
+from PyQt6.QtGui import QCursor, QImage, QPainter, QPainterPath, QTransform
 from PyQt6.QtWidgets import (
     QApplication,
     QButtonGroup,
@@ -128,7 +128,7 @@ class CachedMeshItem(pg.PColorMeshItem):
         super().__init__(*args, **kwargs)
         self._picture_used = None
         self._overview = None  # (QImage, item-coordinate rect)
-        self._detail = None  # (QImage, item-coordinate rect, device transform, device offset)
+        self._detail = None  # (QImage, inverse device transform, device transform, device offset)
         self._last_view = None  # (device transform, viewport size, device pixel ratio)
         self._detail_timer = QTimer()
         self._detail_timer.setSingleShot(True)
@@ -160,14 +160,13 @@ class CachedMeshItem(pg.PColorMeshItem):
         if self._last_view is None or self.qpicture is None or self.scene() is None:
             return
         transform, viewport, dpr = self._last_view
-        mx, my = int(viewport.width() * self.MARGIN), int(viewport.height() * self.MARGIN)
-        shifted = transform * QTransform.fromTranslate(mx, my)
-        image = self._render(QSize(viewport.width() + 2 * mx, viewport.height() + 2 * my), dpr, shifted)
         inverse, ok = transform.inverted()
         if not ok:
             return
-        device = QRectF(-mx, -my, viewport.width() + 2 * mx, viewport.height() + 2 * my)
-        self._detail = (image, inverse.mapRect(device), QTransform(transform), QPointF(-mx, -my))
+        mx, my = int(viewport.width() * self.MARGIN), int(viewport.height() * self.MARGIN)
+        shifted = transform * QTransform.fromTranslate(mx, my)
+        image = self._render(QSize(viewport.width() + 2 * mx, viewport.height() + 2 * my), dpr, shifted)
+        self._detail = (image, inverse, QTransform(transform), QPointF(-mx, -my))
         self.update()
 
     def paint(self, painter, opt, widget):
@@ -192,12 +191,46 @@ class CachedMeshItem(pg.PColorMeshItem):
             painter.drawImage(detail[3], detail[0])  # pixel-exact for this view
             painter.restore()
             return
-        if self._overview is None:
-            self._render_overview(viewport, dpr)
-        if self._overview is not None:
-            painter.drawImage(self._overview[1], self._overview[0])
         if detail is not None:
-            painter.drawImage(detail[1], detail[0])
+            detail_img, detail_inv, _, offset = detail
+            # Map detail_img logical pixels -> old viewport -> item -> current viewport.
+            # Drawing through this relative device transform preserves orientation under
+            # Y-up plot coordinates and inverted X/Y viewboxes alike (no vertical/horizontal flip).
+            rel = QTransform.fromTranslate(offset.x(), offset.y()) * detail_inv * transform
+            detail_dpr = detail_img.devicePixelRatio() or 1.0
+            detail_logical = QRectF(
+                0.0,
+                0.0,
+                detail_img.width() / detail_dpr,
+                detail_img.height() / detail_dpr,
+            )
+            detail_view_rect = rel.mapRect(detail_logical)
+            viewport_rect = QRectF(0.0, 0.0, float(viewport.width()), float(viewport.height()))
+            if not detail_view_rect.contains(viewport_rect):
+                if self._overview is None:
+                    self._render_overview(viewport, dpr)
+                if self._overview is not None:
+                    painter.save()
+                    if detail_view_rect.width() > 2.0 and detail_view_rect.height() > 2.0:
+                        clip_outside = QPainterPath()
+                        clip_outside.addRect(viewport_rect)
+                        inner = QPainterPath()
+                        inner.addRect(detail_view_rect.adjusted(0.5, 0.5, -0.5, -0.5))
+                        clip_outside = clip_outside.subtracted(inner)
+                        painter.resetTransform()
+                        painter.setClipPath(clip_outside, Qt.ClipOperation.IntersectClip)
+                        painter.setTransform(transform)
+                    painter.drawImage(self._overview[1], self._overview[0])
+                    painter.restore()
+            painter.save()
+            painter.setTransform(rel)
+            painter.drawImage(QPointF(0.0, 0.0), detail_img)
+            painter.restore()
+        else:
+            if self._overview is None:
+                self._render_overview(viewport, dpr)
+            if self._overview is not None:
+                painter.drawImage(self._overview[1], self._overview[0])
         self._detail_timer.start()  # sharpen once the view has stopped moving
 
 

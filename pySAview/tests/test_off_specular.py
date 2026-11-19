@@ -494,3 +494,172 @@ def test_sum_spin_mode_in_tab_and_export(qtbot, window):
     first = next(rows)
     assert first[0] == u0 and first[1] == d0
     assert any("pooled u + d" in line for line in header)
+
+
+def _grab_rgba(widget) -> np.ndarray:
+    from PyQt6.QtGui import QImage
+    from PyQt6.QtWidgets import QApplication
+
+    QApplication.processEvents()
+    img = widget.grab().toImage().convertToFormat(QImage.Format.Format_RGBA8888)
+    ptr = img.constBits()
+    ptr.setsize(img.sizeInBytes())
+    return np.frombuffer(ptr, dtype=np.uint8).reshape(img.height(), img.width(), 4).copy()
+
+
+def _data_box_slice(plot_widget, frame_shape):
+    """Pixel slice strictly inside the plot's ViewBox (excluding axis ticks/borders)."""
+    vb_rect = plot_widget.mapFromScene(plot_widget.getViewBox().sceneBoundingRect()).boundingRect()
+    h, w = frame_shape[:2]
+    pad_x = max(8, int(vb_rect.width() * 0.1))
+    pad_y = max(8, int(vb_rect.height() * 0.1))
+    y0 = max(0, vb_rect.top() + pad_y)
+    y1 = min(h, vb_rect.bottom() - pad_y)
+    x0 = max(0, vb_rect.left() + pad_x)
+    x1 = min(w, vb_rect.right() - pad_x)
+    return slice(y0, y1), slice(x0, x1)
+
+
+def test_cached_mesh_no_flip_during_pan_zoom_or_inverted_axes(qtbot):
+    """Panning or zooming CachedMeshItem must never vertically or horizontally flip the
+    cached image before the detail timer fires (including with inverted X/Y viewboxes)."""
+    import pyqtgraph as pg
+    from pySAview.ui.off_specular_view import CachedMeshItem
+    from pySAview.ui.theme import get_safe_colormap
+
+    widget = pg.PlotWidget()
+    qtbot.addWidget(widget)
+    widget.resize(420, 320)
+    # Strongly asymmetric 2D field: bright (high) at top (+y) and right (+x), dark (low) at
+    # bottom (-y) and left (-x), with a NaN gap band in the middle to catch overview bleed.
+    x, y = np.meshgrid(np.linspace(0.0, 10.0, 41), np.linspace(0.0, 10.0, 41))
+    yy = np.arange(40, dtype=float)[:, None]
+    xx = np.arange(40, dtype=float)[None, :]
+    z = yy * 2.0 + xx * 0.8
+    z[19:21, :] = np.nan
+    mesh = CachedMeshItem(x, y, z, enableAutoLevels=False)
+    mesh.setColorMap(get_safe_colormap("gray"))
+    mesh.setLevels((0.0, 110.0))
+    widget.addItem(mesh)
+    widget.getViewBox().setRange(xRange=(0.0, 10.0), yRange=(0.0, 10.0), padding=0.0)
+    widget.show()
+    qtbot.waitExposed(widget)
+    qtbot.waitUntil(lambda: mesh._detail is not None, timeout=5000)
+
+    vb = widget.getViewBox()
+
+    def assert_no_flip(move_fn, *, expect_top_brighter: bool, expect_right_brighter: bool):
+        prev_detail = mesh._detail
+        move_fn()
+        # Capture immediately BEFORE the 120 ms detail timer sharpens the view.
+        during = _grab_rgba(widget)
+        assert mesh._detail is prev_detail
+        qtbot.waitUntil(lambda: mesh._detail is not prev_detail and mesh._detail is not None, timeout=5000)
+        after = _grab_rgba(widget)
+
+        ys, xs = _data_box_slice(widget, after.shape)
+        d_box = during[ys, xs, :3].astype(float)
+        a_box = after[ys, xs, :3].astype(float)
+        h, w = d_box.shape[:2]
+        # Orientation check DURING pan/zoom (before detail timer):
+        top_luma = d_box[: h // 3, :, :].mean()
+        bot_luma = d_box[2 * h // 3 :, :, :].mean()
+        left_luma = d_box[:, : w // 3, :].mean()
+        right_luma = d_box[:, 2 * w // 3 :, :].mean()
+        if expect_top_brighter:
+            assert top_luma > bot_luma + 15.0
+        else:
+            assert bot_luma > top_luma + 15.0
+        if expect_right_brighter:
+            assert right_luma > left_luma + 5.0
+        else:
+            assert left_luma > right_luma + 5.0
+        # Rendered image during motion must closely match the settled detail image (no flip!).
+        diff = np.mean(np.abs(d_box - a_box))
+        diff_vflip = np.mean(np.abs(d_box[::-1, :, :] - a_box))
+        assert diff < 8.0 and diff < diff_vflip * 0.25
+
+    # 1. Small pan (inside the 25% detail margin)
+    assert_no_flip(
+        lambda: vb.setRange(xRange=(0.4, 10.4), yRange=(0.4, 10.4), padding=0.0),
+        expect_top_brighter=True,
+        expect_right_brighter=True,
+    )
+    # 2. Zoom in
+    assert_no_flip(
+        lambda: vb.setRange(xRange=(2.0, 8.0), yRange=(2.0, 8.0), padding=0.0),
+        expect_top_brighter=True,
+        expect_right_brighter=True,
+    )
+    # 3. Zoom out + large pan (exercises _overview outside detail_view_rect alongside _detail)
+    assert_no_flip(
+        lambda: vb.setRange(xRange=(-1.0, 11.0), yRange=(-1.0, 11.0), padding=0.0),
+        expect_top_brighter=True,
+        expect_right_brighter=True,
+    )
+    # 4. Inverted X axis + pan
+    vb.invertX(True)
+    qtbot.waitUntil(lambda: not mesh._detail_timer.isActive(), timeout=5000)
+    _grab_rgba(widget)
+    qtbot.waitUntil(lambda: not mesh._detail_timer.isActive(), timeout=5000)
+    assert_no_flip(
+        lambda: vb.setRange(xRange=(0.5, 9.5), yRange=(0.5, 9.5), padding=0.0),
+        expect_top_brighter=True,
+        expect_right_brighter=False,
+    )
+    # 5. Inverted Y axis + pan
+    vb.invertX(False)
+    vb.invertY(True)
+    _grab_rgba(widget)
+    qtbot.waitUntil(lambda: not mesh._detail_timer.isActive(), timeout=5000)
+    assert_no_flip(
+        lambda: vb.setRange(xRange=(0.2, 9.8), yRange=(0.2, 9.8), padding=0.0),
+        expect_top_brighter=False,
+        expect_right_brighter=True,
+    )
+
+
+@pytest.mark.parametrize("axis_mode", ["th", "point", "alpha", "q"])
+def test_offspec_map_all_modes_stay_upright_during_pan_and_zoom(qtbot, window, axis_mode):
+    """Every 2D map representation keeps exact orientation while panning and zooming."""
+    from pySAview.ui.off_specular_view import CachedMeshItem
+
+    view = window.view_offspec
+    window.resize(1100, 750)
+    window.tabs.setCurrentWidget(view)
+    view._request_compute()
+    _wait_for_map(qtbot, view)
+    window.show()
+    qtbot.waitExposed(window)
+
+    view.combo_y_axis.setCurrentIndex(view.combo_y_axis.findData(axis_mode))
+    _grab_rgba(view.plot)
+    mesh = view._alpha_items[0] if (view._alpha_items and isinstance(view._alpha_items[0], CachedMeshItem)) else None
+    if mesh is not None:
+        qtbot.waitUntil(lambda: mesh._detail is not None and not mesh._detail_timer.isActive(), timeout=5000)
+
+    vb = view.plot.getViewBox()
+    xr, yr = vb.viewRange()
+    dx = 0.04 * (xr[1] - xr[0])
+    dy = 0.04 * (yr[1] - yr[0])
+    prev_detail = mesh._detail if mesh is not None else None
+    vb.setRange(xRange=(xr[0] + dx, xr[1] + dx), yRange=(yr[0] + dy, yr[1] + dy), padding=0.0)
+    during = _grab_rgba(view.plot)
+    if mesh is not None:
+        qtbot.waitUntil(lambda: mesh._detail is not prev_detail and mesh._detail is not None, timeout=5000)
+    after = _grab_rgba(view.plot)
+
+    ys, xs = _data_box_slice(view.plot, after.shape)
+    d_box = during[ys, xs, :3].astype(float)
+    a_box = after[ys, xs, :3].astype(float)
+    # 8x8 block averaging removes sub-pixel rasterization jitter on sparse 1-px Poisson speckles
+    # while staying sharply sensitive to any vertical/horizontal flip or displacement.
+    bh, bw = (d_box.shape[0] // 8) * 8, (d_box.shape[1] // 8) * 8
+    d_blk = d_box[:bh, :bw].reshape(bh // 8, 8, bw // 8, 8, 3).mean(axis=(1, 3))
+    a_blk = a_box[:bh, :bw].reshape(bh // 8, 8, bw // 8, 8, 3).mean(axis=(1, 3))
+    assert np.mean(np.abs(d_blk - a_blk)) < 6.0
+    corr = float(np.corrcoef(d_blk.ravel(), a_blk.ravel())[0, 1])
+    corr_vflip = float(np.corrcoef(d_blk[::-1].ravel(), a_blk.ravel())[0, 1])
+    corr_hflip = float(np.corrcoef(d_blk[:, ::-1].ravel(), a_blk.ravel())[0, 1])
+    assert corr > 0.95 and corr > corr_vflip + 0.1 and corr > corr_hflip + 0.1
+    window.hide()
