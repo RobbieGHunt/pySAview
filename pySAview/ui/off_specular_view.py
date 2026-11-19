@@ -32,6 +32,7 @@ from PyQt6.QtWidgets import (
     QSizePolicy,
     QSpinBox,
     QSplitter,
+    QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -39,11 +40,14 @@ from PyQt6.QtWidgets import (
 from pySAview.core.angle_calibration import (
     AngleCalibration,
     DETECTOR_WIDTH_MM,
+    PYSARED_DEFAULT_DISTANCE_MM,
     CalibrationError,
+    alpha_f_offset_for_pixel,
     alpha_f_offsets,
     alpha_i_strip_edges,
     angles_from_q,
     calibrate,
+    pixel_for_alpha_f_offset,
     pixel_pitch_mm,
     q_from_angles,
     specular_center,
@@ -842,43 +846,119 @@ class OffSpecularView(QWidget):
 
     def _build_calibration_panel(self) -> QGroupBox:
         group = self.cal_group = QGroupBox("Angle calibration (α_i, α_f) — this scan")
-        grid = QGridLayout(group)
-        grid.setHorizontalSpacing(6)
+        outer = QVBoxLayout(group)
+        outer.setSpacing(6)
+
+        # Mode toggle at the top of the calibration card: Direct-beam fit vs pySAred geometry.
+        mode_row = QHBoxLayout()
+        mode_row.setSpacing(6)
+        self.btn_mode_direct_beam = QPushButton("Direct-beam fit")
+        self.btn_mode_direct_beam.setCheckable(True)
+        self.btn_mode_direct_beam.setChecked(True)
+        self.btn_mode_direct_beam.setToolTip(
+            "Linear pixel-to-angle calibration fitted from the transmitted direct-beam streak (°/px)"
+        )
+        self.btn_mode_pysared = QPushButton("pySAred geometry")
+        self.btn_mode_pysared.setCheckable(True)
+        self.btn_mode_pysared.setToolTip(
+            "Flat-detector arctan geometry using manual sample–detector distance L and detector width (pySAred convention)"
+        )
+        self.cal_mode_group = QButtonGroup(self)
+        self.cal_mode_group.setExclusive(True)
+        self.cal_mode_group.addButton(self.btn_mode_direct_beam, 0)
+        self.cal_mode_group.addButton(self.btn_mode_pysared, 1)
+        for btn in (self.btn_mode_direct_beam, self.btn_mode_pysared):
+            btn.setStyleSheet("QPushButton { padding: 4px 8px; }")
+            mode_row.addWidget(btn, 1)
+        self.btn_mode_direct_beam.clicked.connect(lambda: self._on_cal_mode_changed("direct_beam"))
+        self.btn_mode_pysared.clicked.connect(lambda: self._on_cal_mode_changed("pysared"))
+        outer.addLayout(mode_row)
+
+        # Mode-specific controls in a QStackedWidget (2 rows per page so toggling never jumps layout).
+        self.cal_mode_stack = QStackedWidget()
+
+        page_db = QWidget()
+        db_grid = QGridLayout(page_db)
+        db_grid.setContentsMargins(0, 0, 0, 0)
+        db_grid.setHorizontalSpacing(6)
         self.spin_dpp = QDoubleSpinBox()
         self.spin_dpp.setDecimals(6)
         self.spin_dpp.setRange(0.0, 1.0)
         self.spin_dpp.setSingleStep(0.00001)
         self.spin_dpp.setSuffix(" °/px")
         self.spin_dpp.setSpecialValueText("not set")
+        self.spin_dpp.setKeyboardTracking(False)
         self.spin_dpp.setToolTip("Exit-angle step per detector X pixel (from the direct-beam fit; editable)")
-        self.spin_x0 = QDoubleSpinBox()
-        self.spin_x0.setDecimals(1)
-        self.spin_x0.setRange(0.0, 4096.0)
-        self.spin_x0.setSuffix(" px")
-        self.spin_x0.setToolTip("Pixel of exit angle 2θ − θ (from the specular peak; editable)")
-        for spin in (self.spin_dpp, self.spin_x0):
-            spin.setKeyboardTracking(False)
-        self.chk_af_increases = QCheckBox("α_f increases with X")
-        self.chk_af_increases.setToolTip("Direction of the exit angle along displayed X (set by the fit)")
         self.spin_dpp.valueChanged.connect(lambda v: self._on_calibration_edited(deg_per_pixel=v))
-        self.spin_x0.valueChanged.connect(lambda v: self._on_calibration_edited(x0=v))
-        self.chk_af_increases.toggled.connect(lambda on: self._on_calibration_edited(sign=1 if on else -1))
         self.btn_fit_db = QPushButton("Fit Direct Beam")
         self.btn_fit_db.setToolTip("Refit °/pixel from the direct-beam streak and x₀ from the specular peak "
                                    "(discards manual values for this scan)")
         self.btn_fit_db.clicked.connect(self._refit_calibration)
-        self.chk_show_db = QCheckBox("Show fit / reference lines")
-        self.chk_show_db.setToolTip("Pixel axes: fitted direct-beam line. α axes: α_f = α_i (specular), "
-                                    "α_f = −α_i (direct beam) and the ROI; untick for a clean α map")
-        self.chk_show_db.setChecked(True)
-        self.chk_show_db.toggled.connect(self._draw_roi_overlay)
-        grid.addWidget(QLabel("Scale:"), 0, 0)
-        grid.addWidget(self.spin_dpp, 0, 1)
-        grid.addWidget(QLabel("x₀:"), 0, 2)
-        grid.addWidget(self.spin_x0, 0, 3)
-        grid.addWidget(self.chk_af_increases, 1, 0, 1, 2)
-        grid.addWidget(self.btn_fit_db, 1, 2, 1, 2)
-        grid.addWidget(self.chk_show_db, 2, 0, 1, 2)
+        self.lbl_distance = QLabel("—")
+        self.lbl_distance.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.lbl_distance.setToolTip(
+            "Check value only: sample-to-detector distance L = p / tan(Δ) implied by the "
+            "calibrated °/pixel scale Δ assuming nominal pixel pitch p = 300 mm / nx "
+            "(full readout width). Not used in any angle (α_f) or Q conversion.")
+        db_grid.addWidget(QLabel("Scale:"), 0, 0)
+        db_grid.addWidget(self.spin_dpp, 0, 1)
+        db_grid.addWidget(self.btn_fit_db, 0, 2, 1, 2)
+        db_grid.addWidget(QLabel("Distance:"), 1, 0)
+        db_grid.addWidget(self.lbl_distance, 1, 1, 1, 3)
+        db_grid.setColumnStretch(1, 1)
+        db_grid.setColumnStretch(3, 1)
+        self.cal_mode_stack.addWidget(page_db)
+
+        page_ps = QWidget()
+        ps_grid = QGridLayout(page_ps)
+        ps_grid.setContentsMargins(0, 0, 0, 0)
+        ps_grid.setHorizontalSpacing(6)
+        self.spin_distance_mm = QDoubleSpinBox()
+        self.spin_distance_mm.setDecimals(1)
+        self.spin_distance_mm.setRange(10.0, 50000.0)
+        self.spin_distance_mm.setSingleStep(10.0)
+        self.spin_distance_mm.setValue(PYSARED_DEFAULT_DISTANCE_MM)
+        self.spin_distance_mm.setSuffix(" mm")
+        self.spin_distance_mm.setKeyboardTracking(False)
+        self.spin_distance_mm.setToolTip("Sample-to-detector distance L used in pySAred flat-detector arctan geometry")
+        self.spin_distance_mm.valueChanged.connect(lambda v: self._on_calibration_edited(distance_mm=v))
+        self.spin_det_width_mm = QDoubleSpinBox()
+        self.spin_det_width_mm.setDecimals(1)
+        self.spin_det_width_mm.setRange(1.0, 5000.0)
+        self.spin_det_width_mm.setSingleStep(1.0)
+        self.spin_det_width_mm.setValue(DETECTOR_WIDTH_MM)
+        self.spin_det_width_mm.setSuffix(" mm")
+        self.spin_det_width_mm.setKeyboardTracking(False)
+        self.spin_det_width_mm.setToolTip("Active detector readout width along X (pixel pitch p = width / nx)")
+        self.spin_det_width_mm.valueChanged.connect(lambda v: self._on_calibration_edited(detector_width_mm=v))
+        self.lbl_effective_scale = QLabel("—")
+        self.lbl_effective_scale.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.lbl_effective_scale.setToolTip(
+            "Effective small-angle scale degrees(arctan((width / nx) / L)) at the detector normal (x₀); "
+            "actual exit angles use the full flat-detector arctan mapping."
+        )
+        ps_grid.addWidget(QLabel("Distance L:"), 0, 0)
+        ps_grid.addWidget(self.spin_distance_mm, 0, 1)
+        ps_grid.addWidget(QLabel("Width:"), 0, 2)
+        ps_grid.addWidget(self.spin_det_width_mm, 0, 3)
+        ps_grid.addWidget(QLabel("Eff. scale:"), 1, 0)
+        ps_grid.addWidget(self.lbl_effective_scale, 1, 1, 1, 3)
+        ps_grid.setColumnStretch(1, 1)
+        ps_grid.setColumnStretch(3, 1)
+        self.cal_mode_stack.addWidget(page_ps)
+
+        outer.addWidget(self.cal_mode_stack)
+
+        # Shared parameters across both calibration modes: x₀, λ, direction sign, and reference lines.
+        shared = QGridLayout()
+        shared.setHorizontalSpacing(6)
+        self.spin_x0 = QDoubleSpinBox()
+        self.spin_x0.setDecimals(1)
+        self.spin_x0.setRange(0.0, 4096.0)
+        self.spin_x0.setSuffix(" px")
+        self.spin_x0.setKeyboardTracking(False)
+        self.spin_x0.setToolTip("Pixel of exit angle 2θ − θ (from the specular peak; editable)")
+        self.spin_x0.valueChanged.connect(lambda v: self._on_calibration_edited(x0=v))
         self.spin_wavelength = QDoubleSpinBox()
         self.spin_wavelength.setRange(0.1, 50.0)
         self.spin_wavelength.setDecimals(3)
@@ -888,22 +968,35 @@ class OffSpecularView(QWidget):
         self.spin_wavelength.setKeyboardTracking(False)
         self.spin_wavelength.setToolTip("Neutron wavelength used for Qx and Qz")
         self.spin_wavelength.valueChanged.connect(self._on_wavelength_changed)
-        grid.addWidget(QLabel("λ:"), 2, 2)
-        grid.addWidget(self.spin_wavelength, 2, 3)
-        self.lbl_distance = QLabel("—")
-        self.lbl_distance.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        self.lbl_distance.setToolTip(
-            "Check value only: sample-to-detector distance L = p / tan(Δ) implied by the "
-            "calibrated °/pixel scale Δ assuming nominal pixel pitch p = 300 mm / nx "
-            "(full readout width). Not used in any angle (α_f) or Q conversion.")
-        grid.addWidget(QLabel("Distance:"), 3, 0)
-        grid.addWidget(self.lbl_distance, 3, 1, 1, 3)
-        grid.setColumnStretch(1, 1)
-        grid.setColumnStretch(3, 1)
+        self.chk_af_increases = QCheckBox("α_f increases with X")
+        self.chk_af_increases.setToolTip("Direction of the exit angle along displayed X")
+        self.chk_af_increases.toggled.connect(lambda on: self._on_calibration_edited(sign=1 if on else -1))
+        self.chk_show_db = QCheckBox("Show fit / reference lines")
+        self.chk_show_db.setToolTip("Pixel axes: fitted direct-beam line. α axes: α_f = α_i (specular), "
+                                    "α_f = −α_i (direct beam) and the ROI; untick for a clean α map")
+        self.chk_show_db.setChecked(True)
+        self.chk_show_db.toggled.connect(self._draw_roi_overlay)
+        shared.addWidget(QLabel("x₀:"), 0, 0)
+        shared.addWidget(self.spin_x0, 0, 1)
+        shared.addWidget(QLabel("λ:"), 0, 2)
+        shared.addWidget(self.spin_wavelength, 0, 3)
+        shared.addWidget(self.chk_af_increases, 1, 0, 1, 2)
+        shared.addWidget(self.chk_show_db, 1, 2, 1, 2)
+        shared.setColumnStretch(1, 1)
+        shared.setColumnStretch(3, 1)
+        outer.addLayout(shared)
+
         self._set_cal_status("Calibrated automatically from the direct beam when the map is computed.")
         return group
 
-    def _pixel_pitch(self) -> float | None:
+    def _detector_nx(self) -> int:
+        if self._map is not None:
+            return int(self._map.counts.shape[1])
+        if self.scan_data is not None and self.scan_data.detector_shape:
+            return int(self.scan_data.detector_shape[1])
+        return 1024
+
+    def _pixel_pitch(self, width_mm: float = DETECTOR_WIDTH_MM) -> float | None:
         """Displayed-X pixel spacing (mm) from the detector width, or None without detector data."""
         if self._map is not None:
             nx = self._map.counts.shape[1]
@@ -911,16 +1004,29 @@ class OffSpecularView(QWidget):
             nx = self.scan_data.detector_shape[1]
         else:
             return None
-        return pixel_pitch_mm(nx)
+        return pixel_pitch_mm(nx, width_mm)
 
     def _show_calibration(self, cal: AngleCalibration | None) -> None:
-        """Status tooltip and implied distance for this scan's calibration."""
-        pitch = self._pixel_pitch()
-        if cal is None or pitch is None:
+        """Status tooltip and distance / effective-scale readouts for this scan's calibration."""
+        if cal is None:
             self.lbl_distance.setText("—")
+            self.lbl_effective_scale.setText("—")
             return
-        nx = round(DETECTOR_WIDTH_MM / pitch)
-        self.lbl_distance.setText(f"{cal.distance_mm(pitch):.0f} mm  (from {DETECTOR_WIDTH_MM:g} mm / {nx} px)")
+        width = cal.detector_width_mm if cal.mode == "pysared" else DETECTOR_WIDTH_MM
+        pitch = self._pixel_pitch(width)
+        if pitch is None:
+            self.lbl_distance.setText("—")
+            self.lbl_effective_scale.setText("—")
+            return
+        nx = self._detector_nx()
+        if cal.mode == "pysared":
+            self.lbl_effective_scale.setText(
+                f"{cal.deg_per_pixel:.5f} °/px  ({cal.detector_width_mm:g} mm / {nx} px)"
+            )
+            self.lbl_distance.setText(f"{cal.sample_detector_distance_mm:.0f} mm  (pySAred geometry)")
+        else:
+            self.lbl_distance.setText(f"{cal.distance_mm(pitch):.0f} mm  (from {DETECTOR_WIDTH_MM:g} mm / {nx} px)")
+            self.lbl_effective_scale.setText(f"{cal.deg_per_pixel:.5f} °/px")
         self._set_cal_status(cal.describe(pitch))
 
     def _set_cal_status(self, text: str) -> None:
@@ -933,7 +1039,8 @@ class OffSpecularView(QWidget):
                        self.btn_export_png):
             widget.setEnabled(enabled)
         for widget in (self.spin_y0, self.spin_y1, self.btn_crosshair, self.btn_drop_cuts,
-                       self.btn_cut_h, self.btn_cut_v, self.spin_dpp, self.spin_x0,
+                       self.btn_cut_h, self.btn_cut_v, self.btn_mode_direct_beam, self.btn_mode_pysared,
+                       self.spin_dpp, self.spin_distance_mm, self.spin_det_width_mm, self.spin_x0,
                        self.chk_af_increases, self.btn_fit_db, self.chk_show_db, self.spin_wavelength):
             widget.setEnabled(enabled)
 
@@ -1878,14 +1985,24 @@ class OffSpecularView(QWidget):
         ]
         if self._alpha_mode():
             cal = self._alpha_geom["cal"]
-            header.append(f"Angle calibration: {cal.deg_per_pixel!r} deg/pixel ({cal.deg_per_pixel_source}), "
-                          f"x0 = {cal.x0!r} px, alpha_f {'increases' if cal.sign > 0 else 'decreases'} with X; "
-                          "coordinates are pixel centres")
-            pitch = self._pixel_pitch()
-            if pitch is not None:
-                header.append(f"Implied sample-detector distance: {cal.distance_mm(pitch):.1f} mm "
-                              f"(pixel {pitch!r} mm = {DETECTOR_WIDTH_MM:g} mm detector width; "
-                              "derived from deg/pixel, not used in the conversion)")
+            if cal.mode == "pysared":
+                pitch_ps = pixel_pitch_mm(omap.nx, cal.detector_width_mm)
+                header.append(
+                    f"Angle calibration: pySAred geometry (L = {cal.sample_detector_distance_mm!r} mm, "
+                    f"detector width = {cal.detector_width_mm!r} mm, pixel = {pitch_ps!r} mm, "
+                    f"effective {cal.deg_per_pixel!r} deg/pixel at x0), "
+                    f"x0 = {cal.x0!r} px, alpha_f {'increases' if cal.sign > 0 else 'decreases'} with X; "
+                    "coordinates are pixel centres"
+                )
+            else:
+                header.append(f"Angle calibration: {cal.deg_per_pixel!r} deg/pixel ({cal.deg_per_pixel_source}), "
+                              f"x0 = {cal.x0!r} px, alpha_f {'increases' if cal.sign > 0 else 'decreases'} with X; "
+                              "coordinates are pixel centres")
+                pitch = self._pixel_pitch()
+                if pitch is not None:
+                    header.append(f"Implied sample-detector distance: {cal.distance_mm(pitch):.1f} mm "
+                                  f"(pixel {pitch!r} mm = {DETECTOR_WIDTH_MM:g} mm detector width; "
+                                  "derived from deg/pixel, not used in the conversion)")
             if self._q_mode():
                 header.append(f"Wavelength: {self.spin_wavelength.value()!r} Angstrom; "
                               "Qx = (2pi/lambda)(cos af - cos ai), Qz = (2pi/lambda)(sin af + sin ai)")
@@ -2050,19 +2167,38 @@ class OffSpecularView(QWidget):
 
     def _sync_cal_controls(self) -> None:
         cal = getattr(self.scan_data, "angle_calibration", None) if self.scan_data is not None else None
-        widgets = (self.spin_dpp, self.spin_x0, self.chk_af_increases)
+        widgets = (
+            self.btn_mode_direct_beam,
+            self.btn_mode_pysared,
+            self.spin_dpp,
+            self.spin_distance_mm,
+            self.spin_det_width_mm,
+            self.spin_x0,
+            self.chk_af_increases,
+        )
         for widget in widgets:
             widget.blockSignals(True)
         if self.scan_data is not None and self.scan_data.detector_shape:
             self.spin_x0.setMaximum(float(self.scan_data.detector_shape[1]))
         if cal is not None:
+            is_pysared = cal.mode == "pysared"
+            self.btn_mode_pysared.setChecked(is_pysared)
+            self.btn_mode_direct_beam.setChecked(not is_pysared)
+            self.cal_mode_stack.setCurrentIndex(1 if is_pysared else 0)
             self.spin_dpp.setValue(cal.deg_per_pixel)
+            self.spin_distance_mm.setValue(cal.sample_detector_distance_mm)
+            self.spin_det_width_mm.setValue(cal.detector_width_mm)
             self.spin_x0.setValue(cal.x0)
             self.chk_af_increases.setChecked(cal.sign > 0)
             self._show_calibration(cal)
         else:
+            self.btn_mode_direct_beam.setChecked(True)
+            self.btn_mode_pysared.setChecked(False)
+            self.cal_mode_stack.setCurrentIndex(0)
             self._show_calibration(None)
             self.spin_dpp.setValue(0.0)
+            self.spin_distance_mm.setValue(PYSARED_DEFAULT_DISTANCE_MM)
+            self.spin_det_width_mm.setValue(DETECTOR_WIDTH_MM)
             if self._map is not None:
                 try:
                     self.spin_x0.setValue(
@@ -2081,14 +2217,81 @@ class OffSpecularView(QWidget):
         for widget in widgets:
             widget.blockSignals(False)
 
-    def _on_calibration_edited(self, *, deg_per_pixel=None, x0=None, sign=None) -> None:
+    def _on_cal_mode_changed(self, mode: str) -> None:
+        """Switch this scan's calibration between direct-beam fit and pySAred manual geometry."""
+        is_pysared = mode == "pysared"
+        self.cal_mode_stack.setCurrentIndex(1 if is_pysared else 0)
+        scan = self.scan_data
+        if scan is None:
+            return
+        nx = self._detector_nx()
+        cal = scan.angle_calibration
+        try:
+            if is_pysared:
+                if cal is None:
+                    cal = AngleCalibration.from_pysared(
+                        distance_mm=self.spin_distance_mm.value(),
+                        x0=self.spin_x0.value(),
+                        sign=1 if self.chk_af_increases.isChecked() else -1,
+                        detector_width_mm=self.spin_det_width_mm.value(),
+                        nx=nx,
+                    )
+                else:
+                    cal = cal.with_mode("pysared", nx=nx)
+            else:
+                if cal is not None:
+                    cal = cal.with_mode("direct_beam", nx=nx)
+                else:
+                    cal = self._ensure_calibration()
+        except ValueError as error:
+            self._set_notice(f"Calibration mode not changed: {error}")
+            self._sync_cal_controls()
+            return
+        scan.angle_calibration = cal
+        self._sync_cal_controls()
+        self._redraw()
+
+    def _on_calibration_edited(
+        self,
+        *,
+        deg_per_pixel=None,
+        x0=None,
+        sign=None,
+        distance_mm=None,
+        detector_width_mm=None,
+    ) -> None:
         """Manual override for this scan only; only the edited quantity changes."""
         scan = self.scan_data
         if scan is None:
             return
         cal = scan.angle_calibration
+        nx = self._detector_nx()
+        in_pysared = (
+            self.btn_mode_pysared.isChecked()
+            or distance_mm is not None
+            or detector_width_mm is not None
+        )
         try:
-            if cal is None:
+            if in_pysared:
+                if cal is None:
+                    cal = AngleCalibration.from_pysared(
+                        distance_mm=self.spin_distance_mm.value() if distance_mm is None else distance_mm,
+                        detector_width_mm=(
+                            self.spin_det_width_mm.value() if detector_width_mm is None else detector_width_mm
+                        ),
+                        x0=self.spin_x0.value() if x0 is None else x0,
+                        sign=(1 if self.chk_af_increases.isChecked() else -1) if sign is None else sign,
+                        nx=nx,
+                    )
+                else:
+                    cal = cal.with_pysared(
+                        distance_mm=distance_mm,
+                        detector_width_mm=detector_width_mm,
+                        x0=x0,
+                        sign=sign,
+                        nx=nx,
+                    )
+            elif cal is None:
                 dpp = self.spin_dpp.value()
                 if dpp <= 0:
                     return
@@ -2103,7 +2306,7 @@ class OffSpecularView(QWidget):
             self._set_notice(f"Calibration not changed: {error}")
             return
         scan.angle_calibration = cal
-        self._show_calibration(cal)
+        self._sync_cal_controls()
         self._redraw()
 
     def _clear_alpha_items(self) -> None:
@@ -2351,7 +2554,10 @@ class OffSpecularView(QWidget):
     def _pixel_for_alpha(self, k: int, alpha_f: float) -> int | None:
         g = self._alpha_geom
         cal = g["cal"]
-        px = int(np.floor(cal.x0 + cal.sign * (alpha_f - g["base"][k]) / cal.deg_per_pixel))
+        x_coord = pixel_for_alpha_f_offset(alpha_f - g["base"][k], self._map.nx, cal)
+        if not np.isfinite(x_coord):
+            return None
+        px = int(np.floor(x_coord))
         return px if 0 <= px < self._map.nx else None
 
     def _cell_at(self, xv: float, yv: float):
@@ -2394,8 +2600,12 @@ class OffSpecularView(QWidget):
         px = self._pixel_for_alpha(k, yv)
         if px is None:
             cal = g["cal"]
-            px = int(np.clip(np.floor(cal.x0 + cal.sign * (yv - g["base"][k]) / cal.deg_per_pixel),
-                             0, self._map.nx - 1))
+            offset = yv - g["base"][k]
+            x_coord = pixel_for_alpha_f_offset(offset, self._map.nx, cal)
+            if np.isfinite(x_coord):
+                px = int(np.clip(np.floor(x_coord), 0, self._map.nx - 1))
+            else:
+                px = (self._map.nx - 1) if (cal.sign * offset > 0) else 0
         return int(g["rows"][k]), px
 
     def _cell_center(self, row: int, x: int) -> tuple[float, float]:
@@ -2478,6 +2688,6 @@ class OffSpecularView(QWidget):
             x_hi = np.maximum(per_row[:, 0], per_row[:, 1])
         ai_pairs = g["strips"].reshape(-1)
         for xb in (x_lo, x_hi):
-            af = g["base"] + cal.sign * (xb - cal.x0) * cal.deg_per_pixel
+            af = g["base"] + alpha_f_offset_for_pixel(xb, self._map.nx, cal)
             vx, vy = self._to_view(ai_pairs, np.repeat(af, 2))
             self._add_overlay(vx, vy, "#facc15", connect="pairs")

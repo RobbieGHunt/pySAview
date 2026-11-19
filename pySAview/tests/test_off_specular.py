@@ -853,3 +853,105 @@ def test_cut_lines_drop_buttons_and_draggable_lines_all_modes(qtbot, window):
     assert not view.btn_cut_h.isChecked() and not view.btn_cut_v.isChecked()
     assert not view.line_row.isVisible() and not view.line_x.isVisible() and not view.crosshair.isVisible()
     assert not view._row_curve.isVisible() and not view._col_curve.isVisible()
+
+
+def test_calibration_mode_toggle_direct_beam_vs_pysared_per_scan(qtbot, window):
+    """Calibration mode toggle switches the card layout cleanly between Direct-beam fit
+    and pySAred geometry, updates α_f and Qx-Qz live using exact arctan/tan mappings,
+    exports pySAred metadata, and stays strictly per-scan."""
+    from pySAview.core.angle_calibration import (
+        DETECTOR_WIDTH_MM,
+        PYSARED_DEFAULT_DISTANCE_MM,
+        alpha_f_offsets,
+        effective_deg_per_pixel,
+    )
+
+    view = window.view_offspec
+    window.tabs.setCurrentWidget(view)
+    view._request_compute()
+    _wait_for_map(qtbot, view)
+    first_path = str(EXAMPLE.resolve())
+    first_scan = window.loaded_scans[first_path]
+
+    # 1. Default mode is Direct-beam fit on stack page 0.
+    assert view.btn_mode_direct_beam.isChecked() and not view.btn_mode_pysared.isChecked()
+    assert view.cal_mode_stack.currentIndex() == 0
+    assert first_scan.angle_calibration.mode == "direct_beam"
+    db_dpp = first_scan.angle_calibration.deg_per_pixel
+
+    view.combo_y_axis.setCurrentIndex(view.combo_y_axis.findData("alpha"))
+    ext_db_alpha = view._map_extent()
+    view.combo_y_axis.setCurrentIndex(view.combo_y_axis.findData("q"))
+    ext_db_q = view._map_extent()
+
+    # 2. Switch to pySAred geometry: stack switches to page 1 with default L=2500 mm, width=300 mm.
+    view.btn_mode_pysared.click()
+    assert view.btn_mode_pysared.isChecked() and not view.btn_mode_direct_beam.isChecked()
+    assert view.cal_mode_stack.currentIndex() == 1
+    assert view.spin_distance_mm.value() == pytest.approx(PYSARED_DEFAULT_DISTANCE_MM)
+    assert view.spin_det_width_mm.value() == pytest.approx(DETECTOR_WIDTH_MM)
+    cal_ps = first_scan.angle_calibration
+    assert cal_ps.mode == "pysared" and cal_ps.fit is not None
+    assert cal_ps.deg_per_pixel == pytest.approx(effective_deg_per_pixel(2500.0, 1024, 300.0))
+    assert "°/px" in view.lbl_effective_scale.text()
+    assert "pySAred geometry" in view.cal_status
+
+    # Larger L (2500 mm vs implied ~2051 mm) narrows the Qz span live.
+    ext_ps_q = view._map_extent()
+    assert ext_ps_q[3] < ext_db_q[3]
+
+    # Exact arctan / tan round-trip in Qx-Qz mode (including edge pixels far from x0).
+    for row, x in ((10, 20), (40, 370), (100, 600), (80, 1000)):
+        assert view._cell_at(*view._cell_center(row, x)) == (row, x)
+
+    # Constant-Q cuts and export header work cleanly in pySAred mode.
+    view.btn_drop_cuts.click()
+    assert view._row_curve.isVisible() and view._col_curve.isVisible()
+    assert view._row_curve.xData.size > 40 and view._col_curve.xData.size > 40
+    header, _, _ = view.export_table()
+    assert any("pySAred geometry" in line and "2500.0 mm" in line for line in header)
+
+    # 3. Editing L and detector width updates α_f and Qx-Qz live.
+    view.combo_y_axis.setCurrentIndex(view.combo_y_axis.findData("alpha"))
+    ext_2500_alpha = view._map_extent()
+    assert (ext_2500_alpha[3] - ext_2500_alpha[2]) < (ext_db_alpha[3] - ext_db_alpha[2])
+    view.spin_distance_mm.setValue(1800.0)
+    assert first_scan.angle_calibration.sample_detector_distance_mm == pytest.approx(1800.0)
+    ext_1800_alpha = view._map_extent()
+    assert (ext_1800_alpha[3] - ext_1800_alpha[2]) > (ext_2500_alpha[3] - ext_2500_alpha[2])
+    view.spin_det_width_mm.setValue(280.0)
+    assert first_scan.angle_calibration.detector_width_mm == pytest.approx(280.0)
+    # Exact cell round-trip in α_i vs α_f mode with custom pySAred geometry.
+    for row, x in ((10, 15), (50, 370), (120, 995)):
+        assert view._cell_at(*view._cell_center(row, x)) == (row, x)
+    # Verify α_f offsets match core pySAred arctan formula.
+    expected_edges = alpha_f_offsets(1024, first_scan.angle_calibration, edges=True)
+    np.testing.assert_allclose(view._alpha_geom["edges"], expected_edges)
+
+    # 4. Strictly per-scan: loading 005594.nxs must NOT inherit pySAred mode or L=1800 mm.
+    second_file = EXAMPLE.with_name("005594.nxs")
+    window.load_file(second_file)
+    view._request_compute()
+    _wait_for_map(qtbot, view)
+    second_scan = window.loaded_scans[str(second_file.resolve())]
+    assert second_scan.angle_calibration.mode == "direct_beam"
+    assert view.btn_mode_direct_beam.isChecked() and view.cal_mode_stack.currentIndex() == 0
+
+    # Switching back to 005572.nxs restores its pySAred mode, L=1800 mm, and width=280 mm.
+    window.set_active_file(EXAMPLE)
+    view._request_compute()
+    _wait_for_map(qtbot, view)
+    assert view.btn_mode_pysared.isChecked() and view.cal_mode_stack.currentIndex() == 1
+    assert view.spin_distance_mm.value() == pytest.approx(1800.0)
+    assert view.spin_det_width_mm.value() == pytest.approx(280.0)
+
+    # 5. Switching back to Direct-beam fit restores fitted °/px while remembering pySAred L/width.
+    view.btn_mode_direct_beam.click()
+    assert view.btn_mode_direct_beam.isChecked() and view.cal_mode_stack.currentIndex() == 0
+    assert first_scan.angle_calibration.mode == "direct_beam"
+    assert first_scan.angle_calibration.deg_per_pixel == pytest.approx(db_dpp)
+    assert view.spin_dpp.value() == pytest.approx(db_dpp, abs=1e-6)
+
+    view.btn_mode_pysared.click()
+    assert view.spin_distance_mm.value() == pytest.approx(1800.0)
+    assert view.spin_det_width_mm.value() == pytest.approx(280.0)
