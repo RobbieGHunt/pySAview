@@ -272,6 +272,20 @@ def test_wheel_focus_guard_blocks_unfocused_and_clears_on_click_away(qtbot):
 
 # ----------------------------------------------------------------- 7. Display-only Q & alpha map smoothing
 def test_q_and_alpha_map_smoothing_is_display_only_and_preserves_levels(qtbot):
+    from pySAview.ui.off_specular_view import (
+        CachedMeshItem,
+        SmoothResampledMapItem,
+        _bilateral_2d_display,
+    )
+
+    # Edge-preserving log-space bilateral must NOT bloom a 10^5 specular ridge onto nearby 10^1 background
+    ridge_log = np.ones((21, 21), dtype=float)
+    ridge_log[:, 10] = 5.0
+    filtered = _bilateral_2d_display(ridge_log, sigma_s=1.5, sigma_r=0.45, fill_isolated_nans=False)
+    assert filtered[10, 10] == pytest.approx(5.0, abs=0.05)
+    assert filtered[10, 11] == pytest.approx(1.0, abs=0.05)  # zero blooming 1 px away!
+    assert filtered[10, 12] == pytest.approx(1.0, abs=0.05)
+
     win = MainWindow()
     qtbot.addWidget(win)
     try:
@@ -284,37 +298,60 @@ def test_q_and_alpha_map_smoothing_is_display_only_and_preserves_levels(qtbot):
         assert offspec.combo_y_axis.currentData() == "th"
         assert offspec._smooth_group.isHidden()
 
-        # Visible in Qx vs Qz mode
+        # Visible in Qx vs Qz mode, placed on the display bar level with Colormap
         offspec.combo_y_axis.setCurrentIndex(offspec.combo_y_axis.findData("q"))
         assert not offspec._smooth_group.isHidden()
+        assert offspec._smooth_group.parentWidget() is offspec._cmap_group.parentWidget()
         assert offspec.chk_smooth_map.isChecked() is False
+        assert isinstance(offspec._alpha_items[0], CachedMeshItem)
 
         norm_before = offspec._norm.values.copy()
         cuts_before = offspec._cut_values.copy()
         _, _, rows_before_gen = offspec.export_table()
         export_before = [next(rows_before_gen) for _ in range(1000)]
-        z_before = offspec._alpha_items[0].z.copy()
         levels_before = tuple(float(v) for v in offspec.colorbar.levels())
 
-        # Enable smoothing
+        # Enable smooth re-binning -> switches to SmoothResampledMapItem (zero flat-quad boxing)
         offspec.chk_smooth_map.setChecked(True)
-        offspec.spin_smooth_sigma.setValue(2.0)
-        z_after = offspec._alpha_items[0].z.copy()
+        assert len(offspec._alpha_items) == 1
+        smooth_item = offspec._alpha_items[0]
+        assert isinstance(smooth_item, SmoothResampledMapItem)
 
-        # Display mesh changed, but numerical arrays, cuts, exports, and colorbar levels stayed intact
-        assert not np.allclose(z_before, z_after, equal_nan=True)
+        # Verify orientation & accuracy: Bragg peak around Qx=0, Qz≈0.116 Å⁻¹ is at the right Qz (no Y-flip)
+        grid = smooth_item.sample_grid(-0.2, 0.2, 0.05, 0.16, 80, 110)
+        assert np.any(np.isfinite(grid))
+        peak_row, _ = np.unravel_index(int(np.nanargmax(grid)), grid.shape)
+        peak_qz = 0.05 + (peak_row + 0.5) * (0.16 - 0.05) / 110.0
+        assert 0.105 <= peak_qz <= 0.128
+
+        # Pure bilinear mode (sigma = 0.0) and stronger denoising (sigma = 2.0) both work cleanly
+        offspec.spin_smooth_sigma.setValue(0.0)
+        grid_zero = smooth_item.sample_grid(-0.2, 0.2, 0.05, 0.16, 40, 55)
+        assert np.any(np.isfinite(grid_zero))
+        offspec.spin_smooth_sigma.setValue(2.0)
+
+        # Numerical arrays, cuts, exports, and colorbar levels stayed strictly untouched
         np.testing.assert_array_equal(offspec._norm.values, norm_before)
         np.testing.assert_array_equal(offspec._cut_values, cuts_before)
         header_after, _, rows_after_gen = offspec.export_table()
         export_after = [next(rows_after_gen) for _ in range(1000)]
         assert export_after == export_before
-        assert any("display-only" in line and "smoothing" in line.lower() for line in header_after)
+        assert any("display-only" in line and "bilinear" in line.lower() for line in header_after)
         assert tuple(float(v) for v in offspec.colorbar.levels()) == pytest.approx(levels_before, abs=1e-9)
 
-        # Alpha_i vs alpha_f mode also works cleanly with smoothing enabled
+        # Alpha_i vs alpha_f mode also uses SmoothResampledMapItem cleanly
         offspec.combo_y_axis.setCurrentIndex(offspec.combo_y_axis.findData("alpha"))
         assert not offspec._smooth_group.isHidden()
-        assert len(offspec._alpha_items) > 0
+        assert len(offspec._alpha_items) == 1
+        assert isinstance(offspec._alpha_items[0], SmoothResampledMapItem)
+        alpha_grid = offspec._alpha_items[0].sample_grid(0.5, 3.5, 0.5, 3.5, 60, 60)
+        assert np.any(np.isfinite(alpha_grid))
         np.testing.assert_array_equal(offspec._norm.values, norm_before)
+
+        # Unchecking Smooth restores exact unsmoothed CachedMeshItem in Q mode
+        offspec.combo_y_axis.setCurrentIndex(offspec.combo_y_axis.findData("q"))
+        offspec.chk_smooth_map.setChecked(False)
+        assert len(offspec._alpha_items) == 1
+        assert isinstance(offspec._alpha_items[0], CachedMeshItem)
     finally:
         win.view_offspec.shutdown()

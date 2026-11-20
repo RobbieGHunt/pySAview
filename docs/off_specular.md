@@ -120,11 +120,20 @@ cyan lines mark the background ROI boundaries on the map. See [Data reduction](r
 
 ## Display smoothing (`α_i vs α_f` and `Qx vs Qz`)
 
-In **α_i vs α_f** and **Qx vs Qz** views, the optional **Smooth** control applies a
-separable, NaN-safe 2D Gaussian filter (configurable radius `σ` in pixels) to the rendered
-map image only. Colour-bar levels stay anchored to the unsmoothed baseline, and all
-numerical data (`_norm`, cursor readouts, 1D cuts, and exported tables) remain strictly
-unsmoothed.
+In **α_i vs α_f** and **Qx vs Qz** views, the optional **Smooth** control (placed below
+**Normalize** / **Axes**, level with **Colormap**) switches the display renderer from
+exact flat-shaded pixel strips/quads to a regular-grid **inverse-bilinear re-binned**
+display (`SmoothResampledMapItem`) evaluated at the active viewport resolution via the
+exact analytic inverse `(Qx, Qz) → (α_i, α_f) → (frame, pixel)`. This eliminates flat-quad
+rectangular boxing artifacts at every zoom level.
+
+When the radius `σ > 0 px` (default `1.0 px`, range `0.0–4.0 px`), a separable
+edge-preserving **bilateral filter** is applied in display (`log₁₀`) space before
+re-binning: noisy regions of similar log-intensity are smoothed without linear-space
+blooming across sharp specular ridges, Kiessig fringes, or Bragg sheets (`σ = 0.0 px`
+applies pure bilinear re-binning with no denoising). Colour-bar levels remain anchored to
+the unsmoothed baseline, and all numerical data (`_norm`, cursor readouts, 1D cuts, and
+exported tables) remain strictly exact and unsmoothed.
 
 **Sample-to-detector distance.** In **Direct-beam fit** mode no distance is
 needed or entered: Δ is measured directly in degrees per pixel, and α_f, Qx and

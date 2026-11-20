@@ -119,57 +119,146 @@ def _fixed_width_text(label: QLabel) -> None:
     label.setMinimumWidth(0)
 
 
-def _convolve1d_nan(arr: np.ndarray, kernel: np.ndarray, axis: int) -> np.ndarray:
-    """Normalized NaN-aware 1D convolution along ``axis`` (pure NumPy, display-only)."""
-    r = kernel.size // 2
+def _bilateral_1d_display(
+    arr: np.ndarray,
+    sigma_s: float,
+    sigma_r: float,
+    axis: int,
+    *,
+    fill_isolated_nans: bool = False,
+) -> np.ndarray:
+    """1D NaN-safe edge-preserving bilateral filter along ``axis`` (pure NumPy, display-only)."""
+    r = max(1, min(8, int(np.ceil(2.5 * float(sigma_s)))))
     finite = np.isfinite(arr)
     filled = np.where(finite, arr, 0.0)
-    weights = finite.astype(float)
-    pad_width = [(0, 0), (0, 0)]
-    pad_width[axis] = (r, r)
-    f_pad = np.pad(filled, pad_width, mode="constant", constant_values=0.0)
-    w_pad = np.pad(weights, pad_width, mode="constant", constant_values=0.0)
+    pad = [(0, 0), (0, 0)]
+    pad[axis] = (r, r)
+    f_pad = np.pad(filled, pad, mode="constant", constant_values=0.0)
+    m_pad = np.pad(finite.astype(float), pad, mode="constant", constant_values=0.0)
     num = np.zeros_like(filled)
-    den = np.zeros_like(weights)
-    n_axis = arr.shape[axis]
-    for i, w in enumerate(kernel):
+    den = np.zeros_like(filled)
+    w_tot = 0.0
+    inv_2s2 = 0.5 / (float(sigma_s) ** 2)
+    inv_2r2 = 0.5 / (max(float(sigma_r), 1e-9) ** 2)
+    n_ax = arr.shape[axis]
+    for d in range(-r, r + 1):
+        ws = float(np.exp(-(d * d) * inv_2s2))
+        w_tot += ws
         if axis == 0:
-            num += w * f_pad[i : i + n_axis, :]
-            den += w * w_pad[i : i + n_axis, :]
+            nb = f_pad[r + d : r + d + n_ax, :]
+            nm = m_pad[r + d : r + d + n_ax, :]
         else:
-            num += w * f_pad[:, i : i + n_axis]
-            den += w * w_pad[:, i : i + n_axis]
+            nb = f_pad[:, r + d : r + d + n_ax]
+            nm = m_pad[:, r + d : r + d + n_ax]
+        diff = nb - filled
+        wr = np.where(finite, np.exp(-(diff * diff) * inv_2r2), 1.0)
+        w = ws * wr * nm
+        num += w * nb
+        den += w
     out = np.full_like(filled, np.nan)
-    ok = den > 1e-12
+    if fill_isolated_nans:
+        ok = (finite & (den > 1e-12)) | (~finite & (den >= 0.35 * w_tot))
+    else:
+        ok = finite & (den > 1e-12)
     out[ok] = num[ok] / den[ok]
     return out
 
 
-def _smooth_2d_display(
+def _bilateral_2d_display(
     values: np.ndarray,
-    sigma: float,
+    sigma_s: float,
+    sigma_r: float,
     *,
-    row_order: np.ndarray | None = None,
-    preserve_nans: bool = False,
+    fill_isolated_nans: bool = False,
 ) -> np.ndarray:
-    """Apply separable NaN-safe 2D Gaussian smoothing for display only (never mutates data)."""
+    """Separable edge-preserving 2D bilateral filter in display space (never blooms bright ridges)."""
     arr = np.asarray(values, dtype=float)
-    if arr.ndim != 2 or arr.size == 0 or sigma <= 0.0:
-        return arr
-    radius = max(1, int(np.ceil(3.0 * float(sigma))))
-    grid = np.arange(-radius, radius + 1, dtype=float)
-    kernel = np.exp(-0.5 * (grid / float(sigma)) ** 2)
-    kernel /= float(np.sum(kernel))
+    if arr.ndim != 2 or arr.size == 0 or sigma_s <= 0.0:
+        return arr.copy()
+    tmp = _bilateral_1d_display(arr, sigma_s, sigma_r, axis=1, fill_isolated_nans=fill_isolated_nans)
+    return _bilateral_1d_display(tmp, sigma_s, sigma_r, axis=0, fill_isolated_nans=fill_isolated_nans)
 
-    ordered = arr[row_order] if row_order is not None else arr
-    smoothed = _convolve1d_nan(_convolve1d_nan(ordered, kernel, axis=1), kernel, axis=0)
-    if preserve_nans:
-        smoothed = np.where(np.isfinite(ordered), smoothed, np.nan)
-    if row_order is not None:
-        restored = np.empty_like(smoothed)
-        restored[row_order] = smoothed
-        return restored
-    return smoothed
+
+def _sample_bilinear_ai_af(
+    src: np.ndarray,
+    ai_sorted: np.ndarray,
+    base_sorted: np.ndarray,
+    strips_sorted: np.ndarray,
+    nx: int,
+    cal: AngleCalibration,
+    ai_query: np.ndarray,
+    af_query: np.ndarray,
+    *,
+    min_weight: float = 0.45,
+) -> np.ndarray:
+    """Bilinearly sample ``src[frame, pixel]`` at physical ``(alpha_i, alpha_f)`` coordinates."""
+    n = ai_sorted.size
+    if n == 0 or nx <= 0:
+        return np.full(ai_query.shape, np.nan, dtype=float)
+    valid_in = (
+        np.isfinite(ai_query)
+        & np.isfinite(af_query)
+        & (ai_query >= float(strips_sorted[0, 0]))
+        & (ai_query <= float(strips_sorted[-1, 1]))
+    )
+    k1 = np.searchsorted(ai_sorted, ai_query)
+    k0 = np.clip(k1 - 1, 0, n - 1)
+    k1c = np.clip(k1, 0, n - 1)
+    in_strip = (
+        ((ai_query >= strips_sorted[k0, 0]) & (ai_query <= strips_sorted[k0, 1]))
+        | ((ai_query >= strips_sorted[k1c, 0]) & (ai_query <= strips_sorted[k1c, 1]))
+    )
+    valid_in &= in_strip
+
+    denom = ai_sorted[k1c] - ai_sorted[k0]
+    safe_denom = np.where(denom > 1e-12, denom, 1.0)
+    t_ai = np.where(denom > 1e-12, np.clip((ai_query - ai_sorted[k0]) / safe_denom, 0.0, 1.0), 0.0)
+
+    def _sample_row(k_idx: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        xf = pixel_for_alpha_f_offset(af_query - base_sorted[k_idx], nx, cal) - 0.5
+        in_x = np.isfinite(xf) & (xf >= -0.5) & (xf <= nx - 0.5)
+        xf_c = np.clip(xf, 0.0, float(nx - 1))
+        x0 = np.floor(xf_c).astype(np.int32)
+        x1 = np.minimum(x0 + 1, nx - 1)
+        tx = xf_c - x0
+        v0 = src[k_idx, x0]
+        v1 = src[k_idx, x1]
+        m0 = np.isfinite(v0) & in_x
+        m1 = np.isfinite(v1) & in_x
+        w0 = np.where(m0, 1.0 - tx, 0.0)
+        w1 = np.where(m1, tx, 0.0)
+        val = np.where(m0, v0, 0.0) * w0 + np.where(m1, v1, 0.0) * w1
+        return val, w0 + w1
+
+    s0, w0 = _sample_row(k0)
+    s1, w1 = _sample_row(k1c)
+    num = (1.0 - t_ai) * s0 + t_ai * s1
+    den = (1.0 - t_ai) * w0 + t_ai * w1
+    out = np.full(ai_query.shape, np.nan, dtype=float)
+    ok = valid_in & (den >= min_weight)
+    out[ok] = num[ok] / den[ok]
+    return out
+
+
+def _quantize_indexed_image(
+    vals: np.ndarray, levels: tuple[float, float] | None, color_table: list[int],
+) -> tuple[np.ndarray, QImage]:
+    """Quantize a 2D float grid ``(H, W)`` into a ``Format_Indexed8`` QImage (0 = transparent NaN)."""
+    h, w = vals.shape
+    bins = np.zeros((h, w), dtype=np.uint8)
+    valid = np.isfinite(vals)
+    if np.any(valid):
+        if levels is None:
+            lo, hi = float(np.nanmin(vals)), float(np.nanmax(vals))
+        else:
+            lo, hi = float(levels[0]), float(levels[1])
+        rng = hi - lo if hi > lo else 1.0
+        scaled = np.clip(np.rint((vals[valid] - lo) * (254.0 / rng)), 0.0, 254.0).astype(np.uint8)
+        bins[valid] = scaled + 1
+    bins = np.ascontiguousarray(bins)
+    img = QImage(bins.data, w, h, w, QImage.Format.Format_Indexed8)
+    img.setColorTable(color_table)
+    return bins, img
 
 
 _RDBU_R_POS = np.linspace(0.0, 1.0, 11)
@@ -597,6 +686,222 @@ class CachedMeshItem(pg.PColorMeshItem):
         self._detail_timer.start()  # sharpen once the view has stopped moving
 
 
+class SmoothResampledMapItem(pg.GraphicsObject):
+    """Smoothly re-binned ``(α_i, α_f)`` or ``(Qx, Qz)`` map rendered at viewport resolution.
+
+    Eliminates rectangular flat-cell / quad boxing artifacts by evaluating the exact
+    analytic inverse mapping ``(Qx, Qz) -> (α_i, α_f) -> (frame, pixel)`` with bilinear
+    interpolation directly on a regular display grid matching the active viewport (plus
+    an overview image for smooth panning/zooming). Display-only: never alters data, cuts,
+    cursor readouts, or table exports.
+    """
+
+    DETAIL_DELAY_MS = 120
+    MARGIN = 0.20
+    OVERVIEW_MAX_PX = 800
+    DETAIL_MAX_PX = 1000
+    EXPORT_MAX_PX = 1200
+
+    def __init__(self, *, colorMap: pg.ColorMap | None = None) -> None:
+        super().__init__()
+        self.cmap: pg.ColorMap | None = colorMap
+        self.levels: tuple[float, float] | None = None
+        self._color_table: list[int] = (
+            _color_table_from_colormap(colorMap) if colorMap is not None else _IDENTITY_GRAY_ALPHA_TABLE
+        )
+        self._source: dict | None = None
+        self._rect = QRectF()
+        self._overview = None  # (vals, bins, QImage, QRectF)
+        self._detail = None  # (vals, bins, QImage, QRectF, scale_xy)
+        self._last_view = None  # (QTransform, QSize, dpr)
+        self._detail_timer = QTimer()
+        self._detail_timer.setSingleShot(True)
+        self._detail_timer.setInterval(self.DETAIL_DELAY_MS)
+        self._detail_timer.timeout.connect(self._render_detail)
+
+    def set_source(
+        self,
+        src: np.ndarray,
+        ai_sorted: np.ndarray,
+        base_sorted: np.ndarray,
+        strips_sorted: np.ndarray,
+        nx: int,
+        cal: AngleCalibration,
+        extent: tuple[float, float, float, float],
+        *,
+        q_mode: bool,
+        wavelength: float | None = None,
+    ) -> None:
+        self._detail_timer.stop()
+        x0, x1, y0, y1 = (float(v) for v in extent)
+        new_rect = QRectF(min(x0, x1), min(y0, y1), abs(x1 - x0), abs(y1 - y0))
+        if new_rect != self._rect:
+            self.prepareGeometryChange()
+            self._rect = new_rect
+        self._source = dict(
+            src=np.asarray(src, dtype=float),
+            ai=np.asarray(ai_sorted, dtype=float),
+            base=np.asarray(base_sorted, dtype=float),
+            strips=np.asarray(strips_sorted, dtype=float),
+            nx=int(nx),
+            cal=cal,
+            q_mode=bool(q_mode),
+            wavelength=None if wavelength is None else float(wavelength),
+        )
+        self._overview = None
+        self._detail = None
+        self.update()
+
+    def getColorMap(self) -> pg.ColorMap | None:
+        return self.cmap
+
+    def setColorMap(self, cmap: pg.ColorMap) -> None:
+        self.cmap = cmap
+        self._apply_color_table(_color_table_from_colormap(cmap))
+
+    def setLookupTable(self, lut, update: bool = True) -> None:
+        self.cmap = None
+        self._apply_color_table(_color_table_from_qcolors(lut), update=update)
+
+    def _apply_color_table(self, table: list[int], *, update: bool = True) -> None:
+        self._color_table = table
+        if self._overview is not None:
+            self._overview[2].setColorTable(table)
+        if self._detail is not None:
+            self._detail[2].setColorTable(table)
+        if update:
+            self.update()
+
+    def getLevels(self) -> tuple[float, float] | None:
+        return self.levels
+
+    def setLevels(self, levels, update: bool = True) -> None:
+        if levels is None or len(levels) != 2:
+            return
+        new_lv = (float(levels[0]), float(levels[1]))
+        if self.levels == new_lv:
+            return
+        self.levels = new_lv
+        # Re-bin cached float arrays into uint8 LUT indices in-place (<2 ms, no resampling)
+        if self._overview is not None:
+            vals, _, _, rect = self._overview
+            bins, img = _quantize_indexed_image(vals, self.levels, self._color_table)
+            self._overview = (vals, bins, img, rect)
+        if self._detail is not None:
+            vals, _, _, rect, scale_xy = self._detail
+            bins, img = _quantize_indexed_image(vals, self.levels, self._color_table)
+            self._detail = (vals, bins, img, rect, scale_xy)
+        if update:
+            self.update()
+
+    def boundingRect(self) -> QRectF:
+        return QRectF(self._rect)
+
+    def sample_grid(self, x0: float, x1: float, y0: float, y1: float, w_px: int, h_px: int) -> np.ndarray:
+        """Evaluate the smoothly re-binned display field on a regular ``(h_px, w_px)`` grid."""
+        s = self._source
+        if s is None or w_px <= 0 or h_px <= 0 or x1 <= x0 or y1 <= y0:
+            return np.full((max(1, h_px), max(1, w_px)), np.nan, dtype=float)
+        dx = (x1 - x0) / float(w_px)
+        dy = (y1 - y0) / float(h_px)
+        xs = np.linspace(x0 + 0.5 * dx, x1 - 0.5 * dx, w_px)
+        ys = np.linspace(y0 + 0.5 * dy, y1 - 0.5 * dy, h_px)
+        X, Y = np.meshgrid(xs, ys)
+        if s["q_mode"]:
+            ai_q, af_q = angles_from_q(X / QX_SCALE, Y, s["wavelength"])
+        else:
+            ai_q, af_q = X, Y
+        return _sample_bilinear_ai_af(s["src"], s["ai"], s["base"], s["strips"], s["nx"], s["cal"], ai_q, af_q)
+
+    def _ensure_overview(self) -> None:
+        if self._overview is not None or self._source is None or self._rect.isEmpty():
+            return
+        r = self._rect
+        w_px = self.OVERVIEW_MAX_PX
+        h_px = int(round(self.OVERVIEW_MAX_PX * 0.8))
+        vals = self.sample_grid(r.left(), r.right(), r.top(), r.bottom(), w_px, h_px)
+        bins, img = _quantize_indexed_image(vals, self.levels, self._color_table)
+        self._overview = (vals, bins, img, QRectF(r))
+
+    def _view_item_rect(self, transform: QTransform, viewport: QSize) -> QRectF | None:
+        inv, ok = transform.inverted()
+        if not ok or viewport.width() <= 0 or viewport.height() <= 0:
+            return None
+        vp = QRectF(0.0, 0.0, float(viewport.width()), float(viewport.height()))
+        return inv.mapRect(vp).normalized()
+
+    def _render_detail(self) -> None:
+        if self._source is None or self._last_view is None or self._rect.isEmpty():
+            return
+        transform, viewport, dpr = self._last_view
+        vis = self._view_item_rect(transform, viewport)
+        if vis is None or vis.isEmpty():
+            return
+        mx = vis.width() * self.MARGIN
+        my = vis.height() * self.MARGIN
+        padded = vis.adjusted(-mx, -my, mx, my)
+        target = padded.intersected(self._rect)
+        if target.isEmpty() or target.width() <= 0.0 or target.height() <= 0.0:
+            return
+        dev_rect = transform.mapRect(target).normalized()
+        w_px = int(min(self.DETAIL_MAX_PX, max(64, round(dev_rect.width() * dpr))))
+        h_px = int(min(self.DETAIL_MAX_PX, max(64, round(dev_rect.height() * dpr))))
+        vals = self.sample_grid(target.left(), target.right(), target.top(), target.bottom(), w_px, h_px)
+        bins, img = _quantize_indexed_image(vals, self.levels, self._color_table)
+        scale_xy = (abs(transform.m11()), abs(transform.m22()))
+        self._detail = (vals, bins, img, QRectF(target), scale_xy)
+        self.update()
+
+    def paint(self, painter: QPainter, opt, widget) -> None:
+        if self._source is None or self._rect.isEmpty():
+            return
+        if self._exportOpts is not False or widget is None:
+            r = self._rect
+            vals = self.sample_grid(r.left(), r.right(), r.top(), r.bottom(), self.EXPORT_MAX_PX, int(round(self.EXPORT_MAX_PX * 0.8)))
+            _, img = _quantize_indexed_image(vals, self.levels, self._color_table)
+            painter.save()
+            painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+            painter.drawImage(r, img)
+            painter.restore()
+            return
+
+        transform = painter.transform()
+        viewport = widget.size()
+        dpr = widget.devicePixelRatioF()
+        self._last_view = (QTransform(transform), viewport, dpr)
+        vis = self._view_item_rect(transform, viewport)
+        cur_scale = (abs(transform.m11()), abs(transform.m22()))
+
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        detail = self._detail
+        detail_fresh = False
+        if detail is not None and vis is not None:
+            _, _, detail_img, detail_rect, detail_scale = detail
+            same_scale = (
+                abs(detail_scale[0] - cur_scale[0]) <= 0.08 * max(1e-12, cur_scale[0])
+                and abs(detail_scale[1] - cur_scale[1]) <= 0.08 * max(1e-12, cur_scale[1])
+            )
+            needed = vis.intersected(self._rect)
+            covers = detail_rect.adjusted(-1e-9, -1e-9, 1e-9, 1e-9).contains(needed)
+            if same_scale and covers:
+                painter.drawImage(detail_rect, detail_img)
+                painter.restore()
+                return
+            detail_fresh = False
+            self._ensure_overview()
+            if self._overview is not None:
+                painter.drawImage(self._overview[3], self._overview[2])
+            painter.drawImage(detail_rect, detail_img)
+        else:
+            self._ensure_overview()
+            if self._overview is not None:
+                painter.drawImage(self._overview[3], self._overview[2])
+        painter.restore()
+        if not detail_fresh:
+            self._detail_timer.start()
+
+
 class OffSpecularThread(QThread):
     """Integrates the detector volume with its own read-only handle."""
 
@@ -751,44 +1056,52 @@ class OffSpecularView(QWidget):
                                      "(right-hand panel); Qx–Qz also uses λ")
         self.combo_y_axis.currentIndexChanged.connect(self._on_axes_changed)
         bar.addWidget(make_flow_group(QLabel("Axes:"), self.combo_y_axis, spacing=6))
+        main.addWidget(bar)
 
+        # Second control row: display options (Colormap + Smooth sit below Normalize / Axes)
+        self._display_bar = display_bar = FlowContainer(margin=0, h_spacing=8, v_spacing=6)
         self.chk_log = QCheckBox("Log Scale")
         self.chk_log.setChecked(True)
         self.chk_log.toggled.connect(self._redraw)
-        bar.addWidget(self.chk_log)
+        display_bar.addWidget(self.chk_log)
         self.chk_show_roi = QCheckBox("Show ROI")
         self.chk_show_roi.setChecked(True)
         self.chk_show_roi.toggled.connect(self._draw_roi_overlay)
-        bar.addWidget(self.chk_show_roi)
-
-        self.chk_smooth_map = QCheckBox("Smooth")
-        self.chk_smooth_map.setChecked(False)
-        self.chk_smooth_map.setToolTip(
-            "Apply 2D Gaussian display smoothing on α_i vs α_f and Qx vs Qz maps "
-            "(display-only; cuts, cursor readout, and exports remain unsmoothed)."
-        )
-        self.chk_smooth_map.toggled.connect(self._on_smooth_changed)
-        self.spin_smooth_sigma = QDoubleSpinBox()
-        self.spin_smooth_sigma.setRange(0.5, 8.0)
-        self.spin_smooth_sigma.setDecimals(1)
-        self.spin_smooth_sigma.setSingleStep(0.5)
-        self.spin_smooth_sigma.setValue(1.5)
-        self.spin_smooth_sigma.setSuffix(" px")
-        self.spin_smooth_sigma.setFixedWidth(78)
-        self.spin_smooth_sigma.setKeyboardTracking(False)
-        self.spin_smooth_sigma.setEnabled(False)
-        self.spin_smooth_sigma.setToolTip("Gaussian smoothing radius σ in pixels (display-only).")
-        self.spin_smooth_sigma.valueChanged.connect(self._on_smooth_changed)
-        self._smooth_group = make_flow_group(self.chk_smooth_map, self.spin_smooth_sigma, spacing=4)
-        self._smooth_group.setVisible(self._alpha_mode())
-        bar.addWidget(self._smooth_group)
+        display_bar.addWidget(self.chk_show_roi)
 
         self.combo_cmap = configure_compact_combo(QComboBox(), min_chars=7)
         self.combo_cmap.addItems(["turbo", "viridis", "inferno", "plasma", "cividis", "gray", "magma"])
         fit_combo_popup(self.combo_cmap)
         self.combo_cmap.currentTextChanged.connect(self._on_cmap_changed)
-        bar.addWidget(make_flow_group(QLabel("Colormap:"), self.combo_cmap, spacing=6))
-        main.addWidget(bar)
+        self._cmap_group = make_flow_group(QLabel("Colormap:"), self.combo_cmap, spacing=6)
+        display_bar.addWidget(self._cmap_group)
+
+        self.chk_smooth_map = QCheckBox("Smooth")
+        self.chk_smooth_map.setChecked(False)
+        self.chk_smooth_map.setToolTip(
+            "Smoothly re-bin α_i vs α_f and Qx vs Qz onto a regular display grid (bilinear interpolation + "
+            "optional edge-preserving bilateral denoising in display space). Display-only; cuts, cursor readout, "
+            "and exported tables remain exact and unsmoothed."
+        )
+        self.chk_smooth_map.toggled.connect(self._on_smooth_changed)
+        self.spin_smooth_sigma = QDoubleSpinBox()
+        self.spin_smooth_sigma.setRange(0.0, 4.0)
+        self.spin_smooth_sigma.setDecimals(1)
+        self.spin_smooth_sigma.setSingleStep(0.5)
+        self.spin_smooth_sigma.setValue(1.0)
+        self.spin_smooth_sigma.setSuffix(" px")
+        self.spin_smooth_sigma.setFixedWidth(78)
+        self.spin_smooth_sigma.setKeyboardTracking(False)
+        self.spin_smooth_sigma.setEnabled(False)
+        self.spin_smooth_sigma.setToolTip(
+            "Edge-preserving bilateral smoothing radius σ (0.0 px = smooth bilinear re-binning only; "
+            "> 0 adds log-space edge-preserving denoising without blooming bright ridges)."
+        )
+        self.spin_smooth_sigma.valueChanged.connect(self._on_smooth_changed)
+        self._smooth_group = make_flow_group(self.chk_smooth_map, self.spin_smooth_sigma, spacing=4)
+        self._smooth_group.setVisible(self._alpha_mode())
+        display_bar.addWidget(self._smooth_group)
+        main.addWidget(display_bar)
 
         # Only problems and caveats are shown here (hidden otherwise); the settings
         # above already describe what the map shows.
@@ -1666,26 +1979,10 @@ class OffSpecularView(QWidget):
             unsmoothed_linear = norm.values
             self._cut_values = norm.values
 
-        # Optional 2D Gaussian display smoothing on α_i vs α_f and Qx vs Qz maps only (never alters cuts/exports)
-        render_linear = unsmoothed_linear
-        if self._alpha_mode() and self.chk_smooth_map.isChecked():
-            th_arr = self._variable("th")
-            row_order = None
-            if th_arr is not None and frames.size > 1 and int(frames.max()) < th_arr.size:
-                th_sel = th_arr[frames]
-                if np.all(np.isfinite(th_sel)):
-                    row_order = np.argsort(th_sel, kind="stable")
-            render_linear = _smooth_2d_display(
-                unsmoothed_linear,
-                self.spin_smooth_sigma.value(),
-                row_order=row_order,
-                preserve_nans=asym,
-            )
-
-        display = render_linear if asym else (log_display(render_linear) if self._log_active() else render_linear)
+        display = unsmoothed_linear if asym else (log_display(unsmoothed_linear) if self._log_active() else unsmoothed_linear)
         alpha_note = ""
         if self._alpha_mode():
-            alpha_note = self._draw_alpha(display)
+            alpha_note = self._draw_alpha(display, levels=(lo, hi), asym=asym)
             if alpha_note is None:
                 return
         elif self._theta_mode():
@@ -2433,10 +2730,13 @@ class OffSpecularView(QWidget):
         if self._log_active():
             header.append("Log colour scale is display-only; values are linear.")
         if self._alpha_mode() and self.chk_smooth_map.isChecked():
-            header.append(
-                f"Map smoothing (Gaussian sigma = {self.spin_smooth_sigma.value():g} px) "
-                "is display-only; exported values are unsmoothed."
+            sigma = self.spin_smooth_sigma.value()
+            desc = (
+                f"bilinear re-binning + edge-preserving bilateral (sigma = {sigma:g} px)"
+                if sigma > 0.0
+                else "bilinear re-binning (sigma = 0 px)"
             )
+            header.append(f"Smooth map display ({desc}) is display-only; exported values are unsmoothed.")
         if norm.warnings:
             header.append("Warnings: " + " ".join(norm.warnings))
         return header, columns, data
@@ -2556,6 +2856,10 @@ class OffSpecularView(QWidget):
 
     def _on_axes_changed(self) -> None:
         self._smooth_group.setVisible(self._alpha_mode())
+        if self._display_bar.layout() is not None:
+            self._display_bar.layout().invalidate()
+            self._display_bar.layout().activate()
+        self._display_bar.updateGeometry()
         self._redraw()
         if self._map_ready():
             self.plot.autoRange()
@@ -2833,9 +3137,15 @@ class OffSpecularView(QWidget):
         skipped = frames.size - rows.size
         return f"X pixel vs θ: {skipped} unwritten/invalid frame(s) omitted." if skipped else ""
 
-    def _draw_alpha(self, display: np.ndarray) -> str | None:
-        """Draw each frame as its own α_i strip of exact pixel cells. Returns a notice,
-        or None (after showing why) when the α view cannot be drawn."""
+    def _draw_alpha(
+        self,
+        display: np.ndarray,
+        *,
+        levels: tuple[float, float] = (0.0, 1.0),
+        asym: bool = False,
+    ) -> str | None:
+        """Draw each frame as its own α_i strip of exact pixel cells (or smoothly re-binned
+        regular display grid when Smooth is enabled). Returns a notice, or None when unavailable."""
         cal = getattr(self.scan_data, "angle_calibration", None)
         name = "Qx vs Qz" if self._q_mode() else "α_i vs α_f"
         if cal is None:
@@ -2892,10 +3202,73 @@ class OffSpecularView(QWidget):
             af_hi=float(base.max() + float(edges.max())),
         )
         if self._q_mode():
-            # Exact cells: every pixel's four (α_i, α_f) corners mapped to (Qx, Qz). One mesh;
-            # the NaN rows between strips keep points separate (no interpolation).
             lam = self.spin_wavelength.value()
             geom["wavelength"] = lam
+            if same_angles and prev_geom.get("wavelength") == lam and "extent" in prev_geom:
+                q_extent = prev_geom["extent"]
+                X_q = Y_q = None
+            else:
+                n = rows.size
+                ai_corners = np.broadcast_to(strips.reshape(-1, 1), (2 * n, edges.size))
+                af_corners = np.repeat(base, 2)[:, None] + edges[None, :]
+                X_q, Y_q = self._to_view(ai_corners, af_corners)
+                q_extent = (float(np.nanmin(X_q)), float(np.nanmax(X_q)), float(np.nanmin(Y_q)), float(np.nanmax(Y_q)))
+            geom["extent"] = q_extent
+
+        # Display-only smooth re-binning path (bilinear interpolation + optional edge-preserving
+        # bilateral denoising in display space -> eliminates rectangular boxing without log blooming).
+        if self.chk_smooth_map.isChecked():
+            order = np.argsort(alpha_i, kind="stable")
+            ai_s = alpha_i[order]
+            if ai_s.size > 1:
+                keep_u = np.concatenate((ai_s[:-1] < ai_s[1:], [True]))
+            else:
+                keep_u = np.ones(ai_s.size, dtype=bool)
+            idx_u = order[keep_u]
+            ai_u = alpha_i[idx_u]
+            base_u = base[idx_u]
+            strips_u = alpha_i_strip_edges(ai_u)
+            src = display[rows[idx_u]]
+            sigma = self.spin_smooth_sigma.value()
+            if sigma > 0.0:
+                sigma_r = 0.45 if self._log_active() else max(1e-6, 0.20 * max(1e-6, levels[1] - levels[0]))
+                src = _bilateral_2d_display(src, sigma, sigma_r, fill_isolated_nans=not asym)
+            view_extent = (
+                geom["extent"]
+                if self._q_mode()
+                else (float(strips[:, 0].min()), float(strips[:, 1].max()), geom["af_lo"], geom["af_hi"])
+            )
+            if len(self._alpha_items) == 1 and isinstance(self._alpha_items[0], SmoothResampledMapItem):
+                smooth_item = self._alpha_items[0]
+                self._colorbar_items_rebuilt = False
+            else:
+                self._clear_alpha_items()
+                smooth_item = SmoothResampledMapItem(colorMap=self._current_colormap())
+                self.plot.addItem(smooth_item)
+                self._alpha_items = [smooth_item]
+                self.colorbar.setImageItem(self._alpha_items)
+                self._colorbar_on_strips = True
+                self._colorbar_items_rebuilt = True
+            smooth_item.set_source(
+                src,
+                ai_u,
+                base_u,
+                strips_u,
+                self._map.nx,
+                cal,
+                view_extent,
+                q_mode=self._q_mode(),
+                wavelength=geom.get("wavelength") if self._q_mode() else None,
+            )
+            self._th_geom = None
+            self._alpha_geom = geom
+            skipped = frames.size - rows.size
+            return f"{name}: {skipped} unwritten/invalid frame(s) omitted." if skipped else ""
+
+        if self._q_mode():
+            # Exact cells: every pixel's four (α_i, α_f) corners mapped to (Qx, Qz). One mesh;
+            # the NaN rows between strips keep points separate (no interpolation).
+            lam = geom["wavelength"]
             n = rows.size
             Z = np.full((2 * n - 1, self._map.nx), np.nan)
             Z[0::2] = display[rows]
@@ -2914,20 +3287,19 @@ class OffSpecularView(QWidget):
             if same_q_geom:
                 mesh = self._alpha_items[0]
                 mesh.setData(None, None, Z, autoLevels=False)
-                geom["extent"] = prev_geom["extent"]
                 self._colorbar_items_rebuilt = False
             else:
-                ai_corners = np.broadcast_to(strips.reshape(-1, 1), (2 * n, edges.size))  # strip lo/hi edges
-                af_corners = np.repeat(base, 2)[:, None] + edges[None, :]  # pixel edges at each strip's 2θ − θ
-                X, Y = self._to_view(ai_corners, af_corners)
-                geom["extent"] = (float(np.nanmin(X)), float(np.nanmax(X)), float(np.nanmin(Y)), float(np.nanmax(Y)))
+                if X_q is None or Y_q is None:
+                    ai_corners = np.broadcast_to(strips.reshape(-1, 1), (2 * n, edges.size))
+                    af_corners = np.repeat(base, 2)[:, None] + edges[None, :]
+                    X_q, Y_q = self._to_view(ai_corners, af_corners)
                 if can_reuse_mesh:
                     mesh = self._alpha_items[0]
-                    mesh.setData(X, Y, Z, autoLevels=False)
+                    mesh.setData(X_q, Y_q, Z, autoLevels=False)
                     self._colorbar_items_rebuilt = False
                 else:
                     self._clear_alpha_items()
-                    mesh = CachedMeshItem(X, Y, Z, colorMap=self._current_colormap(), enableAutoLevels=False)
+                    mesh = CachedMeshItem(X_q, Y_q, Z, colorMap=self._current_colormap(), enableAutoLevels=False)
                     self.plot.addItem(mesh)
                     self._alpha_items = [mesh]
                     self.colorbar.setImageItem(self._alpha_items)
