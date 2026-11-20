@@ -183,7 +183,7 @@ def test_manual_override_is_per_scan_and_refit_restores(qtbot, window):
     window.load_file(DATA / "005594.nxs")  # becomes active
     _ready(qtbot, view)
     second = window.loaded_scans[str((DATA / "005594.nxs").resolve())]
-    assert second.angle_calibration.deg_per_pixel_source == "direct-beam fit"  # not inherited
+    assert second.angle_calibration.deg_per_pixel_source == "transmitted-beam fit"  # not inherited
     assert second.angle_calibration.deg_per_pixel == pytest.approx(0.00819, abs=2e-5)
     view.combo_y_axis.setCurrentIndex(view.combo_y_axis.findData("alpha"))
     view.combo_spin.setCurrentIndex(view.combo_spin.findData("down"))  # 005594's unwritten frames read F=0
@@ -193,7 +193,7 @@ def test_manual_override_is_per_scan_and_refit_restores(qtbot, window):
     _ready(qtbot, view)
     assert view.spin_dpp.value() == pytest.approx(0.009)
     view.btn_fit_db.click()
-    assert first.angle_calibration.deg_per_pixel_source == "direct-beam fit"
+    assert first.angle_calibration.deg_per_pixel_source == "transmitted-beam fit"
 
 
 def test_q_conversion_and_inverse():
@@ -767,7 +767,7 @@ def test_mode_switching_preserves_fit_and_describe():
     assert cal_back.fit is cal_db.fit
     assert cal_back.fit_y_rows == (12, 900)
     assert cal_back.deg_per_pixel == pytest.approx(cal_db.fit.deg_per_pixel, rel=1e-14)
-    assert cal_back.deg_per_pixel_source == "direct-beam fit"
+    assert cal_back.deg_per_pixel_source == "transmitted-beam fit"
     assert cal_back.sample_detector_distance_mm == 2100.0
     assert cal_back.detector_width_mm == 280.0
     assert cal_back.x0 == 405.0 and cal_back.x0_source == "manual"
@@ -794,11 +794,11 @@ def test_mode_switching_preserves_fit_and_describe():
     pitch = pixel_pitch_mm(1024)
     desc_db = cal_db.describe(pitch)
     assert "Implied sample–detector distance" in desc_db
-    assert "Direct-beam fit:" in desc_db
+    assert "Transmitted-beam fit:" in desc_db
     desc_ps = cal_ps2.describe(pixel_pitch_mm(1024, 280.0))
     assert "pySAred geometry: L = 2100 mm, detector width = 280 mm" in desc_ps
     assert "Effective scale" in desc_ps
-    assert "Direct-beam fit:" in desc_ps
+    assert "Transmitted-beam fit:" in desc_ps
     desc_ps_no_pitch = cal_no_fit.describe()
     assert "pySAred geometry: L = 2400 mm, detector width = 300 mm" in desc_ps_no_pitch
     assert "Effective scale" in desc_ps_no_pitch

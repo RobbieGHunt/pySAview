@@ -45,7 +45,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self, parent: QWidget | None = None, *, settings=None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("SuperADAM NeXus Explorer")
+        self.setWindowTitle("pySAview")
         self.resize(1300, 860)
         self.setAcceptDrops(True)
 
@@ -229,7 +229,7 @@ class MainWindow(QMainWindow):
 
         # Help Menu
         menu_help = menubar.addMenu("&Help")
-        act_about = QAction("&About SuperADAM NeXus Explorer", self)
+        act_about = QAction("&About pySAview", self)
         act_about.setIcon(icons.get_icon("info", is_dark=self.is_dark_mode))
         act_about.triggered.connect(self._show_about)
         menu_help.addAction(act_about)
@@ -667,7 +667,7 @@ class MainWindow(QMainWindow):
         run_str = f"#{scan_data.metadata.run_number}" if scan_data.metadata.run_number else ""
         n_total = len(self.loaded_scans)
         self.setWindowTitle(
-            f"SuperADAM NeXus Explorer — {target.name} ({run_str}) [{n_total} file{'s' if n_total != 1 else ''} loaded]"
+            f"pySAview — {target.name} ({run_str}) [{n_total} file{'s' if n_total != 1 else ''} loaded]"
         )
         self.status_bar.showMessage(
             f"Active: {target.name} ({size_mb:.2f} MB)  |  Run: {run_str}  |  Steps: {n_steps}  |  Total Loaded: {n_total}"
@@ -706,7 +706,7 @@ class MainWindow(QMainWindow):
             self.view_hierarchy.tree.clear()
             self.view_offspec.set_data(None)
             self.view_charts.set_active_scan(None)
-            self.setWindowTitle("SuperADAM NeXus Explorer")
+            self.setWindowTitle("pySAview")
             self.status_bar.showMessage("Ready. Open one or more NeXus (.nxs) files to begin.")
 
     def _update_file_combo(self) -> None:
@@ -797,8 +797,8 @@ class MainWindow(QMainWindow):
     def _show_about(self) -> None:
         QMessageBox.about(
             self,
-            "About SuperADAM NeXus Explorer",
-            "<h3>SuperADAM NeXus Explorer</h3>"
+            "About pySAview",
+            "<h3>pySAview</h3>"
             "<p>A specialized GUI explorer for ILL SuperADAM polarized neutron reflectometry NeXus (.nxs) scan files.</p>"
             "<p><b>Features:</b></p>"
             "<ul>"

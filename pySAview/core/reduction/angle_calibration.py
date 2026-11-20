@@ -167,7 +167,7 @@ class AngleCalibration:
     x0: float
     sign: int  # +1: α_f increases with displayed X; −1: decreases
     fit: DirectBeamFit | None = None
-    deg_per_pixel_source: str = "direct-beam fit"
+    deg_per_pixel_source: str = "transmitted-beam fit"
     x0_source: str = "specular peak"
     fit_y_rows: tuple[int, int] | None = None  # detector Y rows integrated for the fit
     mode: CalibrationMode = "direct_beam"
@@ -322,7 +322,7 @@ class AngleCalibration:
         elif self.mode == "pysared":
             if self.fit is not None:
                 changes["deg_per_pixel"] = float(self.fit.deg_per_pixel)
-                changes["deg_per_pixel_source"] = "direct-beam fit"
+                changes["deg_per_pixel_source"] = "transmitted-beam fit"
             elif self.deg_per_pixel_source == "pySAred geometry":
                 changes["deg_per_pixel_source"] = "manual"
         if distance_mm is not None:
@@ -392,7 +392,7 @@ class AngleCalibration:
                 else ""
             )
             text += (
-                f" | Direct-beam fit: {abs(self.fit.slope_px_per_deg):.2f} px/° over "
+                f" | Transmitted-beam fit: {abs(self.fit.slope_px_per_deg):.2f} px/° over "
                 f"{self.fit.frames.size} frames{tth_span}, rms {self.fit.rms_px:.2f} px"
             )
         if self.fit_y_rows is not None:

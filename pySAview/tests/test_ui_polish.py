@@ -355,3 +355,39 @@ def test_q_and_alpha_map_smoothing_is_display_only_and_preserves_levels(qtbot):
         assert isinstance(offspec._alpha_items[0], CachedMeshItem)
     finally:
         win.view_offspec.shutdown()
+
+
+# ----------------------------------------------------------------- 8. Window title, Transmitted-beam label & pySAred mode switch crash guard
+def test_window_title_transmitted_beam_label_and_pysared_smooth_switch(qtbot):
+    win = MainWindow()
+    qtbot.addWidget(win)
+    try:
+        assert win.windowTitle() == "pySAview"
+        offspec = win.view_offspec
+        assert offspec.btn_mode_direct_beam.text() == "Transmitted-beam fit"
+        assert offspec.btn_fit_db.text() == "Fit Transmitted Beam"
+
+        win.load_file(EXAMPLE_5572)
+        assert win.windowTitle().startswith("pySAview — ")
+
+        win.tabs.setCurrentWidget(offspec)
+        win.show()
+        _wait_offspec(qtbot, offspec)
+
+        # Switching Transmitted-beam fit <-> pySAred geometry in Qx vs Qz and alpha views
+        # with Smooth enabled must render cleanly without NaN-cast IndexError crashes
+        for axes in ("q", "alpha", "th"):
+            offspec.combo_y_axis.setCurrentIndex(offspec.combo_y_axis.findData(axes))
+            if axes in ("q", "alpha"):
+                offspec.chk_smooth_map.setChecked(True)
+            offspec.btn_mode_pysared.click()
+            QApplication.processEvents()
+            offspec.grab()  # forces full SmoothResampledMapItem.paint() + _ensure_overview()
+            assert win.loaded_scans[str(EXAMPLE_5572)].angle_calibration.mode == "pysared"
+
+            offspec.btn_mode_direct_beam.click()
+            QApplication.processEvents()
+            offspec.grab()
+            assert win.loaded_scans[str(EXAMPLE_5572)].angle_calibration.mode == "direct_beam"
+    finally:
+        win.view_offspec.shutdown()

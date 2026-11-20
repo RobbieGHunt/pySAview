@@ -33,10 +33,17 @@ def exception_hook(exc_type, exc_value, exc_traceback) -> None:
 
 def create_app() -> QApplication:
     """Create and configure QApplication."""
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("ILLSuperADAM.pySAview")
+        except Exception:
+            pass
     app = QApplication.instance()
     if app is None:
         app = QApplication(sys.argv)
-    app.setApplicationName("SuperADAM NeXus Explorer")
+    app.setApplicationName("pySAview")
+    app.setApplicationDisplayName("pySAview")
     app.setOrganizationName("ILL SuperADAM")
     sys.excepthook = exception_hook
     return app

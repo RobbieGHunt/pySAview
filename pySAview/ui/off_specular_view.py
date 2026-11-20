@@ -217,7 +217,7 @@ def _sample_bilinear_ai_af(
     def _sample_row(k_idx: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         xf = pixel_for_alpha_f_offset(af_query - base_sorted[k_idx], nx, cal) - 0.5
         in_x = np.isfinite(xf) & (xf >= -0.5) & (xf <= nx - 0.5)
-        xf_c = np.clip(xf, 0.0, float(nx - 1))
+        xf_c = np.clip(np.where(in_x, xf, 0.0), 0.0, float(nx - 1))
         x0 = np.floor(xf_c).astype(np.int32)
         x1 = np.minimum(x0 + 1, nx - 1)
         tx = xf_c - x0
@@ -1295,13 +1295,13 @@ class OffSpecularView(QWidget):
         outer = QVBoxLayout(group)
         outer.setSpacing(6)
 
-        # Mode toggle at the top of the calibration card: Direct-beam fit vs pySAred geometry.
+        # Mode toggle at the top of the calibration card: Transmitted-beam fit vs pySAred geometry.
         mode_row = FlowLayout(margin=0, h_spacing=6, v_spacing=4)
-        self.btn_mode_direct_beam = QPushButton("Direct-beam fit")
+        self.btn_mode_direct_beam = QPushButton("Transmitted-beam fit")
         self.btn_mode_direct_beam.setCheckable(True)
         self.btn_mode_direct_beam.setChecked(True)
         self.btn_mode_direct_beam.setToolTip(
-            "Linear pixel-to-angle calibration fitted from the transmitted direct-beam streak (°/px)"
+            "Linear pixel-to-angle calibration fitted from the transmitted-beam streak (°/px)"
         )
         self.btn_mode_pysared = QPushButton("pySAred geometry")
         self.btn_mode_pysared.setCheckable(True)
@@ -1337,10 +1337,10 @@ class OffSpecularView(QWidget):
         self.spin_dpp.setSuffix(" °/px")
         self.spin_dpp.setSpecialValueText("not set")
         self.spin_dpp.setKeyboardTracking(False)
-        self.spin_dpp.setToolTip("Exit-angle step per detector X pixel (from the direct-beam fit; editable)")
+        self.spin_dpp.setToolTip("Exit-angle step per detector X pixel (from the transmitted-beam fit; editable)")
         self.spin_dpp.valueChanged.connect(lambda v: self._on_calibration_edited(deg_per_pixel=v))
-        self.btn_fit_db = QPushButton("Fit Direct Beam")
-        self.btn_fit_db.setToolTip("Refit °/pixel from the direct-beam streak and x₀ from the specular peak "
+        self.btn_fit_db = QPushButton("Fit Transmitted Beam")
+        self.btn_fit_db.setToolTip("Refit °/pixel from the transmitted-beam streak and x₀ from the specular peak "
                                    "(discards manual values for this scan)")
         self.btn_fit_db.clicked.connect(self._refit_calibration)
         self.lbl_distance = QLabel("—")
@@ -1440,15 +1440,15 @@ class OffSpecularView(QWidget):
         self.chk_af_increases.setToolTip("Direction of the exit angle along displayed X")
         self.chk_af_increases.toggled.connect(lambda on: self._on_calibration_edited(sign=1 if on else -1))
         self.chk_show_db = QCheckBox("Show fit / reference lines")
-        self.chk_show_db.setToolTip("Pixel axes: fitted direct-beam line. α axes: α_f = α_i (specular), "
-                                    "α_f = −α_i (direct beam) and the ROI; untick for a clean α map")
+        self.chk_show_db.setToolTip("Pixel axes: fitted transmitted-beam line. α axes: α_f = α_i (specular), "
+                                    "α_f = −α_i (transmitted beam) and the ROI; untick for a clean α map")
         self.chk_show_db.setChecked(True)
         self.chk_show_db.toggled.connect(self._draw_roi_overlay)
         checks_flow.addWidget(self.chk_af_increases)
         checks_flow.addWidget(self.chk_show_db)
         outer.addLayout(checks_flow)
 
-        self._set_cal_status("Calibrated automatically from the direct beam when the map is computed.")
+        self._set_cal_status("Calibrated automatically from the transmitted beam when the map is computed.")
         return group
 
     def _build_curvature_panel(self) -> QGroupBox:
@@ -2953,7 +2953,7 @@ class OffSpecularView(QWidget):
                     self.spin_x0.setValue(float(np.mean(self._roi_x_ranges()[0])))
             self.chk_af_increases.setChecked(False)
             self._set_cal_status(self._cal_message or
-                                 "Calibrated automatically from the direct beam when the map is computed.")
+                                 "Calibrated automatically from the transmitted beam when the map is computed.")
         for widget in widgets:
             widget.blockSignals(False)
 

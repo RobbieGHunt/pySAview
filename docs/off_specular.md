@@ -19,7 +19,7 @@ zero and invalid pixels blank; it never substitutes a value.
 Two per-scan calibration modes are available in `AngleCalibration` and in the
 Off-Specular calibration panel:
 
-1. **Direct-beam fit (`mode="direct_beam"`, default)** — linear pixel-to-angle
+1. **Transmitted-beam fit (`mode="direct_beam"`, default)** — linear pixel-to-angle
    mapping calibrated directly from the transmitted beam streak:
 
    ```
@@ -135,7 +135,7 @@ applies pure bilinear re-binning with no denoising). Colour-bar levels remain an
 the unsmoothed baseline, and all numerical data (`_norm`, cursor readouts, 1D cuts, and
 exported tables) remain strictly exact and unsmoothed.
 
-**Sample-to-detector distance.** In **Direct-beam fit** mode no distance is
+**Sample-to-detector distance.** In **Transmitted-beam fit** mode no distance is
 needed or entered: Δ is measured directly in degrees per pixel, and α_f, Qx and
 Qz follow from Δ, x₀, θ, 2θ and λ. The panel still shows the distance that Δ
 implies, as a check assuming nominal pixel pitch `p = 300 mm / nx`:
@@ -146,8 +146,8 @@ p = 300 mm / 1024 px = 0.2930 mm      L = p / tan(Δ)
 
 (the SuperADAM detector is 300 mm × 300 mm; `DETECTOR_WIDTH_MM` in
 `core/reduction/angle_calibration.py`). For the example scans L ≈ 2051 mm
-(5572: 2050.8 mm, 5594: 2050.6 mm); an atan fit to the direct beam gives
-2047 mm. In **Direct-beam fit** mode this implied distance follows any manual
+(5572: 2050.8 mm, 5594: 2050.6 mm); an atan fit to the transmitted beam gives
+2047 mm. In **Transmitted-beam fit** mode this implied distance follows any manual
 change of Δ and is written to the export header, but is never used in an angle
 or Q conversion. In **pySAred geometry** mode, by contrast, the entered *L*
 (`sample_detector_distance_mm`) and detector width *W* (`detector_width_mm`)
@@ -194,7 +194,7 @@ The calibration belongs to each scan and is kept in memory only. It is fitted
 automatically the first time a scan's map is computed, from that map's Y
 window (full detector height by default; the window used is recorded and
 shown), and is never inherited from another scan. Editing Δ, x₀ or the direction changes only that quantity
-for that scan and marks it *manual*; **Fit Direct Beam** discards the manual
+for that scan and marks it *manual*; **Fit Transmitted Beam** discards the manual
 values and refits. Hovering over the calibration panel shows the fit details.
 Measurement files are never modified.
 
