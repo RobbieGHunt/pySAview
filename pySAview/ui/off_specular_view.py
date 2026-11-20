@@ -351,7 +351,7 @@ class CachedMeshItem(pg.PColorMeshItem):
         self._overview = None  # (QImage, item-coordinate rect)
         self._detail = None  # (QImage, inverse device transform, device transform, device offset)
         self._last_view = None  # (device transform, viewport size, device pixel ratio)
-        self._detail_timer = QTimer()
+        self._detail_timer = QTimer(self)
         self._detail_timer.setSingleShot(True)
         self._detail_timer.setInterval(self.DETAIL_DELAY_MS)
         self._detail_timer.timeout.connect(self._render_detail)
@@ -714,7 +714,7 @@ class SmoothResampledMapItem(pg.GraphicsObject):
         self._overview = None  # (vals, bins, QImage, QRectF)
         self._detail = None  # (vals, bins, QImage, QRectF, scale_xy)
         self._last_view = None  # (QTransform, QSize, dpr)
-        self._detail_timer = QTimer()
+        self._detail_timer = QTimer(self)
         self._detail_timer.setSingleShot(True)
         self._detail_timer.setInterval(self.DETAIL_DELAY_MS)
         self._detail_timer.timeout.connect(self._render_detail)
@@ -1658,6 +1658,11 @@ class OffSpecularView(QWidget):
 
     def shutdown(self) -> None:
         """Cancel and wait for background integration (window closing)."""
+        self._row_timer.stop()
+        for item in self._alpha_items:
+            timer = getattr(item, "_detail_timer", None)
+            if timer is not None:
+                timer.stop()
         jobs = list(self._jobs.values())
         self._cancel_jobs()
         for job in jobs:
@@ -3050,6 +3055,10 @@ class OffSpecularView(QWidget):
         self._redraw()
 
     def _clear_alpha_items(self) -> None:
+        for item in self._alpha_items:
+            timer = getattr(item, "_detail_timer", None)
+            if timer is not None:
+                timer.stop()
         if len(self._alpha_items) > 1:
             self.plot.setUpdatesEnabled(False)
             try:

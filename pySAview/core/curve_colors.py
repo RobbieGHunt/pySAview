@@ -1,7 +1,6 @@
-"""Matplotlib palette sampling for SuperADAM d/u scan families."""
+"""Matplotlib-compatible palette sampling for SuperADAM d/u scan families."""
 
-from matplotlib import colormaps
-from matplotlib.colors import to_hex
+from pySAview.core.colormaps import colormaps, to_hex
 
 DATASET_SYMBOLS = ("o", "s", "t", "d", "+", "x", "star", "p", "h", "t1", "t2", "t3")
 

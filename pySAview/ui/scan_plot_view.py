@@ -7,7 +7,7 @@ from typing import Any
 
 import numpy as np
 import pyqtgraph as pg
-from matplotlib import colormaps
+from pySAview.core.colormaps import colormaps
 from PyQt6.QtGui import QFont
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (

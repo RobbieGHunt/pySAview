@@ -1,0 +1,209 @@
+name: Build lean PyInstaller packages
+
+on:
+  workflow_dispatch:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build (${{ matrix.label }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: windows-x64
+            os: windows-latest
+            artifact_name: pySAview-windows-x64
+            archive_name: pySAview-windows-x64.zip
+            bundle_dir: dist/pySAview
+            binary_path: dist/pySAview/pySAview.exe
+          - label: macos-arm64
+            os: macos-latest
+            artifact_name: pySAview-macos-arm64
+            archive_name: pySAview-macos-arm64.dmg
+            bundle_dir: dist/pySAview.app
+            binary_path: dist/pySAview.app/Contents/MacOS/pySAview
+          - label: linux-x64
+            os: ubuntu-22.04
+            artifact_name: pySAview-linux-x64
+            archive_name: pySAview-linux-x64.tar.xz
+            bundle_dir: dist/pySAview
+            binary_path: dist/pySAview/pySAview
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install Linux Qt6 runtime libraries for smoke test
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libegl1 libgl1 libxkbcommon0 libdbus-1-3 libxcb-cursor0 libfontconfig1
+
+      - name: Install runtime-only dependencies and PyInstaller
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install . "pyinstaller>=6.10"
+          python -c "import importlib.util; assert importlib.util.find_spec('matplotlib') is None, 'matplotlib must not be installed in runtime packaging env'"
+
+      - name: Build lean onedir bundle with PyInstaller
+        id: build
+        shell: python
+        run: |
+          import os, subprocess, sys, time
+          t0 = time.perf_counter()
+          subprocess.run(
+              [sys.executable, "-m", "PyInstaller", "--clean", "--noconfirm", "pySAview/packaging/pySAview.spec"],
+              check=True,
+          )
+          elapsed = round(time.perf_counter() - t0, 2)
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write(f"build_time_s={elapsed}\n")
+          print(f"PyInstaller build completed in {elapsed} s")
+
+      - name: Run frozen binary functional smoke test
+        id: smoke
+        shell: python
+        env:
+          QT_QPA_PLATFORM: offscreen
+          BINARY_PATH: ${{ matrix.binary_path }}
+          BUNDLE_DIR: ${{ matrix.bundle_dir }}
+        run: |
+          import json, os, subprocess, tempfile, time
+          from pathlib import Path
+
+          binary = Path(os.environ["BINARY_PATH"]).resolve()
+          assert binary.is_file(), f"Built binary not found: {binary}"
+
+          with tempfile.TemporaryDirectory(prefix="pysaview smoke ") as tmpdir:
+              tmp = Path(tmpdir)
+              report = tmp / "smoke.json"
+              env = {
+                  **os.environ,
+                  "QT_QPA_PLATFORM": "offscreen",
+                  "XDG_CACHE_HOME": str(tmp / "cache"),
+              }
+              t0 = time.perf_counter()
+              proc = subprocess.run(
+                  [str(binary), "--smoke-test", str(report)],
+                  env=env,
+                  timeout=120,
+                  capture_output=True,
+                  text=True,
+              )
+              wall_s = round(time.perf_counter() - t0, 3)
+              if proc.stdout:
+                  print("STDOUT:", proc.stdout)
+              if proc.stderr:
+                  print("STDERR:", proc.stderr)
+              assert report.is_file(), f"Smoke report missing (rc={proc.returncode})"
+              data = json.loads(report.read_text(encoding="utf-8"))
+              print(json.dumps(data, indent=2))
+              assert proc.returncode == 0 and data.get("ok") is True, f"Smoke test failed: {data}"
+              assert data.get("frozen") is True
+              assert data.get("svg_ok") is True
+              assert data.get("example_data_ok") is True
+              assert data.get("pre_import_clean") is True
+
+          bundle = Path(os.environ["BUNDLE_DIR"])
+          files = [p for p in bundle.rglob("*") if p.is_file() and not p.is_symlink()]
+          unpacked_mb = round(sum(p.stat().st_size for p in files) / (1024 * 1024), 2)
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write(f"wall_s={wall_s}\n")
+              fh.write(f"launch_to_tick_s={data['launch_to_tick_s']}\n")
+              fh.write(f"qthread_h5py_load_s={data['qthread_h5py_load_s']}\n")
+              fh.write(f"scipy_special_norm_s={data['scipy_special_norm_s']}\n")
+              fh.write(f"unpacked_mb={unpacked_mb}\n")
+              fh.write(f"file_count={len(files)}\n")
+
+      - name: Package Windows archive (.zip)
+        if: runner.os == 'Windows'
+        shell: python
+        env:
+          ARCHIVE_NAME: ${{ matrix.archive_name }}
+        run: |
+          import os, zipfile
+          from pathlib import Path
+          root = Path("dist/pySAview")
+          archive = Path(os.environ["ARCHIVE_NAME"])
+          with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+              for path in sorted(root.rglob("*")):
+                  if path.is_file():
+                      zf.write(path, Path("pySAview") / path.relative_to(root))
+
+      - name: Package macOS disk image (.dmg)
+        if: runner.os == 'macOS'
+        env:
+          ARCHIVE_NAME: ${{ matrix.archive_name }}
+        run: |
+          rm -rf dmg_stage "$ARCHIVE_NAME"
+          mkdir -p dmg_stage
+          cp -R dist/pySAview.app dmg_stage/
+          ln -s /Applications dmg_stage/Applications
+          for attempt in 1 2 3; do
+            if hdiutil create -volname "pySAview" -srcfolder dmg_stage -ov -format UDZO "$ARCHIVE_NAME"; then
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              exit 1
+            fi
+            sleep 5
+          done
+
+      - name: Package Linux archive (.tar.xz)
+        if: runner.os == 'Linux'
+        env:
+          ARCHIVE_NAME: ${{ matrix.archive_name }}
+          XZ_OPT: "-T0"
+        run: |
+          tar -cJf "$ARCHIVE_NAME" -C dist pySAview
+
+      - name: Write build metrics to job summary
+        shell: python
+        env:
+          LABEL: ${{ matrix.label }}
+          ARCHIVE_NAME: ${{ matrix.archive_name }}
+          BUILD_TIME_S: ${{ steps.build.outputs.build_time_s }}
+          UNPACKED_MB: ${{ steps.smoke.outputs.unpacked_mb }}
+          FILE_COUNT: ${{ steps.smoke.outputs.file_count }}
+          WALL_S: ${{ steps.smoke.outputs.wall_s }}
+          LAUNCH_TICK_S: ${{ steps.smoke.outputs.launch_to_tick_s }}
+          LOAD_S: ${{ steps.smoke.outputs.qthread_h5py_load_s }}
+          NORM_S: ${{ steps.smoke.outputs.scipy_special_norm_s }}
+        run: |
+          import os
+          from pathlib import Path
+          archive_mb = round(Path(os.environ["ARCHIVE_NAME"]).stat().st_size / (1024 * 1024), 2)
+          summary = (
+              f"### {os.environ['LABEL']} — `{os.environ['ARCHIVE_NAME']}`\n\n"
+              "| Metric | Value |\n"
+              "| --- | ---: |\n"
+              f"| PyInstaller build time | {os.environ['BUILD_TIME_S']} s |\n"
+              f"| Unpacked bundle size | {os.environ['UNPACKED_MB']} MB ({os.environ['FILE_COUNT']} files) |\n"
+              f"| Archive size | {archive_mb} MB |\n"
+              f"| Smoke test wall time (full) | {os.environ['WALL_S']} s |\n"
+              f"| Launch to first UI tick | {os.environ['LAUNCH_TICK_S']} s |\n"
+              f"| QThread HDF5 example load | {os.environ['LOAD_S']} s |\n"
+              f"| `scipy.special` exact intervals | {os.environ['NORM_S']} s |\n"
+          )
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as fh:
+              fh.write(summary)
+          print(summary)
+
+      - name: Upload packaged artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.archive_name }}
+          retention-days: 14
+          if-no-files-found: error

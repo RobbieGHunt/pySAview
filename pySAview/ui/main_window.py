@@ -27,7 +27,7 @@ from PyQt6.QtWidgets import (
 
 from pySAview.core.nexus_reader import NexusReader
 from pySAview.core.models import ScanData, ScanMetadata
-from pySAview.ui.file_loading import FileLoadThread, warm_scipy_stats_async
+from pySAview.ui.file_loading import FileLoadThread, warm_scipy_special_async
 from pySAview.ui import icons
 from pySAview.ui.preferences import restore_preferences, save_preferences
 from pySAview.ui.detector_view import DetectorView
@@ -328,7 +328,8 @@ class MainWindow(QMainWindow):
         app = QApplication.instance()
         if app is not None:
             theme_qss = DARK_THEME if self.is_dark_mode else LIGHT_THEME
-            app.setStyleSheet(theme_qss)
+            if app.styleSheet() != theme_qss:
+                app.setStyleSheet(theme_qss)
 
         # Tab vector icons
         is_d = self.is_dark_mode
@@ -367,10 +368,10 @@ class MainWindow(QMainWindow):
 
     def _warm_stats_if_visible(self) -> None:
         if not self._closing and self.isVisible():
-            warm_scipy_stats_async()
+            warm_scipy_special_async()
 
     def _on_action_open(self) -> None:
-        warm_scipy_stats_async()
+        warm_scipy_special_async()
         start_dir = self.last_load_directory if Path(self.last_load_directory).is_dir() else str(Path.home())
         file_paths, _ = QFileDialog.getOpenFileNames(
             self,
@@ -383,7 +384,7 @@ class MainWindow(QMainWindow):
             self.start_load_files([Path(p) for p in file_paths], clear_existing=True)
 
     def _on_action_add(self) -> None:
-        warm_scipy_stats_async()
+        warm_scipy_special_async()
         start_dir = self.last_load_directory if Path(self.last_load_directory).is_dir() else str(Path.home())
         file_paths, _ = QFileDialog.getOpenFileNames(
             self,
@@ -397,8 +398,9 @@ class MainWindow(QMainWindow):
 
     def _on_action_open_example(self) -> None:
         # Locate example_data/005572.nxs and 005594.nxs
-        base_dir = Path(__file__).resolve().parent.parent
-        example_dir = base_dir / "example_data"
+        from pySAview.core.paths import example_data_dir
+
+        example_dir = example_data_dir()
         if not example_dir.exists():
             example_dir = Path("pySAview/example_data")
 

@@ -12,8 +12,8 @@ from math import erf, sqrt
 
 import numpy as np
 
-# scipy.stats is imported inside the exact-interval functions: importing it
-# costs ~1.3 s, which would otherwise be paid on every application launch.
+# scipy.special is imported inside the exact-interval functions so SciPy stays
+# off the launch path and unused SciPy subpackages can be excluded from bundles.
 
 NORMALIZATION_UNITS = {
     "raw": "counts",
@@ -82,13 +82,13 @@ def poisson_interval(counts, confidence=CONFIDENCE):
         raise ValueError("Confidence must be between zero and one.")
     if np.any(~np.isfinite(n) | (n < 0) | (n != np.rint(n))):
         raise ValueError("Poisson intervals require finite, nonnegative integer counts.")
-    from scipy.stats import chi2
+    from scipy.special import gammainccinv, gammaincinv
 
     alpha = 1 - confidence
     lower = np.zeros_like(n)
     positive = n > 0
-    lower[positive] = chi2.ppf(alpha / 2, 2 * n[positive]) / 2
-    upper = chi2.isf(alpha / 2, 2 * (n + 1)) / 2
+    lower[positive] = gammaincinv(n[positive], alpha / 2)
+    upper = gammainccinv(n + 1, alpha / 2)
     return lower, upper
 
 
@@ -105,16 +105,16 @@ def poisson_ratio_interval(counts, monitor, confidence=CONFIDENCE):
     if np.any(~np.isfinite(n) | ~np.isfinite(m) | (n < 0) | (m <= 0)
               | (n != np.rint(n)) | (m != np.rint(m))):
         raise ValueError("Ratio intervals require integer counts and a positive monitor.")
-    from scipy.stats import beta
+    from scipy.special import betaincinv
 
     alpha = 1 - confidence
     lower = np.zeros_like(n)
     positive = n > 0
-    p_low = beta.ppf(alpha / 2, n[positive], m[positive] + 1)
+    p_low = betaincinv(n[positive], m[positive] + 1, alpha / 2)
     lower[positive] = p_low / (1 - p_low)
     # Compute the upper odds from the lower complementary probability. This
     # avoids subtracting an upper quantile extremely close to one.
-    q_low = beta.ppf(alpha / 2, m, n + 1)
+    q_low = betaincinv(m, n + 1, alpha / 2)
     upper = (1 - q_low) / q_low
     return lower, upper
 
