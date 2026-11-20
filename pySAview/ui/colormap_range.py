@@ -1,5 +1,5 @@
 """Full colormap preview with shared-range draggable arrow handles."""
-from matplotlib import colormaps
+from pySAview.core.colormaps import colormaps
 from PyQt6.QtCore import Qt, QPointF, pyqtSignal
 from PyQt6.QtGui import QColor, QPainter, QPolygonF
 from PyQt6.QtWidgets import QWidget, QSizePolicy

@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 import numpy as np
 import pyqtgraph as pg
 from PyQt6.QtGui import QColor
 
-RESOURCES_DIR = Path(__file__).resolve().parent.parent / "resources"
+from pySAview.core.paths import resources_dir
+
+RESOURCES_DIR = resources_dir()
 CHEVRON_RIGHT_LIGHT = (RESOURCES_DIR / "chevron_right.svg").as_posix()
 CHEVRON_DOWN_LIGHT = (RESOURCES_DIR / "chevron_down.svg").as_posix()
 CHEVRON_UP_LIGHT = (RESOURCES_DIR / "chevron_up.svg").as_posix()
